@@ -1,4 +1,4 @@
-// Tensor Core WMMA GEMM 性能基准测试
+﻿// Tensor Core WMMA GEMM 性能基准测试
 #include <code_abbreviation.h>
 #include <cuda_fp16.h>
 #include <mma.h>
@@ -70,7 +70,7 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     for (size_t i = 0; i < gpu_result.size(); ++i) {
         float gpu_v = gpu_result[i];
         float cpu_v = cpu_result[i];
-        float diff = abs(gpu_v - cpu_v);
+        float diff = fabs(gpu_v - cpu_v);
         
         if (diff > max_diff) {
             max_diff = diff;
@@ -78,7 +78,7 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
         }
         
         // Tensor Core 采用不同硬件加速的降精度累加，误差容忍度应放大到 1e-2级别
-        if (diff > epsilon && (diff / (abs(cpu_v) + 1e-5f)) > 1e-2f) {
+        if (diff > epsilon && (diff / (fabs(cpu_v) + 1e-5f)) > 1e-2f) {
             error_count++;
         }
     }
@@ -97,13 +97,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // WMMA GEMM GPU 封装（GPU，手写）
 template<typename KernelFunc>

@@ -1,4 +1,4 @@
-// FP16 GEMM 性能基准测试
+﻿// FP16 GEMM 性能基准测试
 #include <code_abbreviation.h>
 #include <cuda_fp16.h>
 
@@ -129,13 +129,6 @@ bool verify_results(const std::vector<half>& gpu_result, const std::vector<half>
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 通用 FP16 GEMM 封装（GPU，手写）
 template<typename KernelFunc>

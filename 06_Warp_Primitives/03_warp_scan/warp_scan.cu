@@ -1,4 +1,4 @@
-// Warp Scan - 快速前缀和
+﻿// Warp Scan - 快速前缀和
 #include <code_abbreviation.h>
 
 // Block-level 包含型前缀和（GPU kernel，手写）
@@ -142,13 +142,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 通用 Scan 封装（GPU，部分手写，部分AI 生成）
 template<typename KernelFunc>

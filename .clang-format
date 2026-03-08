@@ -1,0 +1,27 @@
+---
+Language:        Cpp
+BasedOnStyle:  Google
+Standard:        c++17
+ColumnLimit:     120
+IndentWidth:     4
+
+# CUDA-specific formatting
+SpaceBeforeParens: ControlStatements
+AlignConsecutiveAssignments: true
+AlignConsecutiveDeclarations: true
+DerivePointerAlignment: false
+PointerAlignment: Right
+
+# Keep blocks concise
+AllowShortBlocksOnASingleLine: true
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+
+# Includes
+SortIncludes: true
+IncludeBlocks: Regroup
+
+# CUDA macro handling
+MacroBlockBegin: "^__global__.*$"
+StatementMacros: ["__syncthreads", "CUDA_CHECK", "CUDA_CHECK_LAST"]

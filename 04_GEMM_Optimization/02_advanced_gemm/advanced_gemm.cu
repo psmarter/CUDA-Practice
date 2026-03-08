@@ -1,4 +1,4 @@
-#include <code_abbreviation.h>
+﻿#include <code_abbreviation.h>
 
 // 单独使用以下两种方式收益可能并不大，但结合使用之前的分块技术可显著提高性能
 // GEMM-向量化（GPU kernel，手写）
@@ -153,13 +153,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 // GEMM GPU 封装（GPU，手写）
 template<typename KernelFunc>

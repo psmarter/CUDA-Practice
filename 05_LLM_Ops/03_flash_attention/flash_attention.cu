@@ -1,4 +1,4 @@
-// Flash Attention - 高效注意力机制核心算子
+﻿// Flash Attention - 高效注意力机制核心算子
 #include <code_abbreviation.h>
 
 // -----------------------------------------------------------------------------------------
@@ -188,6 +188,9 @@ __global__ void flash_attention(CPFloat Q, CPFloat K, CPFloat V, PFloat O,
 }
 
 // Flash Attention V3 (打磨版) （GPU kernel，手写）
+// 💡 进阶面试考点与避坑指南 (非 2 的次幂与对齐):
+// 1. float4 向量化要求：这里为了压满带宽强制使用了 float4 进行访存，因此极其严格要求 `head_dim % 4 == 0`，否则会引发段错误。在工业框架中，往往会为未对齐的维度分配额外的标量分支（fallback handler）。
+// 2. Padding 与序列溢出安全：虽然设计分块为 `BR` 和 `BC`，对于无法被整除的 `seq_len`，内核中通过了大量的 `if (row_q < seq_len)` 以及 `if (global_k_row < seq_len)` 分支执行了末尾剔除，确保无论任意输入的非标序列长，都不会发生显存越界泄漏！
 __global__ void flash_attention_v3(CPFloat Q, CPFloat K, CPFloat V, PFloat O,
                                     CInt batch, CInt heads, CInt seq_len, CInt head_dim) {
     // 让 128 个线程 (4个 Wapr) 的 Macro-Block 吃同样大小的 K/V (BC*D), 但吞噬 4 倍大的 Q (BR_v3*D)
@@ -402,13 +405,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 朴素 Attention 封装（GPU，手写）
 GpuTimingResult naive_attention_gpu(CRMatrix h_Q, CRMatrix h_K, CRMatrix h_V, RMatrix h_O, 
@@ -469,9 +465,11 @@ GpuTimingResult naive_attention_gpu(CRMatrix h_Q, CRMatrix h_K, CRMatrix h_V, RM
     result.d2h_ms = timerD2H.elapsed_ms();
     result.total_ms = result.h2d_ms + result.kernel_ms + result.d2h_ms;
     
-    CUDA_CHECK(cudaFree(d_Q)); CUDA_CHECK(cudaFree(d_K)); 
-    CUDA_CHECK(cudaFree(d_V)); CUDA_CHECK(cudaFree(d_O)); 
-    CUDA_CHECK(cudaFree(d_S)); 
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_O));
+    CUDA_CHECK(cudaFree(d_S));
     return result;
 }
 
@@ -521,8 +519,10 @@ GpuTimingResult flash_attention_gpu(CRMatrix h_Q, CRMatrix h_K, CRMatrix h_V, RM
     result.d2h_ms = timerD2H.elapsed_ms();
     result.total_ms = result.h2d_ms + result.kernel_ms + result.d2h_ms;
     
-    CUDA_CHECK(cudaFree(d_Q)); CUDA_CHECK(cudaFree(d_K)); 
-    CUDA_CHECK(cudaFree(d_V)); CUDA_CHECK(cudaFree(d_O)); 
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_O));
     return result;
 }
 
@@ -576,18 +576,20 @@ GpuTimingResult flash_attention_v3_gpu(CRMatrix h_Q, CRMatrix h_K, CRMatrix h_V,
     result.d2h_ms = timerD2H.elapsed_ms();
     result.total_ms = result.h2d_ms + result.kernel_ms + result.d2h_ms;
     
-    CUDA_CHECK(cudaFree(d_Q)); CUDA_CHECK(cudaFree(d_K)); 
-    CUDA_CHECK(cudaFree(d_V)); CUDA_CHECK(cudaFree(d_O)); 
+    CUDA_CHECK(cudaFree(d_Q));
+    CUDA_CHECK(cudaFree(d_K));
+    CUDA_CHECK(cudaFree(d_V));
+    CUDA_CHECK(cudaFree(d_O));
     return result;
 }
 
 // 主函数（部分手写，部分AI 生成）
 int main() {
-#ifdef __CUDA_ARCH__
-#if __CUDA_ARCH__ >= 890
+    // 设置 V3 kernel 的最大动态共享内存大小（96KB）
+    // 注意：__CUDA_ARCH__ 宏仅在 device 编译期有效，host 代码中永远为 false
+    // cudaFuncSetAttribute 是 host 端 runtime API，应直接调用
+    // 如果 GPU 不支持该大小，运行时会返回错误码，但不会导致编译失败
     cudaFuncSetAttribute(flash_attention_v3, cudaFuncAttributeMaxDynamicSharedMemorySize, 98304);
-#endif
-#endif
 
     CInt batch = 2;
     CInt heads = 4;

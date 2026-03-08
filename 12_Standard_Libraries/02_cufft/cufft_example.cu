@@ -1,4 +1,4 @@
-// cuFFT - 快速傅里叶变换
+﻿// cuFFT - 快速傅里叶变换
 #include <code_abbreviation.h>
 #include <cufft.h>
 #include <complex>
@@ -129,11 +129,11 @@ bool verify_complex_results(cufftComplex* gpu_result, const std::vector<Complex>
     constexpr float atol = 1e-3f;  // 绝对容差 (CPU 参考已用 double，误差 << 1e-3)
     constexpr float rtol = 1e-5f;  // 相对容差 (大幅值分量按比例放宽)
     for (int i = 0; i < n; ++i) {
-        float diff_real = std::abs(gpu_result[i].x - cpu_result[i].real());
-        float diff_imag = std::abs(gpu_result[i].y - cpu_result[i].imag());
+        float diff_real = fabs(gpu_result[i].x - cpu_result[i].real());
+        float diff_imag = fabs(gpu_result[i].y - cpu_result[i].imag());
         // 对大幅值分量采用相对容差，避免 float 累积误差导致误判
-        float mag = std::max(std::abs(gpu_result[i].x), std::max(std::abs(gpu_result[i].y),
-                    std::max(std::abs(cpu_result[i].real()), std::abs(cpu_result[i].imag()))));
+        float mag = std::max(fabs(gpu_result[i].x), std::max(fabs(gpu_result[i].y),
+                    std::max(fabs(cpu_result[i].real()), fabs(cpu_result[i].imag()))));
         float tol = std::max(atol, rtol * mag);
         if (diff_real > tol || diff_imag > tol) {
             cout << scientific << setprecision(6);
@@ -156,13 +156,6 @@ bool verify_complex_results(cufftComplex* gpu_result, const std::vector<Complex>
 }
 
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 
 // 1D C2C GPU 封装 (GPU，手写)

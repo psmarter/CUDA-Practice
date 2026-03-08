@@ -1,4 +1,4 @@
-// INT8 GEMM - 整数量化矩阵乘法
+﻿// INT8 GEMM - 整数量化矩阵乘法
 #include <code_abbreviation.h>
 
 // 针对旧架构或未指定架构的编译，提供 dp4a 软件回退实现
@@ -179,13 +179,6 @@ bool verify_results(const std::vector<int32_t>& gpu_result, const std::vector<in
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 通用 INT8 GEMM 封装（GPU，手写）
 template<typename KernelFunc>

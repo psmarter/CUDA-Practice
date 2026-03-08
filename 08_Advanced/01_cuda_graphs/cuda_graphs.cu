@@ -1,4 +1,4 @@
-// CUDA Graphs - 降低 Kernel 发射开销
+﻿// CUDA Graphs - 降低 Kernel 发射开销
 #include <code_abbreviation.h>
 
 // 向量加法（GPU kernel，手写）
@@ -43,14 +43,14 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     for (size_t i = 0; i < gpu_result.size(); ++i) {
         float gpu_v = gpu_result[i];
         float cpu_v = cpu_result[i];
-        float diff = abs(gpu_v - cpu_v);
+        float diff = fabs(gpu_v - cpu_v);
         
         if (diff > max_diff) {
             max_diff = diff;
             max_diff_idx = static_cast<int>(i);
         }
         
-        if (diff > epsilon && (diff / (abs(cpu_v) + 1e-5f)) > 1e-3f) {
+        if (diff > epsilon && (diff / (fabs(cpu_v) + 1e-5f)) > 1e-3f) {
             error_count++;
         }
     }
@@ -69,13 +69,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 传统 Stream 发射模式 GPU 封装（GPU，手写）
 template<typename KernelFuncAdd, typename KernelFuncMul>
@@ -130,8 +123,13 @@ GpuTimingResult standard_stream_gpu(CRMatrix h_A, CRMatrix h_B, CRMatrix h_D, CR
 
     result.total_ms = result.h2d_ms + result.kernel_ms + result.d2h_ms;
 
-    CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B)); CUDA_CHECK(cudaFree(d_C));
-    CUDA_CHECK(cudaFree(d_D)); CUDA_CHECK(cudaFree(d_E)); CUDA_CHECK(cudaFree(d_F)); CUDA_CHECK(cudaFree(d_G));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFree(d_D));
+    CUDA_CHECK(cudaFree(d_E));
+    CUDA_CHECK(cudaFree(d_F));
+    CUDA_CHECK(cudaFree(d_G));
 
     return result;
 }
@@ -212,8 +210,13 @@ GpuTimingResult cuda_graph_gpu(CRMatrix h_A, CRMatrix h_B, CRMatrix h_D, CRMatri
     CUDA_CHECK(cudaGraphDestroy(graph));
     CUDA_CHECK(cudaStreamDestroy(stream));
 
-    CUDA_CHECK(cudaFree(d_A)); CUDA_CHECK(cudaFree(d_B)); CUDA_CHECK(cudaFree(d_C));
-    CUDA_CHECK(cudaFree(d_D)); CUDA_CHECK(cudaFree(d_E)); CUDA_CHECK(cudaFree(d_F)); CUDA_CHECK(cudaFree(d_G));
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+    CUDA_CHECK(cudaFree(d_D));
+    CUDA_CHECK(cudaFree(d_E));
+    CUDA_CHECK(cudaFree(d_F));
+    CUDA_CHECK(cudaFree(d_G));
 
     return result;
 }

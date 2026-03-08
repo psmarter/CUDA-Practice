@@ -1,4 +1,4 @@
-// Warp Shuffle - 线程间数据交换
+﻿// Warp Shuffle - 线程间数据交换
 #include <code_abbreviation.h>
 
 // 广播 - 将某线程的值广播到 warp 内所有线程（GPU kernel，手写）
@@ -160,13 +160,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 通用 Warp Shuffle 算子测试框架 GPU 封装（GPU，部分手写，部分 AI 生成）
 template<typename KernelFunc>

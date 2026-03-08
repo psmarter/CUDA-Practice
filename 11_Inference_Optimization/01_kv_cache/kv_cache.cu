@@ -1,4 +1,4 @@
-// KV Cache - LLM 推理中的键值缓存管理
+﻿// KV Cache - LLM 推理中的键值缓存管理
 #include <code_abbreviation.h>
 #include <random>
 
@@ -129,7 +129,7 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, CInt n, const stri
     bool success = true;
     for (int i = 0; i < n; ++i) {
         // 由于累加误差较大，适当放宽 EPSILON
-        if (std::abs(gpu_result[i] - cpu_result[i]) > 1e-3f) {
+        if (fabs(gpu_result[i] - cpu_result[i]) > 1e-3f) {
             cout << "✗ " << kernel_name << " FAILED: 索引 " << i 
                  << " 结果 " << gpu_result[i] << " (期望 " << cpu_result[i] << ")\n";
             success = false;
@@ -142,13 +142,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, CInt n, const stri
     return success;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 
 // Naive GPU 封装 (GPU，手写)

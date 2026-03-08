@@ -1,21 +1,5 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <iomanip>
-#include "cuda_utils.cuh"
-#include "timer.cuh"
+﻿#include <code_abbreviation.h>
 
-using namespace std;
-using CInt = const int;
-using CSize = const size_t;
-using PFloat = float*;
-using CPFloat = const float*;
-using Matrix = vector<float>;
-using RMatrix = vector<float>&;
-using CRMatrix = const vector<float>&;
-
-constexpr size_t FSIZE = sizeof(float);
-constexpr int BLOCK_SIZE = 1024;
 
 // 归约（GPU kernel，手写）
 __global__ void simple_reduce_sum(PFloat input, PFloat output) {
@@ -70,13 +54,6 @@ float reduce_sum_cpu(CPFloat data, CInt length) {
     return static_cast<float>(total);
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 // 验证结果（AI 生成）
 bool verify_results(float gpu_result, float cpu_result, const string& kernel_name) {

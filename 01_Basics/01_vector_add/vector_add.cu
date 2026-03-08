@@ -1,11 +1,5 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <iomanip>
-#include "cuda_utils.cuh"
-#include "timer.cuh"
+﻿#include <code_abbreviation.h>
 
-using namespace std;
 
 // 向量加法（GPU kernel，手写）
 __global__ void vector_add(const float* A, const float* B, float* C, const int n) {
@@ -23,13 +17,6 @@ void vector_add_cpu(const vector<float>& h_a, const vector<float>& h_b,
     }
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 // 向量加法（GPU，手写）
 GpuTimingResult vector_add_device(const vector<float>& h_a, const vector<float>& h_b,
@@ -96,7 +83,7 @@ bool verify_results(const vector<float>& h_a, const vector<float>& h_b,
     error_count = 0;
     for (int i = 0; i < n; ++i) {
         float expected = h_a[i] + h_b[i];
-        if (std::fabs(h_c[i] - expected) > 1e-5) {
+        if (fabs(h_c[i] - expected) > 1e-5) {
             error_count++;
             // 打印前 5 个错误
             if (error_count <= 5) {

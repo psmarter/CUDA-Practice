@@ -1,4 +1,4 @@
-// PyTorch Extension (Swish 自定义激活算子实现与基准测试)
+﻿// PyTorch Extension (Swish 自定义激活算子实现与基准测试)
 #include <code_abbreviation.h>
 
 // Swish 前向传播计算（GPU kernel，手写）
@@ -57,7 +57,7 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     for (size_t i = 0; i < gpu_result.size(); ++i) {
         float gpu_v = gpu_result[i];
         float cpu_v = cpu_result[i];
-        float diff = abs(gpu_v - cpu_v);
+        float diff = fabs(gpu_v - cpu_v);
         
         if (diff > max_diff) {
             max_diff = diff;
@@ -65,7 +65,7 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
         }
         
         // 相对误差和绝对误差验证
-        if (diff > epsilon && (diff / (abs(cpu_v) + 1e-5f)) > 1e-4f) {
+        if (diff > epsilon && (diff / (fabs(cpu_v) + 1e-5f)) > 1e-4f) {
             error_count++;
         }
     }
@@ -84,13 +84,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // Swish 前向 GPU 封装（GPU，部分手写）
 template<typename KernelFunc>

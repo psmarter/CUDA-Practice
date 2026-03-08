@@ -1,4 +1,4 @@
-// 全局内存合并访问 - 内存访问模式优化
+﻿// 全局内存合并访问 - 内存访问模式优化
 #include <code_abbreviation.h>
 #include <string>
 
@@ -95,7 +95,7 @@ void soa_access_cpu(CRMatrix in_x, CRMatrix in_y, CRMatrix in_z, CRMatrix in_w,
 bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, CInt n, const string& kernel_name) {
     bool success = true;
     for (int i = 0; i < n; ++i) {
-        if (std::abs(gpu_result[i] - cpu_result[i]) > EPSILON) {
+        if (fabs(gpu_result[i] - cpu_result[i]) > EPSILON) {
             cout << "✗ " << kernel_name << " FAILED: 索引 " << i 
                  << " 结果 " << gpu_result[i] << " (期望 " << cpu_result[i] << ")\n";
             success = false;
@@ -111,10 +111,10 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, CInt n, const stri
 bool verify_results_aos(const AoS* gpu_result, const vector<AoS>& cpu_result, CInt n, const string& kernel_name) {
     bool success = true;
     for (int i = 0; i < n; ++i) {
-        if (std::abs(gpu_result[i].x - cpu_result[i].x) > EPSILON ||
-            std::abs(gpu_result[i].y - cpu_result[i].y) > EPSILON ||
-            std::abs(gpu_result[i].z - cpu_result[i].z) > EPSILON ||
-            std::abs(gpu_result[i].w - cpu_result[i].w) > EPSILON) {
+        if (fabs(gpu_result[i].x - cpu_result[i].x) > EPSILON ||
+            fabs(gpu_result[i].y - cpu_result[i].y) > EPSILON ||
+            fabs(gpu_result[i].z - cpu_result[i].z) > EPSILON ||
+            fabs(gpu_result[i].w - cpu_result[i].w) > EPSILON) {
             cout << "✗ " << kernel_name << " FAILED: 索引 " << i << " 发现不匹配的数据\n";
             success = false;
             break;
@@ -126,13 +126,6 @@ bool verify_results_aos(const AoS* gpu_result, const vector<AoS>& cpu_result, CI
     return success;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 // GPU 封装函数（GPU，手写）
 template<typename KernelFunc>

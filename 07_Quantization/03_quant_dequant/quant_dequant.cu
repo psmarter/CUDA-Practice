@@ -1,4 +1,4 @@
-// 量化/反量化 Kernel
+﻿// 量化/反量化 Kernel
 #include <code_abbreviation.h>
 #include <cuda_fp16.h>
 #include <type_traits>
@@ -107,7 +107,7 @@ bool verify_results(const std::vector<T>& gpu_result, const std::vector<T>& cpu_
             cpu_v = static_cast<float>(cpu_result[i]);
         }
         
-        float diff = std::abs(gpu_v - cpu_v);
+        float diff = fabs(gpu_v - cpu_v);
         if (diff > max_diff) {
             max_diff = diff;
             max_diff_idx = static_cast<int>(i);
@@ -150,13 +150,6 @@ bool verify_results(const std::vector<T>& gpu_result, const std::vector<T>& cpu_
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 通用 Quant/Dequant 封装（带缩放参数 Float Scale）（GPU，手写）
 template<typename InputT, typename OutputT, typename KernelFunc>

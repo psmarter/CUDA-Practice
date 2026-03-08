@@ -1,4 +1,4 @@
-// 可计算隐藏访存延迟的多流并发 (Multi-Stream) 基准测试
+﻿// 可计算隐藏访存延迟的多流并发 (Multi-Stream) 基准测试
 #include <code_abbreviation.h>
 
 // 计算密集型任务：A * sin(B) + B * cos(A)（GPU kernel，手写）
@@ -31,14 +31,14 @@ bool verify_results(CPFloat gpu_result, CPFloat cpu_result, const string& kernel
     for (int i = 0; i < n; ++i) {
         float gpu_v = gpu_result[i];
         float cpu_v = cpu_result[i];
-        float diff = abs(gpu_v - cpu_v);
+        float diff = fabs(gpu_v - cpu_v);
         
         if (diff > max_diff) {
             max_diff = diff;
             max_diff_idx = i;
         }
         
-        if (diff > epsilon && (diff / (abs(cpu_v) + 1e-5f)) > 1e-3f) {
+        if (diff > epsilon && (diff / (fabs(cpu_v) + 1e-5f)) > 1e-3f) {
             error_count++;
         }
     }
@@ -57,13 +57,6 @@ bool verify_results(CPFloat gpu_result, CPFloat cpu_result, const string& kernel
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 单流 (串行执行全量任务) 封装（GPU，手写）
 template<typename KernelFunc>

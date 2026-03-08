@@ -2,6 +2,7 @@
 build/
 docs/
 cmake-build*/
+out/
 *.o
 *.obj
 *.exe
@@ -22,3 +23,20 @@ cmake-build*/
 *.ptx
 *.fatbin
 *.gpu
+
+# Python & PyTorch C++ Extension 产物
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+build/lib.*
+build/temp.*
+*.egg-info/
+dist/
+
+# AI 助手与工作流存储
+.agents/
+.agent/
+_agents/
+_agent/
+.gemini/

@@ -1,4 +1,4 @@
-// Thrust - CUDA 并行算法库
+﻿// Thrust - CUDA 并行算法库
 #include <code_abbreviation.h>
 #include <thrust/device_vector.h>
 #include <thrust/host_vector.h>
@@ -56,7 +56,7 @@ void inclusive_scan_cpu(const std::vector<float>& input, std::vector<float>& out
 bool verify_results(const std::vector<float>& gpu_result, const std::vector<float>& cpu_result, const string& kernel_name) {
     bool success = true;
     for (size_t i = 0; i < gpu_result.size(); ++i) {
-        if (std::abs(gpu_result[i] - cpu_result[i]) > 1e-4f) {
+        if (fabs(gpu_result[i] - cpu_result[i]) > 1e-4f) {
             cout << "✗ " << kernel_name << " FAILED: 索引 " << i 
                  << " 结果 " << gpu_result[i] << " (期望 " << cpu_result[i] << ")\n";
             success = false;
@@ -70,8 +70,8 @@ bool verify_results(const std::vector<float>& gpu_result, const std::vector<floa
 }
 
 bool verify_value(float gpu_result, float cpu_result, const string& kernel_name) {
-    float diff = std::abs(gpu_result - cpu_result);
-    float mag  = std::max(std::abs(gpu_result), std::abs(cpu_result));
+    float diff = fabs(gpu_result - cpu_result);
+    float mag  = std::max(fabs(gpu_result), fabs(cpu_result));
     float tol  = std::max(1e-2f, 1e-5f * mag);  // 相对+绝对混合容差
     if (diff > tol) {
         cout << "✗ " << kernel_name << " FAILED: 结果 " << gpu_result << " (期望 " << cpu_result << ")"
@@ -83,13 +83,6 @@ bool verify_value(float gpu_result, float cpu_result, const string& kernel_name)
 }
 
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 
 // 注意：Thrust API 屏蔽了 Kernel 配置，我们使用 CudaTimer 直接包裹 thrust 闭包执行

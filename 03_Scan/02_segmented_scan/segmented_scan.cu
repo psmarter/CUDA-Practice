@@ -1,4 +1,4 @@
-#include <code_abbreviation.h>
+﻿#include <code_abbreviation.h>
 
 // 前缀和-线程粗化（GPU kernel，手写）
 __global__ void coarse_scan(CPFloat input, PFloat output, CInt n) {
@@ -157,13 +157,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;
-    float kernel_ms;
-    float d2h_ms;
-    float total_ms;
-};
 
 // 粗化扫描 GPU 封装（GPU，手写）
 GpuTimingResult coarse_scan_gpu(CRMatrix h_input, RMatrix h_output, CInt iterations) {

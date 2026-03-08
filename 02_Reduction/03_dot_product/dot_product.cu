@@ -1,4 +1,4 @@
-#include <code_abbreviation.h>
+﻿#include <code_abbreviation.h>
 
 // 点积-共享内存（GPU kernel，手写）
 __global__ void shared_dot_product(CPFloat a, CPFloat b, PFloat output, CInt size) {
@@ -104,13 +104,6 @@ bool verify_results(RFloat gpu_result, RFloat cpu_result, const string& kernel_n
     }
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 // 通用点积 GPU 封装（GPU，手写）
 template<typename KernelFunc>

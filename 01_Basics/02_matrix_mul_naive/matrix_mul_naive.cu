@@ -1,14 +1,8 @@
-#include <iostream>
-#include <vector>
-#include <cmath>
-#include <iomanip>
-#include "cuda_utils.cuh"
-#include "timer.cuh"
+﻿#include <code_abbreviation.h>
 
-using namespace std;
-using matrix = vector<float>;           // 行主序
-using Int = const int;
-constexpr size_t sizeF = sizeof(float);
+using matrix = Matrix;            // 兼容本文件中的 'matrix' 别名
+using Int = CInt;                 // 兼容本文件中的 'Int' 别名
+constexpr size_t sizeF = FSIZE;   // 兼容本文件中的 'sizeF' 别名
 
 // 矩阵乘法（GPU kernel，手写）
 __global__ void matrix_mul_naive(const float* A, const float* B, float* C, Int m, Int n, Int k){
@@ -36,13 +30,6 @@ void matrix_mul_cpu(const float* A, const float* B, float* C, Int m, Int n, Int 
     }
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 // 矩阵乘法（GPU，手写）
 GpuTimingResult matrix_mul_naive_device(const matrix& h_a, const matrix& h_b, matrix& h_c, Int m, Int n, Int k, Int iterations = 100) {

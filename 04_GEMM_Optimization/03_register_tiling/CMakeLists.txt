@@ -1,0 +1,2 @@
+add_executable(register_tiling register_tiling.cu)
+target_link_libraries(register_tiling PRIVATE cublas)

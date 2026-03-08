@@ -1,4 +1,4 @@
-#include <code_abbreviation.h>
+﻿#include <code_abbreviation.h>
 
 // GEMM-共享内存分块优化（GPU kernel，手写）
 __global__ void tiled_gemm(CPFloat A, CPFloat B, PFloat C, CInt M, CInt N, CInt K) {
@@ -155,13 +155,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 // GEMM GPU 封装（GPU，手写）
 template<typename KernelFunc>

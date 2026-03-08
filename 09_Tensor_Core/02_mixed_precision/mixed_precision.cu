@@ -1,4 +1,4 @@
-// CUDA Tensor Core Mixed Precision (FP16 Input + FP32 Accumulate) 基准测试
+﻿// CUDA Tensor Core Mixed Precision (FP16 Input + FP32 Accumulate) 基准测试
 #include <code_abbreviation.h>
 
 #include <mma.h>
@@ -69,7 +69,7 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     for (int i = 0; i < n; ++i) {
         float gpu_v = gpu_result[i];
         float cpu_v = cpu_result[i];
-        float diff = abs(gpu_v - cpu_v);
+        float diff = fabs(gpu_v - cpu_v);
         
         if (diff > max_diff) {
             max_diff = diff;
@@ -77,7 +77,7 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
         }
         
         // Tensor Core 处理可能会带来精度的下降，因此放宽差异容忍比率
-        if (diff > epsilon && (diff / (abs(cpu_v) + 1e-5f)) > 5e-2f) {
+        if (diff > epsilon && (diff / (fabs(cpu_v) + 1e-5f)) > 5e-2f) {
             error_count++;
         }
     }
@@ -96,13 +96,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, const string& kern
     return true;
 }
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      
-    float kernel_ms;   
-    float d2h_ms;      
-    float total_ms;    
-};
 
 // 传统 FP32 GEMM 封装（GPU，手写）
 template<typename KernelFunc>
@@ -214,8 +207,10 @@ GpuTimingResult wmma_mixed_gemm_gpu(CRMatrix h_A, CRMatrix h_B, RMatrix h_C,
 
     result.total_ms = result.h2d_ms + result.kernel_ms + result.d2h_ms;
 
-    CUDA_CHECK(cudaFree(d_A_fp32)); CUDA_CHECK(cudaFree(d_B_fp32));
-    CUDA_CHECK(cudaFree(d_A_fp16)); CUDA_CHECK(cudaFree(d_B_fp16));
+    CUDA_CHECK(cudaFree(d_A_fp32));
+    CUDA_CHECK(cudaFree(d_B_fp32));
+    CUDA_CHECK(cudaFree(d_A_fp16));
+    CUDA_CHECK(cudaFree(d_B_fp16));
     CUDA_CHECK(cudaFree(d_C));
 
     return result;

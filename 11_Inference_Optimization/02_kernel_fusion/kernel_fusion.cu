@@ -1,4 +1,4 @@
-// Kernel Fusion - 多算子融合减少访存
+﻿// Kernel Fusion - 多算子融合减少访存
 #include <code_abbreviation.h>
 #include <string>
 #include <random>
@@ -97,7 +97,7 @@ void add_relu_scale_cpu(CRMatrix a, CRMatrix b, RMatrix output, float scale, CIn
 bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, CInt n, const string& kernel_name) {
     bool success = true;
     for (int i = 0; i < n; ++i) {
-        if (std::abs(gpu_result[i] - cpu_result[i]) > 1e-5f) {
+        if (fabs(gpu_result[i] - cpu_result[i]) > 1e-5f) {
             cout << "✗ " << kernel_name << " FAILED: 索引 " << i 
                  << " 结果 " << gpu_result[i] << " (期望 " << cpu_result[i] << ")\n";
             success = false;
@@ -111,13 +111,6 @@ bool verify_results(CRMatrix gpu_result, CRMatrix cpu_result, CInt n, const stri
 }
 
 
-// GPU 计时结果结构体（AI 生成）
-struct GpuTimingResult {
-    float h2d_ms;      // Host to Device 传输时间
-    float kernel_ms;   // Kernel 执行时间（多次平均）
-    float d2h_ms;      // Device to Host 传输时间
-    float total_ms;    // 总时间
-};
 
 
 // 未融合版本的顺序执行封装 (GPU，手写)
