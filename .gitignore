@@ -1,0 +1,24 @@
+# 编译产物
+build/
+docs/
+cmake-build*/
+*.o
+*.obj
+*.exe
+*.out
+*.lib
+*.a
+*.so
+*.dll
+
+# IDE 文件
+.vs/
+.vscode/
+*.user
+*.suo
+
+# CUDA 编译产物
+*.cubin
+*.ptx
+*.fatbin
+*.gpu

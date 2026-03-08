@@ -1,0 +1,1 @@
+add_executable(matrix_mul_naive matrix_mul_naive.cu)
