@@ -286,8 +286,70 @@ Varlen Packed  显存  ：1311.22 MB
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      算子融合 (Kernel Fusion) 访存优化基准测试
+========================================
+特征数组大小：134217728 元素
+单张量大小  ：512.00 MB
+测试算子链路：Add(A, B) -> ReLU -> Scale
+Kernel 迭代次数：50 次
+
+--- CPU 计时 ---
+CPU 执行时间：    1156.07 ms
+
+--- GPU 版本 1: 非融合序列 (Unfused Series) ---
+H2D 传输时间：     102.52 ms
+Kernel 执行时间：    4.06 ms (50 次平均)
+D2H 传输时间：      56.46 ms
+GPU 总时间：       163.05 ms
+
+--- GPU 版本 2: 算子融合 (Fused Kernel) ---
+H2D 传输时间：     141.70 ms
+Kernel 执行时间：    1.73 ms (50 次平均)
+D2H 传输时间：      52.38 ms
+GPU 总时间：       195.81 ms
+
+--- 理论访存计算与性能分析 ---
+非融合版本物理带宽：  925.84 GB/s
+已融合版本物理带宽：  932.85 GB/s
+--------------------------------
+非融合版本有效带宽：  396.79 GB/s (受制于无效的中间访存)
+算子融合后有效带宽：  932.85 GB/s (接近硬件物理极限)
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能加速比 ---
+非融合序列 耗时  :   4.0591 ms
+算子融合版 耗时  :   1.7265 ms
+>> 融合加速比   : 2.35x
+
+--- 结果验证 ---
+✓ Unfused Kernels PASSED: 结果 0.00 (期望 0.00)
+✓ Fused Kernels PASSED: 结果 0.00 (期望 0.00)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
@@ -302,8 +364,72 @@ Varlen Packed  显存  ：1311.22 MB
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      KV Cache 内存管理优化基准测试
+========================================
+Batch Size：32
+Num Heads：16  Head Dim：64
+最大序列长度：2048  Block 大小：16 个 Token
+Kernel 迭代次数：100 次
+
+--- 理论显存占用对比 ---
+所有张量按完整长度 (2048) 预分配 (Naive):
+> 预估 KV Cache 大小: 512.00 MB
+使用分块按需分布并消除碎片 (Paged Attention):
+> 预估 KV Cache 大小: 317.75 MB
+> 节省显存: 37.94%
+
+--- CPU 计时 ---
+CPU 执行时间：     126.39 ms
+
+--- GPU 版本 1: Naive (静态分配连续内存) ---
+H2D 传输时间：      50.00 ms
+Kernel 执行时间：    0.37 ms (100 次平均)
+D2H 传输时间：       0.03 ms
+GPU 总时间：        50.40 ms
+
+--- GPU 版本 2: PagedAttention 机制 ---
+H2D 传输时间：      67.81 ms
+Kernel 执行时间：    0.45 ms (100 次平均)
+D2H 传输时间：       0.03 ms
+GPU 总时间：        68.29 ms
+
+--- 性能分析 ---
+CPU vs GPU (Naive) 加速比：343.03x
+CPU vs GPU (Paged) 加速比：280.75x
+Naive 有效带宽：  898.12 GB/s
+Paged 有效带宽：  735.04 GB/s
+性能对比差异  ：Paged 相比较 Naive 耗时 1.22x (主要来自指针解引用的开销)
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- 结果验证 ---
+✓ Naive Attention PASSED: 结果 3.49 (期望 3.49)
+✓ Paged Attention PASSED: 结果 3.49 (期望 3.49)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
@@ -318,8 +444,79 @@ Varlen Packed  显存  ：1311.22 MB
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+  动态/连续批处理 (Continuous Batching) 基准测试
+========================================
+Batch 规模  ：128 个并发请求
+单请求极长  ：1024
+网络结构    ：Num Heads=32, Head Dim=128
+Kernel 迭代 ：100 次
+
+--- 理论负载与显存开销 ---
+1. 静态 / 基础批次调度 (Static Padding):
+   等待集齐 128 个请求并向最长维度对齐 (1024)。
+   所需处理的 Token 载量: 131072 [4096.00 MB]
+2. 动态 / Inflight 连续调度 (Continuous Packed Tensor):
+   摒弃所有 0-Padding，合并有效 Token 放入 Flatten 数组。
+   实际需计算的 Token 载量: 41959 [1311.22 MB]
+>>> 预估节省计算量 (FLOPS/Mem): 67.99%
+
+--- CPU 计时 (真实 Token) ---
+CPU 执行时间：    1075.84 ms
+
+--- GPU 版本 1: 静态批处理 (Static Padding to Max Length) ---
+H2D 传输时间：     142.92 ms
+Kernel 执行时间：    1.52 ms (100 次平均)
+D2H 传输时间：       0.26 ms
+GPU 总时间：       144.69 ms
+
+--- GPU 版本 2: 动态批处理 / Varlen Packed Tensor ---
+H2D 传输时间：     196.63 ms
+Kernel 执行时间：    1.69 ms (100 次平均)
+D2H 传输时间：       0.30 ms
+GPU 总时间：       198.61 ms
+
+--- 性能分析 ---
+Kernel 耗时对比 : Static 1.5158 ms  vs  Varlen 1.6869 ms
+>> Static 内部通过分支跳过 Padding，因此两者 Kernel 速度接近。
+>> Continuous Batching 的核心收益是显存节省（67.99%），使同一 GPU 能服务更多并发请求。
+
+Static 实际有效带宽：  844.78 GB/s
+Varlen 实际有效带宽：  759.09 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- 显存占用对比 (核心指标) ---
+Static Padding 显存  ：4096.00 MB
+Varlen Packed  显存  ：1311.22 MB
+>> 节省显存 67.99%，等效于可多服务 3.1x 的并发请求
+
+--- 结果验证 ---
+✓ Var-Len Attention PASSED: 结果 -6.8 (期望 -6.8)
+✓ GPU/CPU Variadic-Length Attention 结果验证通过
+
+========================================
 
 ```
 

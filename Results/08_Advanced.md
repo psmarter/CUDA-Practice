@@ -259,8 +259,64 @@ CUDA Graph Launch:     0.0042 ms (1.20x CPU 发射开销减免)
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      多流并发隐藏延迟性能基准测试
+========================================
+测试算子：C = A * sin(B) + B * cos(A)
+数组大小：16777216 元素
+数据大小：192.00 MB
+并发流数：4 排队长度
+Block 大小：256 线程
+测试指标：全链路 (H2D -> Compute -> D2H) 周期执行时间
+执行迭代：10 次
+
+--- CPU 计时 ---
+CPU 执行时间：     190.59 ms
+
+--- GPU 版本 1: 传统单流 (完全串行) ---
+Pipeline 周期时间：   15.55 ms (10 次平均)
+
+--- GPU 版本 2: 多流 (流水线并发) ---
+Pipeline 周期时间：   13.73 ms (10 次平均)
+
+--- 性能分析 ---
+CPU vs GPU (多流) 总加速比：13.88x
+单流 vs 多流 并发加速比：   1.13x
+GPU 有效流水线吞吐带宽：14.66 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+传统单流:  15.5549 ms (基准)
+多流并发:    13.7338 ms (1.13x 并发开销减免)
+
+--- 结果验证 ---
+✓ 传统单流执行 PASSED: 结果 0.57 (期望 0.57)
+✓ 多流并发执行 PASSED: 结果 0.57 (期望 0.57)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
@@ -275,8 +331,62 @@ CUDA Graph Launch:     0.0042 ms (1.20x CPU 发射开销减免)
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      PyTorch Extension 基准测试计算层
+========================================
+自定义算子：Swish Activation (Forward & Backward)
+数组大小：10485760 元素
+单数组大小：40.00 MB
+Block 大小：256 线程
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+Forward CPU 执行时间：      30.30 ms
+Backward CPU 执行时间：     46.01 ms
+
+--- GPU 版本: Custom Swish ---
+[Forward] H2D 传输时间：     3.97 ms
+[Forward] Kernel 时间：      0.08 ms (100 次平均)
+[Forward] D2H 传输时间：     4.07 ms
+[Backward] H2D 传输时间：    7.87 ms
+[Backward] Kernel 时间：     0.13 ms (100 次平均)
+[Backward] D2H 传输时间：    4.06 ms
+
+--- 性能分析 ---
+[Forward] CPU vs GPU Kernel 加速比：369.13x
+[Backward] CPU vs GPU Kernel 加速比：342.43x
+GPU Forward 有效带宽：1022.08 GB/s
+GPU Backward 有效带宽：936.41 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- 结果验证 ---
+✓ Swish Forward PASSED: 结果 -0.00 (期望 -0.00)
+✓ Swish Backward PASSED: 结果 -0.00 (期望 -0.00)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
@@ -291,8 +401,68 @@ CUDA Graph Launch:     0.0042 ms (1.20x CPU 发射开销减免)
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      CUDA Graphs 编排性能基准测试
+========================================
+流水线步骤：(A + B) * D + F = G
+数组大小：100000 元素
+涉及显存：2.67 MB
+Block 大小：256 线程
+Kernel 迭代次数：1000 次
+
+--- CPU 计时 ---
+CPU 执行时间：       0.17 ms
+
+--- GPU 版本 1: 传统多 Kernel 发射 ---
+H2D 传输时间：       0.18 ms
+Kernel 执行时间：    0.00 ms (1000 次平均)
+D2H 传输时间：       0.07 ms
+GPU 总时间：         0.25 ms
+
+--- GPU 版本 2: CUDA Graph Launch ---
+H2D 传输时间：       0.17 ms
+Kernel 执行时间：    0.00 ms (1000 次平均)
+D2H 传输时间：       0.06 ms
+GPU 总时间：         0.24 ms
+
+--- 性能分析 ---
+CPU vs GPU (Graph) Kernel 加速比：41.52x
+CPU vs GPU (Graph) 总时间加速比：0.72x
+GPU 有效带宽：859.11 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+Multi-Stream Launch:   0.0049 ms (基准)
+CUDA Graph Launch:     0.0042 ms (1.18x CPU 发射开销减免)
+
+--- 结果验证 ---
+✓ 传统流发射 Kernel 流水 PASSED: 结果 1.27 (期望 1.27)
+✓ CUDA Graphs 发射 PASSED: 结果 1.27 (期望 1.27)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 

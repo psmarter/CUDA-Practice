@@ -165,8 +165,60 @@ WMMA Mixed Precision:    0.0568 ms (7.21x)
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      WMMA Tensor Core 性能基准测试
+========================================
+数组大小：M=2048 N=2048 K=2048
+数据大小：32.00 MB
+Block 大小：256 线程 (32x8 Warps)
+Kernel 迭代次数：100 次
+
+--- CPU 验证 (若尺寸较小) ---
+矩阵尺寸过大，跳过 CPU 参考计算。
+
+--- GPU 版本 1: Naive WMMA Tensor Core ---
+H2D 传输时间：       1.65 ms
+Kernel 执行时间：    0.56 ms (100 次平均)
+D2H 传输时间：       1.65 ms
+GPU 总时间：         3.86 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：1.78x
+CPU vs GPU 总时间加速比：0.26x
+GPU 有效算力 (TFLOPS)：30.50 TFLOPS
+(RTX 4090 FP16 TC 理论算力峰值：~ 165 TFLOPS (无稀疏))
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+Naive WMMA:   0.5633 ms (基准)
+
+--- 结果验证 ---
+✓ 结果验证跳过 (因矩阵尺寸过大，CPU 基准未计算)
+
+========================================
+
 ```
 
 ## mixed_precision.cu 代码逻辑与测试
@@ -180,6 +232,68 @@ WMMA Mixed Precision:    0.0568 ms (7.21x)
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      WMMA 混合精度性能基准测试
+========================================
+矩阵尺寸：1024 x 1024 x 1024
+数据大小：12.00 MB
+WMMA 切块：16x16x16
+Kernel 迭代次数：100 次
+
+--- CPU 计时 (若尺寸较小) ---
+矩阵尺寸过大，跳过 CPU 参考计算。
+
+--- GPU 版本 1: 传统 FP32 GEMM ---
+H2D 传输时间：       0.85 ms
+Kernel 执行时间：    0.39 ms (100 次平均)
+D2H 传输时间：       0.45 ms
+GPU 总时间：         1.70 ms
+
+--- GPU 版本 2: WMMA 混合精度 (FP16乘加FP32) ---
+H2D(含转换)时间：    0.88 ms
+Kernel 执行时间：    0.05 ms (100 次平均)
+D2H 传输时间：       0.44 ms
+GPU 总时间：         1.37 ms
+
+--- 性能分析 ---
+CPU vs WMMA Kernel 加速比：18.33x
+CPU vs WMMA 总时间加速比： 0.73x
+FP32 有效算力：5.45 TFLOPS
+WMMA 有效算力：39.36 TFLOPS
+FP32 有效访存带宽：31.96 GB/s
+WMMA 有效访存带宽：153.73 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+(附：RTX 4090 Tensor Core 算力理论峰值 ~330 TFLOPS)
+
+--- Kernel 性能对比 ---
+Naive FP32 GEMM:         0.3937 ms (基准)
+WMMA Mixed Precision:    0.0546 ms (7.21x)
+
+--- 结果验证 ---
+✓ 结果验证跳过 (因矩阵尺寸过大，CPU 基准未计算)
+
+========================================
+
 ```

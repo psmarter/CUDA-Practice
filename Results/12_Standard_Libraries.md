@@ -227,8 +227,73 @@ Transform 有效带宽：847.16 GB/s
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      cuBLAS GEMM 官方标准库性能测试
+========================================
+矩阵形状：M=1024, N=1024, K=1024
+单算例数据量：12.00 MB
+Batch 规模  ：8 个矩阵组合 (96.00 MB)
+Kernel 迭代次数：50 次
+
+--- CPU 计时 (M=1024, N=1024, K=1024) ---
+CPU 单算例执行时间：       0.00 ms
+
+--- GPU 版本 1: 基础 cublasSgemm ---
+H2D 传输时间：       0.95 ms
+Kernel 执行时间：    0.04 ms (50 次平均)
+D2H 传输时间：       0.47 ms
+GPU 总时间：         1.46 ms
+
+--- GPU 版本 2: 启发式 cublasLtMatmul ---
+H2D 传输时间：       0.91 ms
+Kernel 执行时间：    0.04 ms (50 次平均)
+D2H 传输时间：       0.44 ms
+GPU 总时间：         1.40 ms
+
+--- GPU 版本 3: Strided Batched SGEMM (Batch=8) ---
+H2D 传输时间：       6.41 ms
+Kernel 执行时间：    0.45 ms (50 次平均)
+D2H 传输时间：       3.30 ms
+GPU 总时间：        10.17 ms
+
+--- 性能分析 (TFLOPS) ---
+CPU vs GPU (基础) 加速比：0.00x
+
+cublasSgemm       算力：   49.91 TFLOPS
+cublasLtMatmul    算力：   50.10 TFLOPS
+StridedBatched    算力：   37.88 TFLOPS (相比单算例通常隐藏了 Kernel 启动开销)
+(RTX 4090 FP32 理论峰值：~82.58 TFLOPS)
+
+--- 结果验证 ---
+  [Skip] cublasSgemm	 validation for large matrices.
+  [Skip] cublasLtMatmul	 validation for large matrices.
+  [Skip] StridedBatched	 validation for large matrices.
+✓ GPU/CPU 一致性验证全部通过 (处理了 Row-Major 转置机制)
+
+========================================
+
 ```
 
 ## cufft_example.cu 代码逻辑与测试
@@ -241,8 +306,63 @@ Transform 有效带宽：847.16 GB/s
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      cuFFT 官方标准库 频谱计算测试
+========================================
+校验波长规模：4096 采样点 (0.0312 MB)
+验证算法  ：GPU cuFFT vs CPU $O(N^2)$ 自研基准
+Kernel 迭代次数：100 次
+
+--- CPU 计时 (DFT $O(N^2)$) ---
+CPU DFT 耗时：   395.0780 ms
+
+--- GPU 版本 1: cuFFT 1D (Forward) ---
+H2D 传输时间：     0.0150 ms
+Kernel 执行时间：  0.0035 ms (100 次平均)
+D2H 传输时间：     0.0123 ms
+GPU 总时间：       0.0035 ms (纯算力段)
+
+--- GPU 版本 2: cuFFT 1D (Inverse) ---
+Kernel 执行时间：  0.0052 ms (100 次平均)
+
+--- 性能分析与拓展基准 ---
+CPU(Naive) vs GPU(cuFFT) 加速比（4096 维度下）：112156.50x
+>> 注：这并不公平，因为 CPU 为 O(N^2) 而 GPU 基于 O(N log N) 库。仅仅用于功能对比和感受差距。
+
+===> 测试大数据吞吐量 (Batch=65536, N=1024) <===
+巨量 Batch Kernel 执行时间：    1.17 ms (10 次平均)
+GPU 最小理论访存有效带宽：457.46 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- 结果验证 ---
+✓ FFT (Forward) PASSED: 结果 (-9.83477e-07,0) (期望 (4.47035e-07,0))
+✓ IFFT(Inverse) PASSED: 结果 (0.5,-1.49012e-07) (期望 (0.5,0))
+✓ GPU/CPU 一致性验证通过！ (包含数学上的完美逆向重构功能验证)
+
+========================================
+
 ```
 
 ## thrust_algorithms.cu 代码逻辑与测试
@@ -255,6 +375,57 @@ Transform 有效带宽：847.16 GB/s
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      Thrust 核心算法性能基准测试
+========================================
+数组大小：10000000 元素
+数据大小：38.15 MB
+Kernel 迭代次数：100 次
+
+---------- [1] Sort (排序) ----------
+CPU std::sort 时间： 2124.06 ms
+GPU thrust::sort 时间：    1.30 ms (5次平均)
+GPU Sort 加速比：1634.06x
+✓ thrust::sort	 PASSED: 结果 0.00 (期望 0.00)
+
+---------- [2] Reduce (归约 sum) ----------
+CPU std::accumulate 时间：   28.35 ms
+GPU thrust::reduce 时间：    0.08 ms (100 次平均)
+GPU Reduce 加速比：371.31x
+Reduce 有效带宽：487.88 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+✓ thrust::reduce	 PASSED: 结果 500073024.00 (期望 500073024.00)
+
+---------- [3] Transform (SAXPY元素级) ----------
+CPU for-loop SAXPY 时间：   29.20 ms
+GPU thrust::transform 时间：    0.13 ms (100 次平均)
+GPU Transform 加速比：222.01x
+Transform 有效带宽：849.73 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+✓ thrust::transform PASSED: 结果 53.27 (期望 53.27)
+
+========================================
+
 ```

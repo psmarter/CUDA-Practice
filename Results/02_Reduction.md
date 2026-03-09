@@ -293,8 +293,75 @@ FMA:         0.0055 ms (1.68x)
 3. **执行表现**: 在 4090 上，Shared Memory 版归约时间约为 **0.0038 ms**，达到了超过基准 Simple 版本 30% 到 40% 的速度增幅。
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      Reduce Sum 性能基准测试
+========================================
+数组大小：2048 元素
+数据大小：0.0078 MB
+Block 大小：1024 线程
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+CPU 执行时间：     0.0030 ms
+
+--- GPU 版本 1: Simple Reduce ---
+H2D 传输时间：     0.0092 ms
+Kernel 执行时间：  0.0051 ms (100 次平均)
+D2H 传输时间：     0.0087 ms
+GPU 总时间：       0.0231 ms
+
+--- GPU 版本 2: Convergent Reduce ---
+H2D 传输时间：     0.0065 ms
+Kernel 执行时间：  0.0038 ms (100 次平均)
+D2H 传输时间：     0.0058 ms
+GPU 总时间：       0.0161 ms
+
+--- GPU 版本 3: Shared Memory Reduce ---
+H2D 传输时间：     0.0062 ms
+Kernel 执行时间：  0.0038 ms (100 次平均)
+D2H 传输时间：     0.0051 ms
+GPU 总时间：       0.0151 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：0.79x
+CPU vs GPU 总时间加速比：0.20x
+GPU 有效带宽：2.17 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+Simple:        0.0051 ms (基准)
+Convergent:    0.0038 ms (1.36x)
+Shared Mem:      0.00 ms (1.36x)
+
+--- 结果验证 ---
+✓ Simple Reduce PASSED: 结果 2048.00 (期望 2048.00)
+✓ Convergent Reduce PASSED: 结果 2048.00 (期望 2048.00)
+✓ Shared Mem Reduce PASSED: 结果 2048.00 (期望 2048.00)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
@@ -308,8 +375,77 @@ FMA:         0.0055 ms (1.68x)
 3. **执行表现**: 归约耗时进一步下降到 **0.005 ms**，在极大数组时使得 GPU 计算能力和极低延迟获得体现，对比纯 CPU `4.78 ms`，加速可达 **~1000x**。
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+   Reduce Optimized 性能基准测试
+========================================
+数组大小：1048576 (1 M) 元素
+数据大小：4.00 MB
+Block 大小：1024 线程
+粗化因子：4
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+CPU 执行时间：       4.69 ms
+CPU 求和结果：   519036.00
+CPU 最大值结果： 0.99
+
+--- GPU 版本 1: Segmented Reduce Sum ---
+H2D 传输时间：       0.42 ms
+Kernel 执行时间：    0.01 ms (100 次平均)
+D2H 传输时间：       0.01 ms
+GPU 总时间：         0.44 ms
+
+--- GPU 版本 2: Coarsened Reduce Sum ---
+H2D 传输时间：       0.41 ms
+Kernel 执行时间：    0.00 ms (100 次平均)
+D2H 传输时间：       0.01 ms
+GPU 总时间：         0.42 ms
+
+--- GPU 版本 3: Coarsened Reduce Max ---
+H2D 传输时间：       0.39 ms
+Kernel 执行时间：    0.00 ms (100 次平均)
+D2H 传输时间：       0.01 ms
+GPU 总时间：         0.40 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：991.52x
+CPU vs GPU 总时间加速比：11.24x
+GPU 有效带宽：887.48 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+Segmented:     0.0084 ms (基准)
+Coarsened:     0.0047 ms (1.77x)
+
+--- 结果验证 ---
+✓ Segmented Sum PASSED: 结果 519035.97 (期望 519036.00)
+✓ Coarsened Sum PASSED: 结果 519035.97 (期望 519036.00)
+✓ Coarsened Max PASSED: 结果 0.99 (期望 0.99)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
@@ -323,7 +459,76 @@ FMA:         0.0055 ms (1.68x)
 3. **查错结果**: 规约 `1M` 规模仅需 **0.0054 ms**，精度截断在可接受范围内的误差，通过了 `verify_results` 并且所有测例均获得 PASSED 标志。
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      Dot Product 性能基准测试
+========================================
+数组大小：1048576 (1 M) 元素
+数据大小：8.00 MB (两向量)
+Block 大小：1024 线程
+粗化因子：4
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+CPU 执行时间：       1.69 ms
+CPU 结果：       1048576.00
+
+--- GPU 版本 1: Simple Dot Product ---
+H2D 传输时间：       0.82 ms
+Kernel 执行时间：  0.0092 ms (100 次平均)
+D2H 传输时间：     0.0079 ms
+GPU 总时间：       0.8346 ms
+
+--- GPU 版本 2: Coarsened Dot Product ---
+H2D 传输时间：     0.8166 ms
+Kernel 执行时间：  0.0056 ms (100 次平均)
+D2H 传输时间：     0.0061 ms
+GPU 总时间：       0.8283 ms
+
+--- GPU 版本 3: FMA Dot Product ---
+H2D 传输时间：     0.7820 ms
+Kernel 执行时间：  0.0056 ms (100 次平均)
+D2H 传输时间：     0.0054 ms
+GPU 总时间：       0.7930 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：303.86x
+CPU vs GPU 总时间加速比：2.13x
+GPU 有效带宽：1506.49 GB/s
+(RTX 4090 DRAM 理论峰值：~1008 GB/s，L2 峰值更高)
+
+--- Kernel 性能对比 ---
+Simple:      0.0092 ms (基准)
+Coarsened:   0.0056 ms (1.65x)
+FMA:         0.0056 ms (1.66x)
+
+--- 结果验证 ---
+✓ Simple PASSED: 结果 1048576.00 (期望 1048576.00)
+✓ Coarsened PASSED: 结果 1048576.00 (期望 1048576.00)
+✓ FMA PASSED: 结果 1048576.00 (期望 1048576.00)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```

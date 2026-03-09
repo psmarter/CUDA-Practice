@@ -136,7 +136,7 @@ AllReduce 跨设备执行耗时: 28.53 ms
 
 检测到 2 张 GPU，正在初始化 NCCL 环境...
 NCCL 初始化成功，开始执行 AllReduce ...
-AllReduce 跨设备执行耗时: 25.83 ms
+AllReduce 跨设备执行耗时: 28.20 ms
 --- 结果验证 ---
 ✓ 全局 AllReduce 同步验证通过。所有设备归约到的结果都是 1.00
 

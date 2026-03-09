@@ -240,8 +240,105 @@ Brent-Kung:    0.0037 ms (0.76x)
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+   测试场景 1：小数据量（算法对比）
+========================================
+数组大小：4096 元素
+数据大小：16.00 KB
+Block 大小：1024 线程
+粗化因子：4
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+CPU 执行时间：       0.01 ms
+CPU 结果（末尾）：1860.60
+
+--- GPU 版本 1: Coarse Scan ---
+H2D 传输时间：       0.01 ms
+Kernel 执行时间：    0.00 ms (100 次平均)
+D2H 传输时间：       0.01 ms
+GPU 总时间：         0.03 ms
+
+--- GPU 版本 2: Segmented Scan ---
+H2D 传输时间：       0.01 ms
+Kernel 执行时间：    0.01 ms (100 次平均)
+D2H 传输时间：       0.01 ms
+GPU 总时间：         0.02 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：1.27x
+CPU vs GPU 总时间加速比：0.24x
+GPU 有效带宽：6.93 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+Coarse Scan:      0.0047 ms (基准)
+Segmented Scan:   0.0059 ms (0.81x)
+
+--- 结果验证 ---
+✓ Coarse Scan PASSED: 结果 1860.60 (期望 1860.60)
+✓ Segmented Scan PASSED: 结果 1860.60 (期望 1860.60)
+✓ 算法一致性 PASSED: 结果 1860.60 (期望 1860.60)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
+   测试场景 2：大数据量（性能测试）
+========================================
+数组大小：1048576 (1 M) 元素
+数据大小：4.00 MB
+Block 大小：1024 线程
+Block 数量：1024
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+CPU 执行时间：       1.79 ms
+CPU 结果（末尾）：471818.66
+
+--- GPU 版本: Segmented Scan ---
+H2D 传输时间：       0.38 ms
+Kernel 执行时间：    0.02 ms (100 次平均)
+D2H 传输时间：       0.45 ms
+GPU 总时间：         0.85 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：80.69x
+CPU vs GPU 总时间加速比：2.09x
+GPU 有效带宽：378.77 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比（数据规模扩展）---
+小数据量 Segmented:   0.0059 ms (4096 元素)
+大数据量 Segmented:   0.0221 ms (1M 元素)
+数据量增长：256x
+Kernel 时间增长：3.78x
+
+--- 结果验证 ---
+✓ Segmented Scan PASSED: 结果 471823.41 (期望 471818.66)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
@@ -256,8 +353,68 @@ Brent-Kung:    0.0037 ms (0.76x)
 
 **Sanitizer & 运行测试输出**: 
 ```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      前缀和（Scan）性能基准测试
+========================================
+数组大小：1024 元素
+数据大小：4.00 KB
+Block 大小：1024 线程
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+CPU 执行时间：       0.00 ms
+
+--- GPU 版本 1: Kogge-Stone ---
+H2D 传输时间：       0.01 ms
+Kernel 执行时间：    0.00 ms (100 次平均)
+D2H 传输时间：       0.01 ms
+GPU 总时间：         0.02 ms
+
+--- GPU 版本 2: Brent-Kung ---
+H2D 传输时间：       0.01 ms
+Kernel 执行时间：    0.00 ms (100 次平均)
+D2H 传输时间：       0.01 ms
+GPU 总时间：         0.02 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：0.27x
+CPU vs GPU 总时间加速比：0.06x
+GPU 有效带宽：2.21 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+Kogge-Stone:   0.0028 ms (基准)
+Brent-Kung:    0.0037 ms (0.76x)
+
+--- 结果验证 ---
+✓ Kogge-Stone PASSED: 结果 451.60 (期望 451.60)
+✓ Brent-Kung PASSED: 结果 451.60 (期望 451.60)
+✓ 算法一致性 PASSED: 结果 451.60 (期望 451.60)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
 
 ```
 
