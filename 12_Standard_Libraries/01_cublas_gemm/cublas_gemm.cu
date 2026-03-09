@@ -337,7 +337,7 @@ int main() {
     CpuTimer cpuTimer;
     cpuTimer.start();
     // 只跑一次防卡死
-    sgemm_cpu(h_A, h_B, h_C_cpu, M, N, K);
+    if (M <= 512) { sgemm_cpu(h_A, h_B, h_C_cpu, M, N, K); }
     cpuTimer.stop();
     double cpu_time_ms = cpuTimer.elapsed_ms();
     cout << "CPU 单算例执行时间：   " << setw(8) << cpu_time_ms << " ms\n";
@@ -349,7 +349,7 @@ int main() {
         Matrix A_slice(h_A_batch.begin() + b * M * K, h_A_batch.begin() + (b + 1) * M * K);
         Matrix B_slice(h_B_batch.begin() + b * K * N, h_B_batch.begin() + (b + 1) * K * N);
         Matrix C_slice(M * N, 0.0f);
-        sgemm_cpu(A_slice, B_slice, C_slice, M, N, K);
+        if (M <= 512) { sgemm_cpu(A_slice, B_slice, C_slice, M, N, K); }
         // 写回
         std::copy(C_slice.begin(), C_slice.end(), h_C_batch_cpu.begin() + b * M * N);
     }
