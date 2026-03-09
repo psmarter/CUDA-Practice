@@ -28,64 +28,6 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 ## 四、 本地自动脚本基础运行记录
 *(此下为真机二进制标准执行日志)*
 
-
-
-
-
-### Binary: cute_basics
-#### Standard Execution & CUDA Timer
-```text
-检测到 2 块 CUDA 设备
-设备 0： NVIDIA GeForce RTX 4090
-  计算能力：8.9
-  全局显存：23.65 GB
-  每个 Block 共享内存：49152 Bytes
-  每个 Block 最大线程数：1024
-  Block 维度上限：(1024, 1024, 64)
-  Grid 尺寸上限：(2147483647, 65535, 65535)
-  Warp 大小：32
-  SM 数量：128
-  每个 SM 最大线程数：1536
-设备 1： NVIDIA GeForce RTX 4090
-  计算能力：8.9
-  全局显存：23.64 GB
-  每个 Block 共享内存：49152 Bytes
-  每个 Block 最大线程数：1024
-  Block 维度上限：(1024, 1024, 64)
-  Grid 尺寸上限：(2147483647, 65535, 65535)
-  Warp 大小：32
-  SM 数量：128
-  每个 SM 最大线程数：1536
-
-========================================
-      CuTe (CUTLASS 3.x) 基础演示
-========================================
-
->>> 运行 CuTe Print Kernel ... <<<
---- CuTe Layout 基础演示 ---
-Layout 2D Shape: (0, 0)
-Index(1, 2) 的一维偏移量: 6
-
---- CuTe 循环打印 --- 
-layout(0) = 0
-layout(1) = 4
-layout(2) = 8
-layout(3) = 1
-layout(4) = 5
-layout(5) = 9
-layout(6) = 2
-layout(7) = 6
-layout(8) = 10
-layout(9) = 3
-layout(10) = 7
-layout(11) = 11
-
->>> 测试 CuTe Tensor Copy Kernel ... <<<
-✓ CuTe Tensor Copy 验证通过
-
-========================================
-```
-
 ## cutlass_gemm.cu 代码逻辑与测试
 **代码路径**: `14_CUTLASS/01_cutlass_gemm/cutlass_gemm.cu`
 **测试命令**: `./build/14_CUTLASS/01_cutlass_gemm/cutlass_gemm`
