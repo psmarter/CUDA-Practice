@@ -227,3 +227,21 @@ Transform 有效带宽：850.86 GB/s
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## cublas_gemm 代码逻辑与测试
+**实现逻辑分析**:
+1. **cuBLAS**: 使用 NVIDIA 官方高度优化的 cuBLAS 库。
+2. **参考基准**: 为所有 GEMM 手写提供对比的上限天花板基准。
+
+
+## cufft_test 代码逻辑与测试
+**实现逻辑分析**:
+1. **cuFFT**: 快速傅里叶变换的官方实现。
+2. **信号处理**: 对高吞吐的数字信号做快速处理。
+
+
+## thrust_test 代码逻辑与测试
+**实现逻辑分析**:
+1. **Thrust**: 类似 C++ STL 的 CUDA 并行库。
+2. **高效使用**: 提供了高速的 sort, reduce, scan 常规操作封包。
+

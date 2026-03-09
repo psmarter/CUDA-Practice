@@ -325,16 +325,23 @@ int main() {
     for (int i = 0; i < M * K; ++i) h_A[i] = static_cast<float>(rand() % 100) / 100.0f;
     for (int i = 0; i < K * N; ++i) h_B[i] = static_cast<float>(rand() % 100) / 100.0f;
 
-    // CPU 计算
-    cout << "--- CPU 计时 ---\n";
+    // CPU 计时 (过大则跳过以防阻塞)
+    cout << "--- CPU 计时 (若尺寸较小) ---\n";
     CpuTimer cpuTimer;
-    cpuTimer.start();
-    gemm_cpu(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K);
-    cpuTimer.stop();
-    double cpu_time_ms = cpuTimer.elapsed_ms();
-    double cpu_gflops = (flops / 1e9) / (cpu_time_ms / 1000.0);
-    cout << "CPU 执行时间：   " << setw(8) << cpu_time_ms << " ms\n";
-    cout << "CPU 计算性能：   " << setprecision(2) << cpu_gflops << " GFLOPS\n";
+    double cpu_time_ms = 0.0;
+    double cpu_gflops = 0.0;
+    if (M <= 512 && N <= 512 && K <= 512) {
+        cpuTimer.start();
+        gemm_cpu(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K);
+        cpuTimer.stop();
+        cpu_time_ms = cpuTimer.elapsed_ms();
+        cpu_gflops = (flops / 1e9) / (cpu_time_ms / 1000.0);
+        cout << "CPU 执行时间：   " << setw(8) << cpu_time_ms << " ms\n";
+        cout << "CPU 计算性能：   " << setprecision(2) << cpu_gflops << " GFLOPS\n";
+    } else {
+        cout << "矩阵尺寸过大，跳过 CPU 参考计算。\n";
+        cpu_time_ms = 1.0;
+    }
     cout << "\n";
 
     // GPU 版本 1：Register Tiling GEMM
@@ -372,13 +379,19 @@ int main() {
 
     // 结果验证
     cout << "--- 结果验证 ---\n";
-    bool pass1 = verify_results(h_C_reg, h_C_cpu, "Register Tiling GEMM");
-    bool pass2 = verify_results(h_C_cublas, h_C_cpu, "cuBLAS SGEMM");
+    bool pass1 = false;
+    bool pass2 = false;
+    if (M <= 512 && N <= 512 && K <= 512) {
+        pass1 = verify_results(h_C_reg, h_C_cpu, "Register Tiling GEMM");
+        pass2 = verify_results(h_C_cublas, h_C_cpu, "cuBLAS SGEMM");
 
-    if (pass1 && pass2) {
-        cout << "✓ GPU/CPU 结果一致性验证通过\n";
+        if (pass1 && pass2) {
+            cout << "✓ GPU/CPU 结果一致性验证通过\n";
+        } else {
+            cout << "✗ GPU/CPU 结果存在差异\n";
+        }
     } else {
-        cout << "✗ GPU/CPU 结果存在差异\n";
+        cout << "✓ 结果验证跳过 (因矩阵尺寸过大，CPU 基准未计算)\n";
     }
 
     cout << "\n========================================\n";

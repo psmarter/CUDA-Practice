@@ -307,3 +307,21 @@ Exclusive Scan 有效带宽：884.96 GB/s
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## warp_shuffle 代码逻辑与测试
+**实现逻辑分析**:
+1. **Warp Shuffle**: 允许 Warp 内的线程在不使用 Shared Memory 的情况下进行寄存器级别的直接通信。
+2. **应用**: 快速实现并行归约、广播。
+
+
+## warp_reduce 代码逻辑与测试
+**实现逻辑分析**:
+1. **Warp Reduce**: 基于 Shuffle 指令实现的 Warp 内部快速求和归约。
+2. **优势**: 避免了 Shared Memory 的存取延迟和 bank conflict。
+
+
+## warp_scan 代码逻辑与测试
+**实现逻辑分析**:
+1. **Warp Scan**: 基于 Shuffle 指令实现的 Warp 内快速前缀和。
+2. **优势**: 高效地计算 Warp 级别的并行前缀和。
+

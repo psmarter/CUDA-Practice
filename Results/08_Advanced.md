@@ -295,3 +295,21 @@ CUDA Graph Launch:     0.0042 ms (1.20x CPU 发射开销减免)
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## cuda_graphs 代码逻辑与测试
+**实现逻辑分析**:
+1. **CUDA Graphs**: 将一系列 CUDA 操作（Kernel启动、内存拷贝等）拓扑为一个图结构。
+2. **优势**: 一次性提交图执行，极大降低了 CPU 发射 Kernel 的额外开销。
+
+
+## multi_stream 代码逻辑与测试
+**实现逻辑分析**:
+1. **Multi Stream**: 使用多个 CUDA 流使不同的任务在 GPU 上并发和重叠执行。
+2. **重叠**: 实现 Compute 与 Data Transfer (H2D/D2H) 的相互掩盖。
+
+
+## pytorch_extension_test 代码逻辑与测试
+**实现逻辑分析**:
+1. **PyTorch Extension**: 将 CUDA 自定义算子通过 pybind11 封装入 Python，直接给 PyTorch 提供原生定制算子。
+2. **作用**: 消除 Pytorch 底层与 CUDA C++ 的隔阂。
+

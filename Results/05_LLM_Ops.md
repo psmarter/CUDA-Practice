@@ -499,3 +499,36 @@ Flash Attention V3:            5.32 ms (1.25x)
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## softmax 代码逻辑与测试
+**实现逻辑分析**:
+1. **Warp级规约求最值**: 每个 Warp 中的线程并向寻找最大值，以稳定指数运算，防止溢出。
+2. **全局分子分母并行计算**: Exponential计算后在 Warp 内进行加和规约，得出分母，然后完成除法映射。
+3. **LLM核心操作**: 是注意力机制的核心后置归一化算子。
+
+
+## layernorm 代码逻辑与测试
+**实现逻辑分析**:
+1. **均值和方差并行求解**: 单个Block负责一行数据的统计量（均值、平方均值）。
+2. **在线单跑（Welford）**: 高级实现采用单遍读取完成均值与方差的在线计算，节省一次 Global Memory 读写。
+3. **Transformer标配**: 处理张量的最后一维（Hidden dimension），将其规范化。
+
+
+## flash_attention 代码逻辑与测试
+**实现逻辑分析**:
+1. **Tiling & Recomputation (Tiling Forward, Backward Recompute)**: 将 Q, K, V 进行分块装载到 SRAM 流式处理，大幅度省去存取大型 Attention Map ($N \times N$) 所带来 HBM 读写瓶颈。
+2. **理论颠覆**: 从 Memory Bound 成功逆转为 Compute Bound 算子，提速并减少显存占用。
+3. **安全指数规约计算**: 调整 Softmax 在分块中的局部最大值和缩放系数，保持数学等价。
+
+
+## rope 代码逻辑与测试
+**实现逻辑分析**:
+1. **旋转位置编码 (Rotary Position Embedding)**: 将输入映射为复数域上的旋转，在不改变向量范数的前提下，将相对位置信息硬编码进去。
+2. **访存模式优化**: 可以交织处理(相邻对)提取或半切分开操作，要求良好的内存合并特性。
+
+
+## rmsnorm 代码逻辑与测试
+**实现逻辑分析**:
+1. **简化的 LayerNorm**: 去除了均值的减除，只进行均方根缩放。
+2. **效率增益**: 减少了一次全行归约操作（少算一次均值），理论上略快于LayerNorm并在大多数现代LLM（如Llama）中具有等价效果。
+

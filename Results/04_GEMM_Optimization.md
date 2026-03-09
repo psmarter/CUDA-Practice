@@ -252,3 +252,23 @@ Double Buffer GEMM:   0.3155 ms (1.21x)
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## tiled_gemm 代码逻辑与测试
+**实现逻辑分析**:
+1. **Shared Memory Tiling**: 将 Global Memory 中的矩阵切块装载进 Shared Memory 中，再参与乘加。
+2. **性能提升**: 极大地降低了对于 Global memory 的读取次数（降低了N倍的带宽压力），显著提升计算受限程序的性能。
+
+
+## advanced_gemm 代码逻辑与测试
+**实现逻辑分析**:
+1. **Double Buffering**: 引入双缓冲机制，利用异或等切换缓冲区，消除软管线的等待时间。
+2. **指针投递与内存布局转化**: 使用向量化存取(float4)以及 Shared Memory Padding 降低存取延迟。
+3. **优化结果**: 性能通常进一步提升，逼近硬件理论上限的 70-80%。
+
+
+## register_tiling 代码逻辑与测试
+**实现逻辑分析**:
+1. **寄存器重用**: 进一步将 Shared Memory 中的数据缓存到 Registers 中进行反复的 FMA 操作。
+2. **指令级并行**: 通过循环展开（Pragma unroll）提高指令发射速率并减少分支预测开销。
+3. **极端优化边界**: 使该算子受限于寄存器数量和计算单元，而不是带宽层级。
+

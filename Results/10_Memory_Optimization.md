@@ -344,3 +344,21 @@ SoA结构访问 vs AoS访问: 0.99x 加速
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## coalesced_access 代码逻辑与测试
+**实现逻辑分析**:
+1. **合并访存**: 使得 Warp 内连续地址访问能够尽可能在同一个内存事务(transaction)中完成，充分利用带宽。
+2. **优化基石**: 所有对齐 Global memory 访问优化的根本途径。
+
+
+## bank_conflict 代码逻辑与测试
+**实现逻辑分析**:
+1. **Bank Conflict 消除**: 通过改变内存存储步长或增加 padding 阻止多个线程同时访问同一个 Shared Memory Bank。
+2. **带宽救星**: 避免了 Shared Memory 访问的串行化回退。
+
+
+## async_copy 代码逻辑与测试
+**实现逻辑分析**:
+1. **异步拷贝**: 使用 Volta 以后提供的异步内存拷贝机制（如 `cuda::memcpy_async`），由外部硬直接支持。
+2. **Pipeline**: 与计算做到 Pipeline 无缝隐藏，摆脱寄存器做跳板的局限。
+

@@ -341,3 +341,21 @@ Kernel 执行时间：    0.41 ms (10 次平均)
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## occupancy 代码逻辑与测试
+**实现逻辑分析**:
+1. **占用率分析**: 研究 SM 上驻留的 Active Warps 比例。
+2. **制约**: 寻找受限于寄存器还是 Shared Memory 的瓶颈。
+
+
+## roofline 代码逻辑与测试
+**实现逻辑分析**:
+1. **Roofline 模型**: 评估当前算是 Calculate Bound 还是 Memory Bound。
+2. **调优方向**: 给出目前离硬件带宽和算力天花板的相对位置。
+
+
+## nsight_profiling 代码逻辑与测试
+**实现逻辑分析**:
+1. **Nsight Profiling**: 使用 `ncu` 或 `nsys` 具体捕捉执行时的事件流。
+2. **细节捕捉**: 查看 Stall 因素如 MIO, L1 TEX, 等等。
+

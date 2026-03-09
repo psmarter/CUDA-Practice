@@ -408,3 +408,21 @@ CUTLASS/cuBLAS: 152177.8%
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## cutlass_gemm 代码逻辑与测试
+**实现逻辑分析**:
+1. **CUTLASS GEMM**: C++ 模板抽象实现的高性能矩阵乘。
+2. **灵活与极致**: 具有和 cuBLAS 相当的性能又同时完全开源且易配置。
+
+
+## tensorop_gemm 代码逻辑与测试
+**实现逻辑分析**:
+1. **TensorOp GEMM**: CUTLASS 对 Tensor Core 的专属调优。
+2. **硬件挖掘**: 压榨矩阵运算流水线与寄存器分配的理论上限。
+
+
+## cute_basics 代码逻辑与测试
+**实现逻辑分析**:
+1. **CuTe Basics**: CUTLASS 最新的 Layout/Tensor Tiling 核心抽象库。
+2. **理论颠覆**: 使用纯粹代数语义化来描述原本复杂的内存偏移映射关系。
+

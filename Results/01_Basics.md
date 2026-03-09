@@ -225,11 +225,10 @@ CPU 计算性能：1.03 GFLOPS
 **代码路径**: `01_Basics/01_vector_add/vector_add.cu`
 **测试命令**: `./build/01_Basics/01_vector_add/vector_add`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
-
+**实现逻辑分析**:
+1. **核心逻辑**: 这是 CUDA 编程的最基础范例。在 Kernel (`vector_add_kernel`) 中运用了 Grid-Stride Loop（网格跨步循环）设计，`i = blockIdx.x * blockDim.x + threadIdx.x; i += blockDim.x * gridDim.x`机制使得处理超大规模元素 (64M) 时不受 Grid 维度限制。
+2. **主机管理**: 分配超大内存 (单数组 256MB) 完成 `cudaMemcpy` 搬留。
+3. **性能结果**: Kernel 耗时仅 **0.86ms** 左右。不仅对 CPU 产生 180x+ 加速，在 RTX 4090 上展现了 932.97 GB/s 的极限高带宽表现，完美压榨了显存总线。
 **Sanitizer & 运行测试输出**: 
 ```text
 ========= COMPUTE-SANITIZER
@@ -241,11 +240,10 @@ CPU 计算性能：1.03 GFLOPS
 **代码路径**: `01_Basics/03_matrix_mul_tiled/matrix_mul_tiled.cu`
 **测试命令**: `./build/01_Basics/03_matrix_mul_tiled/matrix_mul_tiled`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
-
+**实现逻辑分析**:
+1. **基于 Tiling 改进**: 把全局大矩阵均分为 `TILE_SIZE x TILE_SIZE`（如 32x32）的小方块，并利用每个 Block 极其低延迟的 Shared Memory 寄存局部数据 `__shared__ float s_A[...][...]`。
+2. **减少显存压力**: 通过线程同步 `__syncthreads()`，Block 中多线程能够高效复位和重复利用片内数据，大幅度缩小 Global Memory 的带宽瓶颈拖累。
+3. **性能结果**: 在 1024x1024 测试规模下表现优异，其耗时缩降至 **0.31ms**，运算性能由朴素版的 5200 GFLOPS 跃升至 **6925 GFLOPS**。计算结果与 CPU 对比保持一致无误差。
 **Sanitizer & 运行测试输出**: 
 ```text
 ========= COMPUTE-SANITIZER
@@ -257,11 +255,10 @@ CPU 计算性能：1.03 GFLOPS
 **代码路径**: `01_Basics/02_matrix_mul_naive/matrix_mul_naive.cu`
 **测试命令**: `./build/01_Basics/02_matrix_mul_naive/matrix_mul_naive`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
-
+**实现逻辑分析**:
+1. **原始数学逻辑直录**: 直接依照矩阵乘法定义编写，通过 `blockIdx` 与 `threadIdx` 获取每个线程计算位置，内部运用单一的由 0 到 K 的大循环 `for` 直接累加乘积。
+2. **未优化痛点展示**: 每个线程需要自发向全局内存读取整行/列的 N 个元素，使得大量相似访存未被合并使用，导致了高昂的 Global Memory 延迟堆积。
+3. **性能基准验证**: 能够被 4090 并行化执行而时间压缩至约 **0.41ms** (相较于单核 CPU 的 2100ms 是巨大的 5100倍 碾压)，但相对于 GPU 理论浮点极限算力和带 Tiling 的进阶方法还有进一步发展空间。
 **Sanitizer & 运行测试输出**: 
 ```text
 ========= COMPUTE-SANITIZER

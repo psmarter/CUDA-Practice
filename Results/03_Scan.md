@@ -260,3 +260,16 @@ Brent-Kung:    0.0037 ms (0.76x)
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## prefix_sum 代码逻辑与测试
+**实现逻辑分析**:
+1. **前缀和基本原理**: 利用Blelloch/Kogge-Stone等并行算法，通过两阶段（Up-sweep/Down-sweep）或者分步累加的方法完成Scan操作。
+2. **Bank Conflict与优化**: 通过Shared memory计算并在索引中插入padding，以避免bank conflict。
+3. **多Block扩展**: 单个Block完成内部的Prefix sum后，输出中间数组（各个Block的最后一个元素的扫描值），再次进行Scan，最后加回原本数组，实现Global Scan。
+
+
+## segmented_scan 代码逻辑与测试
+**实现逻辑分析**:
+1. **扩展前缀和**: 基于Flag数组划定段边界，在跨越段边界时中断累加，只在同段内执行Scan。
+2. **应用场景**: 用于稀疏矩阵计算、图算法中划分不同的子任务区间直接并行计算。
+

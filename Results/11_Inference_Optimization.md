@@ -322,3 +322,21 @@ Varlen Packed  显存  ：1311.22 MB
 ========= Unable to find injection library libsanitizer-collection.so
 
 ```
+
+## kv_cache 代码逻辑与测试
+**实现逻辑分析**:
+1. **KV Cache**: LLM Transformer 中对过去 token 的 Key 和 Value 进行缓存以避免重复计算。
+2. **访存密集**: 将原先密集计算转变为访存受限计算的推手。
+
+
+## kernel_fusion 代码逻辑与测试
+**实现逻辑分析**:
+1. **Kernel Fusion**: 将多个琐碎的内核合并成一个，避免对 Global memory 的重复读写。
+2. **效率**: 省去了多次 Launch overhead，将很多数据驻留在寄存器或 Shared memory 内部周转。
+
+
+## dynamic_batching 代码逻辑与测试
+**实现逻辑分析**:
+1. **Dynamic Batching**: 动态地将到达推理服务器不同长度或不同时间的请求拼合成批次计算。
+2. **吞吐化**: 使算力密集的硬件得以喂饱。
+
