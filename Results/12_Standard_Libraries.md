@@ -26,38 +26,78 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 ```
 
 ## 四、 本地自动脚本基础运行记录
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
-# 12_Standard_Libraries 综合测试报告
+### Binary: cublas_gemm
+#### Standard Execution & CUDA Timer
+```text
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
 
-## 一、 测试条件
-- **测试环境**: 当前 Linux 编译环境 (包含 CMake, NVCC)
-- **硬件配置**: 多卡环境 (2x NVIDIA GeForce RTX 4090, 架构 sm_89)
-- **编译参数**: `nvcc` -O3, 标准 CUDA 运行时，启用 C++17
-- **测试库依赖**: CUDA 原生库 (cuBLAS, cuFFT), CUTLASS, NCCL (针对多卡)
+========================================
+      cuBLAS GEMM 官方标准库性能测试
+========================================
+矩阵形状：M=1024, N=1024, K=1024
+单算例数据量：12.00 MB
+Batch 规模  ：8 个矩阵组合 (96.00 MB)
+Kernel 迭代次数：50 次
 
-## 二、 测试方法与执行逻辑
-针对此模块下的实现，测试覆盖了：
-1. **正确性验证 (Correctness Check)**：使用 CPU 计算出基准结果 (Reference)，与 GPU 计算结果进行对比并使用宏 `CHECK` 比较误差。
-2. **基本耗时测量 (Timer)**：依赖 `cudaEventRecord` 或者 `std::chrono` 来统计算子的时间。
-3. **安全与内存分析 (Compute Sanitizer)**：部分核心利用 `compute-sanitizer` 检查 Shared Memory/Global Memory 越界。
-4. **性能剖析探测 (Nsight Compute - ncu)**：通过 `ncu` 收集 `sm__throughput`, `dram__bytes` 及寄存器利用率数据。
+--- CPU 计时 (M=1024, N=1024, K=1024) ---
+CPU 单算例执行时间：       0.00 ms
 
-## 三、 测试命令模板
-```bash
-# 标准正确性运行
-./build/12_Standard_Libraries/<sub_directory>/<binary_name>
+--- GPU 版本 1: 基础 cublasSgemm ---
+H2D 传输时间：       0.93 ms
+Kernel 执行时间：    0.04 ms (50 次平均)
+D2H 传输时间：       0.56 ms
+GPU 总时间：         1.53 ms
 
-# 内存排错检查
-compute-sanitizer ./build/12_Standard_Libraries/<sub_directory>/<binary_name>
+--- GPU 版本 2: 启发式 cublasLtMatmul ---
+H2D 传输时间：       1.08 ms
+Kernel 执行时间：    0.04 ms (50 次平均)
+D2H 传输时间：       0.52 ms
+GPU 总时间：         1.64 ms
 
-# Nsight Compute 吞吐性能捕获
-ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./<binary_name>
+--- GPU 版本 3: Strided Batched SGEMM (Batch=8) ---
+H2D 传输时间：       7.83 ms
+Kernel 执行时间：    0.34 ms (50 次平均)
+D2H 传输时间：       3.54 ms
+GPU 总时间：        11.71 ms
+
+--- 性能分析 (TFLOPS) ---
+CPU vs GPU (基础) 加速比：0.00x
+
+cublasSgemm       算力：   49.91 TFLOPS
+cublasLtMatmul    算力：   50.17 TFLOPS
+StridedBatched    算力：   50.67 TFLOPS (相比单算例通常隐藏了 Kernel 启动开销)
+(RTX 4090 FP32 理论峰值：~82.58 TFLOPS)
+
+--- 结果验证 ---
+  [Skip] cublasSgemm	 validation for large matrices.
+  [Skip] cublasLtMatmul	 validation for large matrices.
+  [Skip] StridedBatched	 validation for large matrices.
+✓ GPU/CPU 一致性验证全部通过 (处理了 Row-Major 转置机制)
+
+========================================
 ```
-
-## 四、 本地自动脚本基础运行记录
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
-
 
 ### Binary: cufft_example
 #### Standard Execution & CUDA Timer
@@ -92,24 +132,24 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 Kernel 迭代次数：100 次
 
 --- CPU 计时 (DFT $O(N^2)$) ---
-CPU DFT 耗时：   392.5050 ms
+CPU DFT 耗时：   395.2370 ms
 
 --- GPU 版本 1: cuFFT 1D (Forward) ---
 H2D 传输时间：     0.0123 ms
-Kernel 执行时间：  0.0035 ms (100 次平均)
-D2H 传输时间：     0.0117 ms
-GPU 总时间：       0.0035 ms (纯算力段)
+Kernel 执行时间：  0.0037 ms (100 次平均)
+D2H 传输时间：     0.0118 ms
+GPU 总时间：       0.0037 ms (纯算力段)
 
 --- GPU 版本 2: cuFFT 1D (Inverse) ---
-Kernel 执行时间：  0.0051 ms (100 次平均)
+Kernel 执行时间：  0.0054 ms (100 次平均)
 
 --- 性能分析与拓展基准 ---
-CPU(Naive) vs GPU(cuFFT) 加速比（4096 维度下）：112736.96x
+CPU(Naive) vs GPU(cuFFT) 加速比（4096 维度下）：107159.09x
 >> 注：这并不公平，因为 CPU 为 O(N^2) 而 GPU 基于 O(N log N) 库。仅仅用于功能对比和感受差距。
 
 ===> 测试大数据吞吐量 (Batch=65536, N=1024) <===
 巨量 Batch Kernel 执行时间：    1.17 ms (10 次平均)
-GPU 最小理论访存有效带宽：457.06 GB/s
+GPU 最小理论访存有效带宽：457.55 GB/s
 (RTX 4090 理论峰值：~1008 GB/s)
 
 --- 结果验证 ---
@@ -119,10 +159,7 @@ GPU 最小理论访存有效带宽：457.06 GB/s
 
 ========================================
 ```
-### Binary: cublas_gemm
-#### Standard Execution & CUDA Timer
-```text
-```
+
 ### Binary: thrust_algorithms
 #### Standard Execution & CUDA Timer
 ```text
@@ -156,92 +193,68 @@ GPU 最小理论访存有效带宽：457.06 GB/s
 Kernel 迭代次数：100 次
 
 ---------- [1] Sort (排序) ----------
-CPU std::sort 时间： 2125.47 ms
-GPU thrust::sort 时间：    1.32 ms (5次平均)
-GPU Sort 加速比：1609.28x
+CPU std::sort 时间： 2121.84 ms
+GPU thrust::sort 时间：    1.30 ms (5次平均)
+GPU Sort 加速比：1629.79x
 ✓ thrust::sort	 PASSED: 结果 0.00 (期望 0.00)
 
 ---------- [2] Reduce (归约 sum) ----------
-CPU std::accumulate 时间：   28.08 ms
+CPU std::accumulate 时间：   28.04 ms
 GPU thrust::reduce 时间：    0.08 ms (100 次平均)
-GPU Reduce 加速比：368.33x
-Reduce 有效带宽：488.69 GB/s
+GPU Reduce 加速比：364.74x
+Reduce 有效带宽：484.50 GB/s
 (RTX 4090 理论峰值：~1008 GB/s)
 ✓ thrust::reduce	 PASSED: 结果 500073024.00 (期望 500073024.00)
 
 ---------- [3] Transform (SAXPY元素级) ----------
-CPU for-loop SAXPY 时间：   29.42 ms
+CPU for-loop SAXPY 时间：   29.87 ms
 GPU thrust::transform 时间：    0.13 ms (100 次平均)
-GPU Transform 加速比：224.01x
-Transform 有效带宽：850.86 GB/s
+GPU Transform 加速比：226.45x
+Transform 有效带宽：847.16 GB/s
 (RTX 4090 理论峰值：~1008 GB/s)
 ✓ thrust::transform PASSED: 结果 53.27 (期望 53.27)
 
 ========================================
 ```
 
-## cufft_example.cu 代码逻辑与测试
-**代码路径**: `12_Standard_Libraries/02_cufft/cufft_example.cu`
-**测试命令**: `./build/12_Standard_Libraries/02_cufft/cufft_example`
-
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
-
-**Sanitizer & 运行测试输出**: 
-```text
-========= COMPUTE-SANITIZER
-========= Unable to find injection library libsanitizer-collection.so
-
-```
-
 ## cublas_gemm.cu 代码逻辑与测试
 **代码路径**: `12_Standard_Libraries/01_cublas_gemm/cublas_gemm.cu`
 **测试命令**: `./build/12_Standard_Libraries/01_cublas_gemm/cublas_gemm`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**:
+1. **cuBLAS**: 使用 NVIDIA 官方高度优化的 cuBLAS 库。
+2. **参考基准**: 为所有 GEMM 手写提供对比的上限天花板基准。
 
 **Sanitizer & 运行测试输出**: 
 ```text
 ========= COMPUTE-SANITIZER
 ========= Unable to find injection library libsanitizer-collection.so
+```
 
+## cufft_example.cu 代码逻辑与测试
+**代码路径**: `12_Standard_Libraries/02_cufft/cufft_example.cu`
+**测试命令**: `./build/12_Standard_Libraries/02_cufft/cufft_example`
+
+**实现逻辑分析**:
+1. **cuFFT**: 快速傅里叶变换的官方实现。
+2. **信号处理**: 对高吞吐的数字信号做快速处理。
+
+**Sanitizer & 运行测试输出**: 
+```text
+========= COMPUTE-SANITIZER
+========= Unable to find injection library libsanitizer-collection.so
 ```
 
 ## thrust_algorithms.cu 代码逻辑与测试
 **代码路径**: `12_Standard_Libraries/03_thrust/thrust_algorithms.cu`
 **测试命令**: `./build/12_Standard_Libraries/03_thrust/thrust_algorithms`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**:
+1. **Thrust**: 类似 C++ STL 的 CUDA 并行库。
+2. **高效使用**: 提供了高速的 sort, reduce, scan 常规操作封包。
 
 **Sanitizer & 运行测试输出**: 
 ```text
 ========= COMPUTE-SANITIZER
 ========= Unable to find injection library libsanitizer-collection.so
-
 ```
-
-## cublas_gemm 代码逻辑与测试
-**实现逻辑分析**:
-1. **cuBLAS**: 使用 NVIDIA 官方高度优化的 cuBLAS 库。
-2. **参考基准**: 为所有 GEMM 手写提供对比的上限天花板基准。
-
-
-## cufft_test 代码逻辑与测试
-**实现逻辑分析**:
-1. **cuFFT**: 快速傅里叶变换的官方实现。
-2. **信号处理**: 对高吞吐的数字信号做快速处理。
-
-
-## thrust_test 代码逻辑与测试
-**实现逻辑分析**:
-1. **Thrust**: 类似 C++ STL 的 CUDA 并行库。
-2. **高效使用**: 提供了高速的 sort, reduce, scan 常规操作封包。
-
