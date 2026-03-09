@@ -1,97 +1,223 @@
-# 13_Performance_Analysis: 性能分析与瓶颈定位
+# 13_Performance_Analysis 性能调优与瓶颈分析
 
-## 1. 全景导览与学习目标 (Overview & Learning Objectives)
+## 一、 全景导览与学习目标
 
-不善用剖析器（Profiler）的程序员只能在黑箱外猜想，“测量胜于直觉”，在底层硬件优化上更是绝对的真理。本章的学习目标是深入掌握 NVIDIA 的原厂性能杀器：Nsight Systems (`nsys`) 与 Nsight Compute (`ncu`)，并结合理论分析模型剖析 Kernel 性能瓶颈。
+该子项目处于 CUDA-Practice 学习体系的 **高阶系统级 (L4)** 阶段。真正的顶尖 CUDA 工程师不仅会写各种花哨的 Kernel，更重要的是拥有**“看病”**的能力——当一个算子跑得慢时，能精确诊断出它是被显存带宽卡主了，还是计算核心喂不饱，亦或是流水线被数据依赖阻塞。
 
-目录下的子模块通过不同维度展示了性能度量的基本原理与实践：
+本章脱离了单纯的算法实现，转向**性能工程 (Performance Engineering)**，系统性地涵盖了三大性能调优标杆工具与理论：
 
-- `01_occupancy/`：探讨 Occupancy（SM 驻留率）与 ILP（指令级并行）的权衡。展示如何通过调整线程数和每线程处理的数据量（Data per Thread），在低 Occupancy 下利用 ILP 完美隐藏延迟并跑满带宽。
-- `02_roofline/`：基于实际测量的硬件峰值（Peak TFLOPS 与 Peak Bandwidth），验证经典的屋顶线模型（Roofline Model）。展示 Vector Add（Memory Bound）与 GEMM（Compute Bound）在算术强度（Arithmetic Intensity）层面的差异。
-- `03_nsight_profiling/`：展示如何使用 NVTX (NVIDIA Tools Extension) 在 C++ 源码中植入 `nvtxRangePush` 和 `nvtxRangePop` 性能标记，以方便 `nsys` 追踪时序以及验证 Coalesced/Non-coalesced 访存行为的带宽差异。
+- `01_occupancy`：**占用率分析 (Occupancy Analysis)**。用极端的 Kernel 案例展示：为什么有时候 100% 满负载的 Occupancy 跑不过只有 12% Occupancy 的 Kernel？揭开 ILP (指令级并行) 隐藏延迟的真相。
+- `02_roofline`：**Roofline Model (房顶线模型)**。构建硬件的绝对性能天花板画像。通过计算算术强度 (Arithmetic Intensity)，精确评估你的算子是 “Memory Bound” 还是 “Compute Bound”。
+- `03_nsight_profiling`：**Nsight 工具链实战**。抛弃简陋的 `cudaEvent`，直接上核弹级分析工具 Nsight Systems 与 Nsight Compute，在汇编与硬件事件图表级别抓取诸如非合并访存等致命瓶颈。
 
-## 2. 原理推导与数学表达 (Math & Logic)
+---
 
-**屋顶线模型 (Roofline Model)** 的核心表达反映了计算量与访存量的制约关系。
-- 横轴：算术强度（Arithmetic Intensity）$I$ = 总计 FLOPs / 总计内存读取与写入 Bytes
-- 纵轴：内核算力性能 $P$ (FLOPs/second)
+## 二、 原理推导与数学表达
 
-屋顶的平坦上限由硬件理论计算峰值限制：$P_{peak}$
-受限于内存带宽的左侧斜坡限制方程式为：带宽高斜率 $BW_{peak}$
-$$ P = I \times BW_{peak} $$
+### 1. Occupancy (占用率) 理论
 
-内核的最终可达性能 $P_{achieved}$ 是二者的下限：
-$$ P_{achieved} = \min(P_{peak}, \; I \times BW_{peak}) $$
+Occupancy 的定义为：当前 SM (Streaming Multiprocessor) 上活跃的 Warp 数量，除以该 SM 硬件允许的最大 Warp 数量：
+$$ \text{Occupancy} = \frac{\text{Active Warps per SM}}{\text{Max Warps per SM}} \times 100\% $$
+提升 Occupancy 的传统目的是**为了在某些 Warp 等待数据时，有足够多的其他 Warp 切入执行以隐藏延迟 (Latency Hiding)**。但正如本章所揭示的，如果单个 Thread 通过指令级并行 (ILP, Instruction-Level Parallelism) 发起足够多无依赖的独立访存/计算指令，同样能填满流水线，此时较低的 Occupancy 亦能达到峰值带宽。
 
-拐点（Ridge Point）计算公式：
-$$ I_{ridge} = \frac{P_{peak}}{BW_{peak}} $$
-当内核的算术强度 $I < I_{ridge}$ 时，处于 Memory Bound 区；反之则处于 Compute Bound 区。
+### 2. Roofline Model (房顶线模型)
 
-## 3. 内存与线程的硬核博弈 (Mapping & Occupancy)
+评估一个 Kernel 的绝对性能边界，需要确定其**算术强度 (Arithmetic Intensity, $I$)**，即每访问 1 Byte Global Memory 所执行的浮点运算次数：
+$$ I = \frac{\text{Total FLOPS}}{\text{Total Bytes Accessed}} \quad \text{(FLOPS/Byte)} $$
 
-Occupancy（驻留率）指的是当前 SM 上活跃的 Warp 数占该 SM 最大可并发 Warp 数的比例。经典的直觉认为 100% 的 Occupancy 能最大化隐蔽全局访存延迟。然而，通过 `01_occupancy` 可证实指令级并行（ILP）的威力。
+硬件的最终吞吐上限 $P$ (GFLOPS) 被限制在两条“房顶”之下：
+$$ P = \min(P_{\text{peak}}, \ I \times B_{\text{peak}}) $$
 
-在同样的 256M 个浮点数拷贝任务中：
-- **高 Occupancy (256 Threads, 1 element/thread)**：虽然有更多的活跃 Warp 在等待，但由于单线程执行指令的跨度太短，带宽利用率约为 1212 GB/s。
-- **低 Occupancy + ILP (64 Threads, 16 elements/thread)**：通过寄存器展开，单个线程一次性发射多条独立访存指令。此时 Occupancy 极低，但掩盖延迟的效率极高，带宽飙升至 1365 GB/s。
+- $P_{\text{peak}}$: 硬件理论峰值算力
+- $B_{\text{peak}}$: 硬件理论峰值内存带宽
+- **拐点 (Ridge Point)**: $I_{\text{ridge}} = P_{\text{peak}} / B_{\text{peak}}$。若算子的 $I < I_{\text{ridge}}$，则为 **Memory Bound**；若 $I > I_{\text{ridge}}$，则为 **Compute Bound**。
 
-> **核心结论**：盲目追求 100% Occupancy 是误区。适当增加每个线程的工作量（Register Pressure / ILP），只要不引发严重的 Register Spilling，往往能带来突破物理占用上限的极致性能。
+---
 
-## 4. 关键源码逐行解剖 (Code Deep-Dive)
+## 三、 硬核内存映射解析
 
-来自 `03_nsight_profiling/nsight_profiling.cu`，利用 NVTX 辅助 profiling 发射测定。
-通过 RAII 机制包装 `nvtxRangePush`，我们可以在 Nsight 系统时间轴上看到极为干净明了的色带，完美避开 CPU/GPU 异步执行带来的测量杂讯。
+### Roofline Model 硬件画像图 (RTX 4090)
+
+使用折线图直观表达 RTX 4090 架构的 Roofline 边界。
+
+```mermaid
+xychart-beta
+  title "RTX 4090 Roofline Model (单精度 FP32)"
+  x-axis "算术强度 (FLOPS/Byte) [对数尺度等价展现]" [0.01, 0.1, 1, 10, 85.3, 100, 200]
+  y-axis "性能 (TFLOPS)" 0 --> 90
+  line "Memory Bound 斜率界限" [0.01, 0.10, 1.01, 10.08, 86.02, 86.02, 86.02]
+  line "Compute Bound 天花板" [86.02, 86.02, 86.02, 86.02, 86.02, 86.02, 86.02]
+```
+
+> **解析**：在 RTX 4090 上，拐点算术强度高达 **85.33 FLOPS/Byte**。这意味着绝大多数没有做极致 registers/shared-memory tiling 复用的基础算子（例如基础 GEMM、各类 Element-wise 操作）都会无情地撞上左侧的倾斜屋顶，沦为 **Memory Bound**。
+
+### Nsight 工具链全景流水线
+
+```mermaid
+graph TD
+    classDef C_data fill:#f0f9ff,stroke:#3b82f6;
+    classDef F_data fill:#fff1f2,stroke:#ef4444;
+
+    Src["CUDA 源码 + NVTX 标记"]:::C_data
+    
+    subgraph "宏观系统层面"
+        Nsys["nsys profile \n (Nsight Systems)"]:::F_data
+        Find["定位耗时最长的 Kernel / 找出 CPU-GPU 同步空隙"]
+    end
+    
+    subgraph "微观硬件指令层面"
+        Ncu["ncu \n (Nsight Compute)"]:::F_data
+        Diag["抓取 L1/L2 命中率 / 寄存器堵塞 / 未合并访存比例"]
+    end
+    
+    Src --"编译生成执行档"--> Nsys
+    Nsys --"锁定目标 Kernel"--> Ncu
+    Ncu --"产出 Metrics 报告"--> Diag
+```
+
+---
+
+## 四、 关键源码逐行解剖
+
+### 1. 运行时动态查询 Occupancy
+
+为了科学设置宏观线程参数，不能盲猜配置，需要用 `cudaOccupancyMaxActiveBlocksPerMultiprocessor` API 拉取官方硬件分析：
+
+摘自 `01_occupancy/occupancy.cu`：
 
 ```cpp
-// NVTX (NVIDIA Tools Extension SDK) 标记初始化结构
-#include <nvtx3/nvToolsExt.h>
+// 传入 kernel 的函数指针和 block 大小，自动分析能驻留多少个 block
+int num_blocks_per_sm;
+cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &num_blocks_per_sm,
+    kernel,                     // 目标分析的 Kernel 函数
+    BLOCK_SIZE,                 // 预期的单 Block 线程数
+    0                           // 动态共享内存大小
+);
 
-// 利用 C++ RAII 原则封装的 NVTX 区间追踪器
-class NVTXRange {
-public:
-    NVTXRange(const char* name) {
-        nvtxRangePush(name); // 压入带有名称的阶段标签，方便 nsys 可视化
-    }
-    ~NVTXRange() {
-        nvtxRangePop();      // 生命周期结束时自动弹出标签
-    }
-};
+// 计算理论驻留线程占极值 (如 RTX 4090 是 1536) 的比例
+int active_threads_per_sm = num_blocks_per_sm * BLOCK_SIZE;
+float occupancy = (float)active_threads_per_sm / props.maxThreadsPerMultiProcessor;
+```
 
-void run_benchmark() {
-    // 实例化后，它会自动统计后续 kernel_launch 直到作用域结束的完整时长
-    NVTXRange range("Benchmark_Coalesced_Memory");
-    
-    // 发射 Kernel
-    good_kernel<<<grid, block>>>(d_in, d_out, N);
-    
-    // 强制系统同步，确保 NVTX 的 Pop 操作准确打在 Kernel 结束后 
-    cudaDeviceSynchronize(); 
+**解剖结论**：这是性能分析的起手式。通过 API 预判，如果 Occupancy 过低，说明 Kernel 申请了过多的 Shared Memory 或过多的 Registers 导致硬件拒绝分配更多线程切入。
+
+### 2. Roofline 的核心参数埋点
+
+任何优秀的极客级开发，应当在框架中埋点算出每次执行通过的真实 GFLOPS：
+
+摘自 `02_roofline/roofline.cu`：
+
+```cpp
+// 以矩阵乘法 C(NxN) = A * B 为例
+KernelProfile prof;
+// 乘法和加法各一次，规模 N^3，所以浮点操作数 = 2 * N^3
+prof.flops = (long long)N * (long long)N * (long long)N * 2LL;
+
+// 假设完美 Cache 情况，只考虑必定从 Global 读出再写入的最低下限传输量
+// 读A(N^2) + 读B(N^2) + 写C(N^2) = 3 * N^2 * 4Bytes
+prof.bytes_accessed = (long long)N * (long long)N * 3LL * 4LL; 
+
+prof.compute_intensity(); // I = Flops / Bytes = 170.66 FLOPS/Byte
+// 大于 85.33，判定为 Compute Bound！
+```
+
+### 3. NVTX 注入标记时间流
+
+摘自 `03_nsight_profiling/nsight_profiling.cu`：
+
+```cpp
+// 利用基于 RAII 封装的 NVTX 范围标定器
+{
+    PROFILE_SCOPE("Kernel Computation (Bad)"); // 会在 nsys 的 GUI 时间轴划出一个彩色的区间
+    for (int i = 0; i < iterations; ++i) {
+        profile_example_kernel_bad<<<grid, block>>>(d_input, d_output, n, stride);
+    }
 }
 ```
 
-## 5. 性能基准与诊断基准 (Performance & Profiling)
+**解剖结论**：由于 GPU 调度是完全异步的，如果不打 NVTX 标签，在 Nsys 的 GUI `timeline` 中你只会看到密密麻麻的墨绿色快，根本无法对应业务逻辑（特别是 C++ 复杂的工程里）。
 
-| 场景 | 配置 | 带宽(GB/s) / 算力(GFLOPS) | 瓶颈分析 / 结论 |
-|----|----|---------|---------------|
-| `Occupancy 满载` | 256 Threads, 1 Data | 1212.02 GB/s | 虽然活跃 Warp 多，每线程吞吐贫弱。 |
-| `ILP 指令级并行` | 64 Threads, 16 Data | **1365.11 GB/s** | 显著逼近 4090 的峰值显存带宽，指令流水线填满。 |
-| `Roofline: VecAdd` | 算术强度 I ≈ 0.083 | 78.69 GFLOPS | $I < 85.33$，极其缺乏复用，标准的 Memory Bound。 |
-| `Roofline: GEMM` | 算术强度 I ≈ 170.6 | **5215.82 GFLOPS** | $I > 85.33$，计算密集型，被 Peak TFLOPS 限制。 |
-| `Nsight: 坏访存` | 步长 32 跳跃访问 | 273.52 GB/s | Non-coalesced 触发 Cache 惩罚，读取大量无效数据。|
-| `Nsight: 连续访存`| 顺延物理内存寻址 | **1223.57 GB/s** | Coalesced 完全命中了 128 Bytes 一次性提取事务局域性。|
+---
 
-## 6. 编译构建与调试指引 (Compile & Build)
+## 五、 性能基准与分析
 
-本目录的性能分析示例依赖于完整的编译报告和 `-lineinfo`。
-在 `03_nsight_profiling` 中还需要链接 NVTX SDK 库（`-lnvToolsExt`）。
+所有数据提取自 `Results/13_Performance_Analysis.md` 真实日志：
+
+- **测试硬件**: NVIDIA GeForce RTX 4090 × 2, Linux 环境, nvcc -O3
+
+### 1. Occupancy 掩盖延迟真相 (N=10,000,000 数组读写)
+
+| Kernel 架构模式 | 理论 Occupancy | Thread 逻辑操作数 (ILP) | 有效带宽 (GB/s) |
+| -------- | ----------- | ---------------- | ------------- |
+| Config 1: High-Occ | **100.00 %** | 每个 Thread 1 个 | 1230.12 GB/s |
+| Config 2: Mid-Occ | **100.00 %** | 每个 Thread 4 个 | 1324.67 GB/s |
+| Config 3: **Low-Occ + Max-ILP** | **100.00 % (活跃线程极少但块多)** | **每个 Thread 16 个** | **1365.92 GB/s** |
+| Config 4: 32KB 共享显存挤占 | 50.00 % | 每个 Thread 1 个 | 1020.48 GB/s |
+
+**极其反直觉的分析结论**：
+一味追求 100% Occupancy 未必是最佳路线。当每个线程通过 ILP (展开循环，批量加载数据到寄存器) 发出多个内存请求时，即便总体驻留的 Warp 数量不变或较少，它同样能完美掩盖 Global Memory 延迟。Config 3 的性能大幅度碾压了基础模型，甚至超出了纯理论显存带宽（因为 L2 Cache 的参与）。
+
+### 2. Roofline 瓶颈实测碰撞
+
+| 算子场景 | 算术强度 $I$ | 瓶颈归属定位 | 理论峰值能达速度 | 实际运行速度 | Compute 侧有效率 |
+| -------- | ----------- | ---------------- | ------------- | ------------- | ------------- |
+| Vector Add (N=10M) | **0.083** | **Memory Bound** | 84.01 GFLOPS | 78.72 GFLOPS | **93.70 %** |
+| Naive GEMM (N=1024) | **170.667** | **Compute Bound** | 86016.00 GFLOPS | 5234.05 GFLOPS | **6.08 %** |
+
+**分析结论**：对于 Vector Add 这种低算力需求的算子，它已经跑到了其所在 Roofline 屋顶的上限（93%），就算你怎么优化汇编，它也快不了了，必须提升内存带宽；而对于 Naive GEMM，虽然它的算力瓶颈极高（86 TFLOPS），由于缺乏 Tiling 导致 Cache 失效，实际只跑了惊人的 6.08%，说明有无穷的优化空间等待通过 Block Tiling 挖掘。
+
+### 3. Nsight 致命诱捕 (N=10,000,000，数组跳跃读写)
+
+| Kernel 模式 | Stride 步长 | Kernel 耗时 | 测定物理带宽 | 相对加速比 |
+| -------- | ----------- | -----------| ------------ | ------------ |
+| CPU 参考 | — | 18.20 ms | — | 1x |
+| **Bad Kernel** | 32 (跨度破坏合并) | 0.29 ms | **273.54 GB/s** | vs CPU 62x |
+| **Good Kernel** | 连续布局 (合并访存) | 0.07 ms | **1227.03 GB/s** | **vs Bad 4.49x** |
+
+**分析**：这个 4.5 倍的差距在代码上仅仅是一行 Index 偏移的改变。如果不用 Nsight Compute (ncu) 去抓取 `dram__bytes_read` 或者查阅 Global Memory Load Efficiency，开发者可能永远以为 273 GB/s 已经“很快了”。
+
+---
+
+## 六、 编译及参考资料
+
+### 编译与标准运行指令
+
+借助根目录的统一 `CMakeLists.txt` 构建目标：
 
 ```bash
-# 所有项目已集成于 CMakeLists.txt，标准构建：
-cd build && make -j4
+# 1. 切换至项目根目录并执行整体配置（首次构建）
+cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-# Nsight Systems 系统级全局时序追踪分析（宏观）
-nsys profile -t cuda,nvtx -o my_profile --stats=true ./13_Performance_Analysis/03_nsight_profiling/nsight_profiling
+# 2. 独立编译对应的子项目 Target 
+cmake --build build --target occupancy -j8
+cmake --build build --target roofline -j8
+cmake --build build --target nsight_profiling -j8
 
-# Nsight Compute 内核级深度硬件监控分析（微观），必需加 -lineinfo 编译
-ncu --set full -o ncu_report ./13_Performance_Analysis/03_nsight_profiling/nsight_profiling
+# 3. 标准二进制验证运行
+./build/13_Performance_Analysis/01_occupancy/occupancy
+./build/13_Performance_Analysis/02_roofline/roofline
+./build/13_Performance_Analysis/03_nsight_profiling/nsight_profiling
+
+# 4. 高阶吞吐截断探测 (使用 Nsight Compute 纯命令行环境收集 metrics)
+sudo ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./build/13_Performance_Analysis/02_roofline/roofline
 ```
+
+### Nsight Tools 专项使用指令速查
+
+```bash
+# 生成系统级 Timeline 文件
+nsys profile --trace=cuda,nvtx -o nsight_timeline ./build/13_Performance_Analysis/03_nsight_profiling/nsight_profiling
+
+# 在本地带有显示器的情况下打开观测
+nsys-ui nsight_timeline.nsys-rep
+
+# 深度 Profiling 指定 Kernel (跳过前面几次预热执行)
+sudo ncu --kernel-name profile_example --launch-skip 2 --launch-count 2 ./build/13_Performance_Analysis/03_nsight_profiling/nsight_profiling
+```
+
+### 推荐阅读
+
+- [Nsight Compute User Interface Guide](https://docs.nvidia.com/nsight-compute/NsightCompute/index.html) —— 涵盖对 Metrics 取样和报告分析的官方核心手册。
+- [CUDA C++ Best Practices Guide (Performance Metrics)](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#performance-metrics) —— 理解有效带宽与理论峰值的关系，如何计算 Roofline。
+- [Dissecting the NVidia Volta GPU Architecture (Citadel)](https://arxiv.org/abs/1802.04786) —— 理解现代 GPU 瓶颈中 ILP (指令级并行) 以低于直觉的 Occupancy 跑出满载吞吐的深层架构奥秘。
