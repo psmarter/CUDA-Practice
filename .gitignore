@@ -40,3 +40,4 @@ dist/
 _agents/
 _agent/
 .gemini/
+.github/
