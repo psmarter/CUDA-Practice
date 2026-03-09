@@ -1,220 +1,177 @@
-# 11_Inference_Optimization 推理核心优化
+# 11_Inference_Optimization — LLM 推理系统优化
 
-## 一、 全景导览与学习目标
+## 一、全景导览与学习目标
 
-该子项目处于 CUDA-Practice 学习体系的 **前沿级 (L4)** 阶段。当今的算力需求极大地被大语言模型 (LLM) 推理所霸占，而 LLM 推理（特别是 Decoding 阶段）往往是极度**访存密集 (Memory-Bound)** 的。由于每次仅预测一个 Token，庞大的权重和历史状态 (KV Cache) 使得 GPU 算力无法被有效榨取。
+本子项目属于 CUDA-Practice 学习体系的**部署与量化推理（L3）**阶段。大语言模型（LLM）的推理（生成阶段）通常不是 Compute Bound，而是极端严重的 **Memory Bound（访存瓶颈）** 与 **Capacity Bound（显存容量瓶颈）**。
 
-本实验聚焦于大语言模型工业级推理中最核心的几大通用加速策略：
+本模块聚焦现代推理引擎（如 vLLM, TensorRT-LLM, TGI）最核心的三大系统级访存优化技术：
 
-- `01_kv_cache`：**PagedAttention 思想探索**。揭示经典的静态显存分配 (Naive KV Cache) 是如何遭遇严重的显存碎片化与显存限制的，并通过手工实现 PagedAttention 的核心块表 (Block Table) 映射机制，实现**按需分配**，极大地节省显存池占用。
-- `02_kernel_fusion`：**算子融合 (Kernel Fusion)**。将原本需要多次返回全局内存 (Global Memory) 的独立算子组结构（如 `Add -> ReLU -> Scale` 或 `Linear -> GELU`）在 CUDA Kernel 内部打平成单次算术循环，彻底消除不必要的片外 DRAM 访存，带宽直接逼近物理极限。
-- `03_dynamic_batching`：**动态批处理 / 连续批处理 (Continuous Batching)**。针对真实线上请求长度参差不齐的问题，摒弃将所有请求 Padding 至最大长度的静态批处理（此举会导致天量的无效计算与显存占用），转向使用 Flatten (Varlen) 的一维打包张量来处理。
-
----
-
-## 二、 原理推导与数学表达
-
-### 1. Paged KV Cache 的逻辑寻址
-
-传统连续张量读取 KV Cache 元素依靠公式：
-$$ Address(b, h, s, d) = b \cdot (H \cdot S \cdot D) + h \cdot (S \cdot D) + s \cdot D + d $$
-其中 $b, h, s, d$ 分别为 batch_idx, head_idx, seq_idx, dim_idx。由于 $S$ (Max Sequence Length) 是静态设定的最大值，短序列会产生巨大的显存浪费。
-PagedAttention 将逻辑序列 $s$ 切割为多个物理缓存块 (Block Size $B_{sz}$)，并通过 Block Table 间接寻址：
-$$ \text{Logical\_Block} = \lfloor \frac{s}{B_{sz}} \rfloor, \quad \text{Block\_Offset} = s \pmod{B_{sz}} $$
-物理块索引 $P_{idx}$：
-$$ P_{idx} = \text{block\_table}[b, \text{Logical\_Block}] $$
-$$ \text{Address}(\text{Paged}) = \text{Base}(P_{idx}) + h \cdot (B_{sz} \cdot D) + \text{Block\_Offset} \cdot D + d $$
-
-### 2. Kernel Fusion 访存收敛
-
-以 `Output = Scale( ReLU( Add(A, B) ) )` 为例：
-非融合版本需要三次完整的 Global Memory 轮转：
-
-1. $T_1 = A + B$ （2 次 Read，1 次 Write）
-2. $T_2 = \max(T_1, 0)$ （1 次 Read，1 次 Write）
-3. $\text{Output} = T_2 \times \alpha$ （1 次 Read，1 次 Write）
-共计 **4 Read, 3 Write**。
-融合版本在寄存器内周转：
-$$ \text{reg}_A = \text{Load}(A), \text{reg}_B = \text{Load}(B) $$
-$$ \text{reg}_{out} = \max(\text{reg}_A + \text{reg}_B, 0) \times \alpha $$
-$$ \text{Store}(\text{Output}, \text{reg}_{out}) $$
-共计 **2 Read, 1 Write**，对于带宽受限的逐元素计算，理论上可立刻获得两倍以上的加速。
-
-### 3. Continuous Batching 的 Token 平展
-
-静态批处理（Static Padding）需要为长度为 $L_i$ 的序列统一分配 $\sum_{i=1}^{B} L_{max}$ 的空间，当序列长度倾斜严重时，Padding 率极高。
-Continuous Batching 抛弃补零，将所有序列的首尾接龙成一个一维平坦数组 (Packed Array，长度 $N = \sum L_i$)。对于计算 Attention，使用额外的 `seq_starts` 数组记录前缀和偏移量：
-$$ \text{seq\_starts}[i] = \sum_{k=0}^{i-1} L_k $$
-计算第 $b$ 个序列时，其 Token 的活跃区间为 $[\text{seq\_starts}[b], \text{seq\_starts}[b+1])$。
+| 文件 | 核心技术 | 优化目标 | 工业界应用 |
+|------|----------|---------|-----------|
+| `02_kernel_fusion/kernel_fusion.cu` | **算子融合 (Kernel Fusion)** | 削减内存往返开销 (Memory Round-trip) | Fused MLP, Fused Attention |
+| `01_kv_cache/kv_cache.cu` | **PagedAttention (分页 KV Cache)** | 消除内存内碎片，提升并发容量 | vLLM 核心基石 |
+| `03_dynamic_batching/dynamic_batching.cu` | **Continuous Batching (连续批处理)** | 消除 Padding 填空，释放显存带宽 | Orca (TGI 基础) |
 
 ---
 
-## 三、 硬核内存映射解析
+## 二、原理推导与机制解析
 
-### 1. PagedAttention / KV Cache Block Table
+### 1. 为什么需要算子融合？（Memory Round-trip 灾难）
 
-以下展示了为什么 Paged 模型能消除内部和外部碎片化显存浪费：
+考虑简单的网络层：$Y = \text{Scale}(\text{ReLU}(A + B))$
+
+- **非融合 (Unfused)**：
+  - `add_kernel`: 读 $A$, $B$ (2×)，写 $tmp1$ (1×)
+  - `relu_kernel`: 读 $tmp1$ (1×)，写 $tmp2$ (1×)
+  - `scale_kernel`: 读 $tmp2$ (1×)，写 $Y$ (1×)
+  - 总访存量：4 次读 + 3 次写
+- **融合 (Fused)**：
+  - `fused_kernel`: 读 $A$, $B$，在寄存器中计算 $A+B \rightarrow \text{ReLU} \rightarrow \text{Scale}$，写 $Y$
+  - 总访存量：2 次读 + 1 次写（消除了 4 次中间访存！）
+
+### 2. PagedAttention 机制
+
+传统 KV Cache 甚至在请求刚发来时，就为 `max_seq_length` 分配连续的显存，导致大量内部碎片（浪费可达 60%）。
+PagedAttention 借鉴操作系统的**虚实映射**原理：
+
+- 将 KV Cache 划分为固定大小的 Block（如 16 Tokens）。
+- 在逻辑上是连续的 Seq，在物理显存上打散分配。
+- 生成时动态按需分配 Block，将显存碎片率降至 < 4%。
+
+### 3. Continuous Batching（变量长批处理）
+
+传统的 Static Batching 必须用 `<PAD>` 将所有请求补齐到同批次中最长的长度。这不仅导致海量无效计算，更致命的是浪费了这部分 `<PAD>` 所占据的极大显存带宽。
+**Continuous Batching** 将 batch 中所有有效的 token 紧凑打包成一个 1D 张量（Var-len Tensor）。通过 `cu_seqlens` (累积序列长度数组) 记录每个请求的偏移量，彻底告别 Padding。
+
+---
+
+## 三、硬核内存映射解析
+
+### Paged KV Cache 虚实映射图
 
 ```mermaid
 graph TD
-    subgraph "Naive 静态分配 (极大浪费)"
-        N_Req["请求1 (实际仅需 2 Blocks)"]
-        N_Req --> N_B1[Block1]:::used
-        N_Req --> N_B2[Block2]:::used
-        N_Req --> N_B3[Padding 空余]:::wasted
-        N_Req --> N_B4[Padding 空余]:::wasted
-        N_Req --> N_B5[Padding 空余]:::wasted
+    classDef virtual fill:#bbf,stroke:#333;
+    classDef block_t fill:#d4e157,stroke:#333;
+    classDef physical fill:#fcf1c8,stroke:#333;
+
+    subgraph "逻辑地址 (Req 1: 长度 35)"
+        L0["Logical Block 0 (Token 0-15)"]:::virtual
+        L1["Logical Block 1 (Token 16-31)"]:::virtual
+        L2["Logical Block 2 (Token 32-34)"]:::virtual
     end
 
-    subgraph "Paged 动态按需分配 (显存池紧凑)"
-        direction LR
-        P_TABLE["Block Table (逻辑到物理映射)"]
-        
-        P_POOL["物理显存块池 (Physical Pool)"]
-        
-        P_TABLE --"映射 (Idx 0)"--> Pool_B1[Phys Block 12]:::used
-        P_TABLE --"映射 (Idx 1)"--> Pool_B2[Phys Block 25]:::used
-        
-        %% 无占用的内存块可以在池中自由分配给其他请求
+    subgraph "Block Table (映射表)"
+        T0["Idx: 12"]:::block_t
+        T1["Idx: 3"]:::block_t
+        T2["Idx: 9"]:::block_t
     end
-    
-    classDef used fill:#d0f9c4,stroke:#333;
-    classDef wasted fill:#f9d0c4,stroke:#333;
+
+    subgraph "物理显存 (Physical KV Pool)"
+        P3["Physical Block 3\n(Req1 Block1)"]:::physical
+        P8["Physical Block 8\n..."]:::physical
+        P9["Physical Block 9\n(Req1 Block2)"]:::physical
+        P12["Physical Block 12\n(Req1 Block0)"]:::physical
+    end
+
+    L0 -.-> T0; T0 --> P12
+    L1 -.-> T1; T1 --> P3
+    L2 -.-> T2; T2 --> P9
 ```
 
-### 2. 算子融合 (Kernel Fusion) 的内存流量对比
-
-```mermaid
-graph LR
-    subgraph "Unfused (7次内存传输)"
-        A1[(Global A, B)] -->|2 Reads| Add((Add))
-        Add -->|1 Write| T1[(Temp 1)]
-        T1 -->|1 Read| Relu((ReLU))
-        Relu -->|1 Write| T2[(Temp 2)]
-        T2 -->|1 Read| Scale((Scale))
-        Scale -->|1 Write| Out1[(Global Output)]
-    end
-
-    subgraph "Fused (3次内存传输)"
-        A2[(Global A, B)] -->|2 Reads| Reg((寄存器内计算:<br>Add->ReLU->Scale))
-        Reg -->|1 Write| Out2[(Global Output)]
-    end
-```
+**性能代价**：在 Kernel 内部读取 KV 时，需引入一次指针解引用（间接寻址 `block_table[log_blk_idx]`）。这会轻微降低物理算力，但省出的海量显存让 Server 能够**显著提升并发 Batch Size**，从而最终提升整体吞吐。
 
 ---
 
-## 四、 关键源码逐行解剖
+## 四、关键源码逐行解剖
 
-我们剖析 `kv_cache.cu` 中 PagedAttention 的核心取数据逻辑：
+### Continuous Batching 前向访问核心（来自 `dynamic_batching.cu`）
 
-```cpp
-// PagedAttention Block 查表与物理指针解引用机制
-for (int i = 0; i < seq_len; ++i) {
-    // 1. 将原先连续的序列偏移 i，分解为逻辑块号和块内余数
-    int logical_block_idx = i / block_size;
-    int block_offset = i % block_size;
-    
-    // 2. 查表：进入 block_table 获取该逻辑块被分配到了显存池的哪一个真实物理块
-    int physical_block_idx = block_table[batch_idx * max_blocks_per_seq + logical_block_idx];
-    
-    // 3. 从指针数组中取出物理块的真实指针
-    float* k_block = k_blocks[physical_block_idx];
-    float* v_block = v_blocks[physical_block_idx];
-    
-    // 4. 计算指针偏移量取出行切片：跨越 Heads，跨越 Token内的 Dim
-    int element_idx = head_idx * (block_size * head_dim) + 
-                      block_offset * head_dim + 
-                      tid;
-                      
-    float k_val = k_block[element_idx];  // 真正的 DRAM 数据读取
-    float v_val = v_block[element_idx];
-    
-    // 5. 进行乘加计算
-    acc += (q_val * k_val) * v_val;
+```cuda
+// varlen_attention_kernel
+// q_data 被打包为了一个 1D Tensor: [Total_Tokens, Num_Heads, Head_Dim]
+// cu_seqlens 记录了偏移: [0, len0, len0+len1, ...]
+
+int token_idx = blockIdx.x * blockDim.x + threadIdx.x; // 并发处理所有真实 Token
+if (token_idx >= total_tokens) return;
+
+// 1. 二分查找 / 线性查找 当前 Token 属于哪个 Request
+int batch_idx = 0;
+while (batch_idx < batch_size && token_idx >= cu_seqlens[batch_idx + 1]) {
+    batch_idx++;
 }
-```
 
-**解剖结论**：Paged 机制以**增加指针跳转指令运算的开销**（间接寻址 `block_table -> physical_ptr -> value`）来**大幅降低对显存空间的无意义占据**。这也是典型的空间换时间策略。
+// 2. 计算在当前 Request 内的局部位置 (用于 Positional Encoding/Mask)
+int seq_idx = token_idx - cu_seqlens[batch_idx];
+
+// 3. 执行核心计算 (彻底无需处理任何 Padding 废数据)
+float q_val = q_data[(token_idx * num_heads + head_idx) * head_dim + dim_idx];
+```
 
 ---
 
-## 五、 性能基准与分析
+## 五、性能基准与分析
 
-所有数据提取自 `Results/11_Inference_Optimization.md` 真实日志：
+> 所有数据提取自 `Results/11_Inference_Optimization.md` 真实日志，测试硬件：NVIDIA GeForce RTX 4090（sm_89）× 2，Linux，nvcc -O3。
 
-- **测试硬件**: NVIDIA GeForce RTX 4090 × 2, Linux 环境, nvcc -O3
+### 1. 算子融合 Memory Round-trip 减免（`kernel_fusion`，数据量 512 MB，50 次平均）
 
-### 1. KV Cache (内存复用优化)
+| 版本 | Kernel 时长 | 有效数据带宽 | vs 非融合加速比 |
+|------|------------|-------------|---------------|
+| 非融合序列 (Add->ReLU->Scale) | 4.06 ms | 396.79 GB/s | 基准 |
+| **算子融合 (Fused Kernel)** | **1.73 ms** | **932.85 GB/s** | **2.35×** |
 
-针对 $B=32$, $H=16$, $D=64$，且序列长度随机波动在 $[128, 2048]$ 的请求集：
+**分析**：非融合版本看似很快，但其有效带宽（仅计算输入输出的必要流转）暴跌至 396 GB/s，绝大部时间都在将 `tmp_1`、`tmp_2` 写回再读出。融合后有效带宽逼近硬件极限（932 GB/s），获得 2.35 倍实打实的提速。
 
-| 调度机制 | Kernel 耗时 | CPU 耗时 | 预估显存占用 | VS 静态分配 |
-| -------- | ----------- | -------------| ------------ | ------------- |
-| CPU 参考 | 126.39 ms | -- | ~512 MB | -- |
-| Naive 静态连续分配 | **0.37 ms** | --| 512.00 MB | 基准极速 |
-| Paged 按需分配打散 | 0.45 ms | -- | **317.75 MB** | 节省 37.94% 显存 |
+### 2. KV Cache：连续分配 vs 分页（`kv_cache`，Batch=32，Max_Len=2048，100 次平均）
 
-**分析**：Paged 机制相较于连续数组寻址有着 `1.22x` 的性能轻微退化（有效带宽从 898 GB/s 降到了 735 GB/s），这是查表开销引起的。但在大模型推理场景下，显存永远是第一瓶颈，节省近 40% 显存意味着 Batch Size 可以近乎翻倍，这带来了整体节点系统吞吐的极大收益。
+| 版本 | Kernel 时长 | 预估显存占用 | 有效访存带宽 |
+|------|------------|------------|------------|
+| 静态对齐 (Naive) | 0.37 ms | 512.00 MB | 898.12 GB/s |
+| **分页机制 (PagedAttention)** | **0.45 ms** | **317.75 MB** | **735.04 GB/s** |
 
-### 2. 算子融合 (Kernel Fusion)
+**分析**：引入 Paged Table 映射后，因间接寻址开销，Kernel 耗时慢了 1.22 倍（0.45ms）。但这是极为划算的交易：**显存直接节省了 37.94%**。在显存决定并发上限的 LLM 服务器中，这意味着 TPS 吞吐量的暴力提升。
 
-针对 1.34 亿元素，高达 512 MB 的单张量长流水线：
+### 3. Continuous Batching 容量释放（`dynamic_batching`，Batch=128，单向长请求，100 次平均）
 
-| 实现版本 | Kernel 平均时长 | 有效带宽 (实际产生作用的读写)| vs 基准加速比 |
-| -------- | ----------- | ---------------- | ------------- |
-| CPU 参考 (`for i...`) | 1156.07 ms | -- | -- |
-| 非融合序列 (多 Kernel Launch) | 4.06 ms | 396.79 GB/s | 1.00x |
-| **算子融合 (单次访问计算)** | **1.73 ms** | **932.85 GB/s** | **2.35x** |
-
-**分析**：融合版本的物理带宽和有效带宽均高达 932 GB/s，直逼 RTX4090 的极限物理带宽 (~1008 GB/s)。完全消灭了中间繁杂结果 `T1, T2` 落盘的时间。
-
-### 3. Continuous Batching (动态批处理)
-
-对于 $B=128$, 一极多短产生的长尾 Padding 场景：
-
-| 调度批处理机制 | 实际计算量占比 | Kernel 时长 | Token 载量显存消耗 | 对比 |
-| -------- | ----------- | -----------| ------------ | ------------- |
-| 静态 (Padding to Max) | 32% (多余全为空算) | 1.52 ms | 4096.00 MB | 极限浪费 |
-| **变长 Packed Tensor** | **100% (精确命中)** | **1.69 ms** | **1311.22 MB** | **节省 68% 显存** |
+| 版本 | Kernel 耗时 | 打包策略 | 核心显存占用 |
+|------|------------|---------|------------|
+| 静态批处理 (Static Padding) | 1.52 ms | 全部 Padding 补齐至 1024 | 4096.00 MB |
+| **动态紧凑批处理 (Varlen Packed Tensor)** | **1.69 ms** | **1D 变长压紧，抛弃掩码** | **1311.22 MB** |
 
 ```mermaid
 xychart-beta
-  title "显存节约指标对比 (MB，越低并发潜力越高)"
-  x-axis ["Static Padding", "Varlen Packed Tensor"]
-  y-axis "显存占用 (MB)" 0 --> 4500
-  bar [4096.00, 1311.22]
+  title "批处理显存开销 (Static Padding vs Varlen Packed) (MB，越低越好)"
+  x-axis ["Static", "Continuous (Varlen Packed)"]
+  y-axis "显存 (MB)" 0 --> 4200
+  bar [4096, 1311]
 ```
 
-**分析**：Static Kernel 因利用分支跳过了零值的计算，所以在时间上和 Varlen 甚至不相上下；然而在实际系统中，不使用 Varlen 会因为极短时间内耗尽极其昂贵的 HBM 导致 OOM，根本排不上 128 Batch。Varlen 相当于解放了 3.1 倍的卡位。
+**综合结论**：在极度参差不齐的实际会话请求中，Continuous Batching 暴砍 **67.99%** 显存无效浪费。Kernel 耗时相近（1.52ms vs 1.69ms）是因为 Static 版本内部做了 `if (is_pad) continue` 跳过了计算，但 Static 版本在 Host-2-Device 与显存驻留上的庞大代价（4GB）直接锁死了服务上限。
 
 ---
 
-## 六、 编译及参考资料
+## 六、编译及参考资料
 
-### 编译与标准运行指令
-
-借助根目录的统一 `CMakeLists.txt` 构建目标：
+### 编译与运行
 
 ```bash
-# 1. 切换至项目根目录并执行整体配置（首次构建）
+# 从项目根目录配置（首次）
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-# 2. 独立编译对应的子项目 Target 
-cmake --build build --target kv_cache -j8
+# 编译三个目标
 cmake --build build --target kernel_fusion -j8
+cmake --build build --target kv_cache -j8
 cmake --build build --target dynamic_batching -j8
 
-# 3. 标准二进制验证与探测运行
+# 标准运行
 ./build/11_Inference_Optimization/01_kv_cache/kv_cache
 ./build/11_Inference_Optimization/02_kernel_fusion/kernel_fusion
 ./build/11_Inference_Optimization/03_dynamic_batching/dynamic_batching
-
-# 4. 高阶内存吞吐与利用率捕获
-ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./build/11_Inference_Optimization/02_kernel_fusion/kernel_fusion
 ```
 
-### 推荐阅读
+### 参考资料
 
-- [vLLM: Easy, Fast, and Cheap LLM Serving with PagedAttention](https://arxiv.org/pdf/2309.06180) —— PagedAttention 机制与 vLLM 核心框架的原初论文，现代开源大模型推理基石。
-- [NVIDIA TensorRT Documentation - Kernel Fusion](https://developer.nvidia.com/tensorrt) —— 理解编译器在后端如何通过计算图做算子融合（Graph Fusion）。
-- [FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning](https://arxiv.org/abs/2307.08691) —— 内含 Varlen（变长连续）Attention 处理实现的鼻祖之一。
+- [vLLM: Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) — SOSP 2023 最佳论文，PagedAttention (vLLM) 原理解析
+- [Orca: A Distributed Serving System for Transformer-Based Generative Models](https://arxiv.org/abs/2201.03662) — Continuous Batching (Iteration-level scheduling) 奠基之作
+- [NVIDIA TensorRT-LLM Documentation](https://nvidia.github.io/TensorRT-LLM/) — 深入了解工业级框架如何落地上述所有融合优化策略

@@ -1,214 +1,203 @@
-# 02_Reduction 规约算法与线程收敛
+# 02_Reduction — 规约算法与线程收敛
 
-## 一、 全景导览与学习目标
+## 一、全景导览与学习目标
 
-该子项目在 CUDA-Practice 学习体系中属于 **经典算子与并发 (L2)** 阶段的核心内容。在 `01_Basics` 我们学习了“映射”（Map）操作，而在本项目中，我们将攻克 CUDA 编程中极具代表性的“归约”（Reduce）操作（如求和、求最大值、点积等）。
+本子项目属于 CUDA-Practice 学习体系的**经典算子与并发（L2）**阶段。归约（Reduction）是将 $N$ 个元素通过满足结合律的二元运算符折叠为单个标量的经典并行原语，是求和、求最大值、点积等操作的基础。
 
-归约操作的难点在于：**多个线程需要汇聚并组合各自的数据**，这天生面临着线程同步开销和显存访问冲突。本章节递进式地展示了如何从最容易引发 Control Divergence（控制流发散）的“坏代码”，一步步演化出极致压榨硬件性能的工业级 Kernel。
+与上一模块的"映射"（Map）操作不同，归约面临的核心难点是**多线程数据汇聚时的协作同步**——如何在消除 Warp 发散（Warp Divergence）的同时最大化内存带宽利用率。
 
-包含以下三个核心演进阶段：
+三个源文件构成完整的优化演进链：
 
-- `01_reduce_sum/reduce_sum.cu`：**基础规约演进**。展示了朴素归约（产生严重的发散分支）、收敛规约，以及引入 Shared Memory（共用缓存）保护的高效规约。
-- `02_reduce_optimized/reduce_optimized.cu`：**工业级规约优化**。引入了**数据粗化 (Thread Coarsening)** 技巧和 `atomicAdd` 以处理超大规模元素的全局归约。
-- `03_dot_product/dot_product.cu`：**规约的变体应用**。展示了向量点积的实现，并通过利用底层计算管线指令 `fmaf`（融合乘加，FMA优化）获得了计算延迟的极致压降。
-
----
-
-## 二、 原理推导与数学表达
-
-归约操作（Reduction）是一个将数组 $N$ 个元素通过满足**结合律 (Associativity)** 的二元运算符 $\oplus$（如 $+$, $\times$, $\max$）折叠为一个标量的过程：
-$$ S = x_0 \oplus x_1 \oplus x_2 \ldots \oplus x_{N-1} $$
-
-在并行计算环境下，我们不可能依靠单一 for 循环进行串行累加。相反，利用 CUDA 的海量线程并发，我们将操作重构为多级的树状折叠（Tree-based Reduction）：
-$$ \mathbf{V}^{(k+1)}_i = \mathbf{V}^{(k)}_i \oplus \mathbf{V}^{(k)}_{i + \text{stride}}, \quad \text{其中} \; \text{stride} = 2^{K-k-1} $$
-
-**各版本的数学 / 算法层面改进：**
-
-1. **Simple 朴素版本**：步长（stride）从小到大倍增递进。这在硬件上是灾难，因为对于 `if (tid % stride == 0)`，同一个 Warp 内部的大部分线程被闲置，触发了极为恶劣的 **Warp Divergence（分支发散）** 和 Bank Conflict。
-2. **Convergent 收敛版本**：步长（stride）从大（`blockDim / 2`）逐渐减半至 1。这一简单的数学重新映射，使得存活下来执行累加的线程完美地从线程号 0 开始紧凑排列，直接填满整个 Warp！此举从根本上让同一 Warp 内的线程步调一致。
-3. **Thread Coarsening 粗化版本**：数学上将累加拆散为 `(串行局部累加) + (并行 Block 归约)`。每个线程不再只搬运 1 或 2 个元素，而是串行累加多个（本例中 COARSE_FACTOR=4，共处理 8 个）连续块。极大地减小了 Block 启动数量，减少了 `__syncthreads()` 同步开销。
+| 文件 | Kernel 列表 | 核心技术 | 优化层级 |
+|------|------------|----------|---------|
+| `01_reduce_sum/reduce_sum.cu` | `simple_reduce_sum`、`convergent_reduce_sum`、`shared_reduce_sum` | Divergence 分析、Shared Memory 归约 | 入门 |
+| `02_reduce_optimized/reduce_optimized.cu` | `coarsened_reduce_sum`、`coarsened_reduce_max` + `segmented_reduce` | Thread Coarsening、`atomicAdd`、Warp Shuffle | 进阶 |
+| `03_dot_product/dot_product.cu` | `dot_product_simple`、`dot_product_coarsened`、`dot_product_fma` | FMA 指令、规约常见变体 | 进阶 |
 
 ---
 
-## 三、 硬核内存映射解析
+## 二、原理推导与数学表达
 
-在高效块内收敛归约（Shared Memory + Convergent）中，最经典的一幕就是**连续的一半线程并行对半分折叠数据**。
+归约操作的数学定义：对满足结合律的二元运算符 $\oplus$（如 $+$、$\max$），将 $N$ 个元素折叠为单个标量：
 
-### Shared Memory 收敛归约时序（Stride 减半）
+$$S = x_0 \oplus x_1 \oplus x_2 \oplus \cdots \oplus x_{N-1}$$
 
-以下模型展示了 `BlockDim = 8` 时，连续的存活线程是如何不断将高地址的数据累加到低地址（`stride` 从 4 -> 2 -> 1 演进）：
+在 GPU 上引入多级树状折叠（Tree-Based Reduction），每轮 $d$ 的递推为：
+
+$$V^{(d+1)}_i = V^{(d)}_i \oplus V^{(d)}_{i + 2^d}, \quad \text{stride} = 2^D, 2^{D-1}, \ldots, 1$$
+
+**三种算法的数学/硬件层面区别**：
+
+1. **Simple（朴素版）**：stride 从 1 倍增到 blockDim。条件 `if (tid % stride == 0)` 导致同一 Warp 内部分线程分叉，产生严重 **Warp Divergence** 和 Bank Conflict。
+
+2. **Convergent（收敛版）**：stride 从 blockDim 减半到 1。活跃线程始终从 `tid=0` 起连续排列（同一 Warp 内所有活跃线程步调一致），从根本上消除了 Divergence。
+
+3. **Thread Coarsening（粗化版）**：每线程在进入并行归约前，串行地在寄存器中预累加 `COARSE_FACTOR×2 = 8` 个元素。数学上等价于：
+   $$\text{local\_sum} = \sum_{j=0}^{2 \cdot \text{COARSE} - 1} x_{tid + j \cdot \text{BLOCK\_SIZE}}$$
+   大幅削减了启动的 Block 总数和 `__syncthreads()` 调用次数。
+
+---
+
+## 三、硬核内存映射解析
+
+### 收敛归约（BlockDim=8）线程-数据时序图
+
+以下展示了 Convergent 版本中，存活线程始终从 `tid=0` 起连续分布的关键优势：
 
 ```mermaid
 graph TD
-    classDef memory fill:#f9f,stroke:#333,stroke-width:2px;
-    classDef threadA fill:#bbf,stroke:#333,stroke-width:2px,color:#000;
-    classDef threadB fill:#dfd,stroke:#333,stroke-width:2px,color:#000;
-    classDef idle fill:#fff,stroke:#999,stroke-width:1px,stroke-dasharray: 5 5,color:#999;
+    classDef active fill:#bbf,stroke:#333;
+    classDef idle fill:#eee,stroke:#999,stroke-dasharray:4 4;
+    classDef data fill:#fcf1c8,stroke:#333;
 
-    subgraph "初始加载 (Global to Shared Memory)"
-       S0[S_0]:::memory
-       S1[S_1]:::memory
-       S2[S_2]:::memory
-       S3[S_3]:::memory
-       S4[S_4]:::memory
-       S5[S_5]:::memory
-       S6[S_6]:::memory
-       S7[S_7]:::memory
+    subgraph "初始: Shared Memory [S0..S7]"
+        S0[S0]:::data
+        S1[S1]:::data
+        S2[S2]:::data
+        S3[S3]:::data
+        S4[S4]:::data
+        S5[S5]:::data
+        S6[S6]:::data
+        S7[S7]:::data
     end
 
-    subgraph "第一轮 Iteration 1: stride = 4"
-       T0[T0 负责: S_0 = S_0 + S_4]:::threadA
-       T1[T1 负责: S_1 = S_1 + S_5]:::threadA
-       T2[T2 负责: S_2 = S_2 + S_6]:::threadA
-       T3[T3 负责: S_3 = S_3 + S_7]:::threadA
-       T4_idle[T4 闲置]:::idle
-       T5_idle[T5 闲置]:::idle
-       
-       S4 -.-> T0
-       S0 --> T0
-       S5 -.-> T1
-       S1 --> T1
-       S6 -.-> T2
-       S2 --> T2
-       S7 -.-> T3
-       S3 --> T3
+    subgraph "stride=4: T0~T3 活跃 (完整 Half-Warp)"
+        A0["T0: S0←S0+S4"]:::active
+        A1["T1: S1←S1+S5"]:::active
+        A2["T2: S2←S2+S6"]:::active
+        A3["T3: S3←S3+S7"]:::active
+        I4["T4: 闲置"]:::idle
+        I5["T5: 闲置"]:::idle
     end
 
-    subgraph "第二轮 Iteration 2: stride = 2"
-       T0_2[T0 负责: S_0 = S_0 + S_2]:::threadB
-       T1_2[T1 负责: S_1 = S_1 + S_3]:::threadB
-       T2_idle2[T2 闲置]:::idle
-       T3_idle2[T3 闲置]:::idle
-
-       T2 -.-> T0_2
-       T0 --> T0_2
-       T3 -.-> T1_2
-       T1 --> T1_2
-    end
-    
-    subgraph "第三轮 Iteration 3: stride = 1"
-       T0_3[T0 负责: S_0 = S_0 + S_1]:::threadA
-       T1_idle[T1 闲置]:::idle
-       
-       T1_2 -.-> T0_3
-       T0_2 --> T0_3
+    subgraph "stride=2: T0~T1 活跃"
+        B0["T0: S0←S0+S2"]:::active
+        B1["T1: S1←S1+S3"]:::active
+        B2["T2: 闲置"]:::idle
     end
 
-    T0_3 ==> Result((Block Sum In S_0))
+    subgraph "stride=1: T0 活跃 → 写回结果"
+        C0["T0: S0←S0+S1 → output"]:::active
+    end
+
+    S4 -.->|读取| A0
+    S0 --> A0
+    S0 --> B0
+    A2 -.->|读取| B0
+    B1 -.->|读取| C0
+    B0 --> C0
 ```
 
-**设计关键点**：注意每一轮（Iteration）中，处在工作状态的线程 ID 永远是连续的（`T0, T1, T2, T3` → `T0, T1` → `T0`），这保证了至少在一个 Warp 层级内，代码的执行流没有分岔，完美地消除了 Control Divergence。
+**关键点**：每轮活跃线程 ID 均连续（T0-T3 → T0-T1 → T0），保证 Warp 内不出现分叉，SM 利用率接近满载。
+
+### Thread Coarsening 数据粒度对比
+
+| 策略 | 每线程处理元素数 | 启动 Block 数（1M 元素） | `__syncthreads()` 开销 |
+|------|----------------|------------------------|----------------------|
+| Simple/Convergent | 1 | 1024 | 高 |
+| **Coarsened (COARSE=4)** | **8** | **128** | **低（约 1/8）** |
 
 ---
 
-## 四、 关键源码逐行解剖
+## 四、关键源码逐行解剖
 
-### 数据粗化 (Thread Coarsening)
-
-为了处理远大于 Block 配置界限的大型数组（1M 级别），单纯靠加载两元素并不足够。我们截取在 `reduce_optimized.cu` 最具工业实践色彩的代码段：
+### Thread Coarsening 核心片段（来自 `reduce_optimized.cu`）
 
 ```cpp
-// 在这行 Kernel 中，每个线程块不再只吃下 BLOCK_SIZE*2 大小的数据
-// 而是胃口暴涨了数倍（COARSE_FACTOR倍）！
-__global__ void coarsened_reduce_sum(PFloat input, PFloat output, CInt length) {
-    __shared__ float shared_data[BLOCK_SIZE];
-    CInt tid = threadIdx.x;
-    
-    // 物理地址跳跃值：注意这里乘上了 2 * COARSE_FACTOR。这是网格级的大跨度跃迁。
-    CInt sid = 2 * COARSE_FACTOR * blockDim.x * blockIdx.x + tid;
+// 每线程的全局起始地址（跨步 2×COARSE_FACTOR 个 Block）
+CInt sid = 2 * COARSE_FACTOR * blockDim.x * blockIdx.x + tid;
 
-    float sum = 0.0f;
-    // 💥 优化的核心精髓：串行粗化！ 
-    // 在这一个小 for 循环内发生的是每个物理线程利用极快速度的寄存器 (Register)，
-    // 在背后悄悄预先累加了 COARSE_FACTOR * 2 (比如 8 个) 全局内存的值。
-    for (int i = 0; i < COARSE_FACTOR * 2; ++i) {
-        if (sid + i * BLOCK_SIZE < length) {
-            sum += input[sid + i * BLOCK_SIZE]; 
-        }
+float sum = 0.0f;
+// 寄存器内预累加：COARSE_FACTOR×2=8 个全局元素
+// 完全避免了 Shared Memory 参与，直接在寄存器中悄然完成初步折叠
+for (int i = 0; i < COARSE_FACTOR * 2; ++i) {
+    if (sid + i * BLOCK_SIZE < length) {
+        sum += input[sid + i * BLOCK_SIZE];  // 全局内存连续读取，合并访存
     }
-    // 仅将已经极度浓缩出来的 sum，扔进 Shared Memory 中供 Block 进行接下来的对折规约
-    shared_data[tid] = sum;
-    
-    // ... 下面接标准的 shared mem 收敛折叠 ...
+}
+// 将高度浓缩的局部和放入 Shared Memory，供后续对折归约使用
+shared_data[tid] = sum;
+// 此后执行标准的收敛式 Shared Memory 归约...
 ```
 
-**深入注解**：
-为什么这行代码极大幅提高了效能？在不粗化的情况，你要想处理完这 8 个元素，你需要启动额外的多个 Block 线程组分配出去，那些额外的 Block 会吃掉大量的调度和后续多次进行 `__syncthreads()` 同步的开销。而**粗化**本质上让线程在真正开启并行规约成本前，先做了“力所能及的私人搬运任务”，是 CUDA 开发中的必备武器。
+**为什么有效**：不粗化时处理同样 8 个元素需要 8× 更多 Block，每个 Block 都有 `__syncthreads()` 的同步栅栏开销。粗化让这部分"私人搬运"工作全部在高速寄存器内完成，而非反复在 Shared Memory 里排队。
 
 ---
 
-## 五、 性能基准与分析
+## 五、性能基准与分析
 
-所有数据提取自 `Results/02_Reduction.md` 真实日志：
+> 所有数据提取自 `Results/02_Reduction.md` 真实日志，测试硬件：NVIDIA GeForce RTX 4090（sm_89）× 2，Linux，nvcc -O3。
 
-- **测试硬件**: NVIDIA GeForce RTX 4090 (sm_89) × 2, Linux 环境
-- **测试规模**:
-  - `Reduce Sum` (小规模探测): $N = 2048$ 元素，执行 $100$ 次平均
-  - `Reduce Optimized` (粗化测试): $N = 1,048,576$ ($1\text{M}$) 元素，粗化因子 = $4$
-  - `Dot Product`: 两个 $1\text{M}$ 大小的向量
+### 1. 小规模算法对决（`reduce_sum`，N=2048，100 次平均）
 
-### 1. 1M 优化归约基准表现
+| 版本 | Kernel 时间 | vs Simple 加速比 | 正确性 |
+|------|------------|-----------------|--------|
+| Simple（朴素，有 Divergence） | 0.0051 ms | 1× | PASSED |
+| **Convergent（收敛，消除 Divergence）** | **0.0038 ms** | **1.36×** | PASSED |
+| Shared Memory（Shared + Convergent） | 0.0038 ms | 1.36× | PASSED |
 
-| 实现版本 | Kernel 时间 | 有效带宽 | vs 基准 (Segmented) 加速比 | CPU 耗时 |
-| -------- | ----------- | ---------------- | ------------- | ------------- |
-| GPU V1 (Segmented) | 0.0084 ms | — | 1x (基准) | 4.69 ms |
-| **GPU V2 (Coarsened Sum)** | **0.0047 ms** | **887.48 GB/s** | **1.77x** | 4.69 ms |
-| **GPU V3 (Coarsened Max)** | **~0.00 ms (均摊)** | — | — | 4.69 ms |
+### 2. 大规模工业级优化（`reduce_optimized`，N=1,048,576，COARSE\_FACTOR=4，100 次平均）
 
-*注：CPU vs 粗化 GPU 版本的算力执行加速比达到了惊人的 `991 倍`。*
+| 版本 | Kernel 时间 | 有效带宽 | vs CPU（4.69 ms）加速比 |
+|------|------------|---------|----------------------|
+| CPU 参考 | 4.69 ms | — | 1× |
+| GPU Segmented（基础分段）| 0.0084 ms | — | ~559× |
+| **GPU Coarsened（线程粗化）** | **0.0047 ms** | **887.48 GB/s** | **991.52×** |
 
-### 2. 1M 点积 (Dot Product) 基准表现
+### 3. 点积变体（`dot_product`，N=1,048,576，100 次平均）
 
-| 实现版本 | Kernel 时间 | 吞吐/带宽 | vs 单核 CPU 加速比 |
-| -------- | ----------- | ---------------- | ------------- |
-| CPU 参考 | 1.69 ms | — | 1x |
-| GPU V1 (Simple) | 0.0092 ms | — | 183.7x |
-| GPU V2 (Coarsened) | 0.0056 ms | — | 301.7x |
-| **GPU V3 (FMA 优化指令)** | **0.0056 ms** | **1506.49 GB/s\*** | **301.7x** |
+| 版本 | Kernel 时间 | 有效带宽 | vs CPU（1.69 ms）加速比 |
+|------|------------|---------|----------------------|
+| CPU 参考 | 1.69 ms | — | 1× |
+| GPU Simple | 0.0092 ms | — | 183.7× |
+| GPU Coarsened | 0.0056 ms | — | 301.8× |
+| **GPU FMA（融合乘加）** | **0.0056 ms** | **1506.49 GB/s\*** | **303.86×** |
 
-*\*注：有效带宽高达 1506.49 GB/s，超越了 4090 的 DRAM 理论值 1008 GB/s，这由于多次迭代测试时该 1MB 体积的数组被极强命中了 L2 Cache 导致的正常合理物理现象。*
+*\* 注：1506.49 GB/s 超过 DRAM 理论峰值（~1008 GB/s），系 1MB 数组完全驻留在 L2 Cache（72 MB）中的正常缓存命中现象，非硬件限制。*
 
-````mermaid
+```mermaid
 xychart-beta
-  title "Kernel 耗时对比：线程粗化威力与乘加联合 (1M 元素)"
-  x-axis ["Reduce(Seg 基础)", "Reduce(Coarsened)", "DotProd(Simple)", "DotProd(FMA)"]
-  y-axis "时间 (ms)" 0 --> 0.012
-  bar [0.0084, 0.0047, 0.0092, 0.0056]
-````
+  title "各版本 Kernel 耗时对比（越低越好，单位 ms）"
+  x-axis ["Reduce Simple", "Reduce Convergent", "Reduce Coarsened(1M)", "DotProd FMA(1M)"]
+  y-axis "时间 (ms)" 0 --> 0.011
+  bar [0.0051, 0.0038, 0.0047, 0.0056]
+```
 
-**📊 深入分析：**
+**分析**：
 
-1. 在初级测试 `01_reduce_sum` 中，Convergent（收敛版）将 Simple 散发版本的耗时从 $0.0051\text{ms}$ 降低到了 $0.0038\text{ms}$（约 $1.36\text{x}$ 加速）。这是由于彻底**消灭了 Warp 内分支分岔 (Divergence)**，让 SM 的硬件使用率重获圆满。
-2. 线程粗化（Coarsening）显现了它真正的威力。在拥有 `1M` 数据的求和任务上，粗放版时间直接砍半，由基础切段版本的 $0.0084\text{ms}$ 脱胎换骨减至 $0.0047\text{ms}$。这说明**合并工作并在前期尽可能使用高速寄存器累加，大幅击败了大量线程之间必须强行同步交互（Syncthreads）所付出的代价。**
+- **Convergent vs Simple**（N=2048）：1.36× 提升完全来自消除 Warp Divergence，无额外算法开销。  
+- **Coarsened vs Segmented**（N=1M）：约 1.79× 提升来自 Block 数量减少 8× 和 `__syncthreads()` 频率降低，寄存器粗化是核心。
 
 ---
 
-## 六、 编译及参考资料
+## 六、编译及参考资料
 
-### 编译与标准运行指令
-
-借助根目录的统一 `CMakeLists.txt` 构建目标：
+### 编译与运行
 
 ```bash
-# 1. 切换至项目根目录并执行整体配置（首次构建）
+# 从项目根目录配置（首次）
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 
-# 2. 独立编译对应的子项目 Target
+# 编译三个目标
 cmake --build build --target reduce_sum -j8
 cmake --build build --target reduce_optimized -j8
 cmake --build build --target dot_product -j8
 
-# 3. 运行基础验证程序进行观测
+# 标准运行
 ./build/02_Reduction/01_reduce_sum/reduce_sum
 ./build/02_Reduction/02_reduce_optimized/reduce_optimized
 ./build/02_Reduction/03_dot_product/dot_product
 
-# 4. 可选测试：使用排错器检查规约过程是否有越界
+# 内存安全检查（建议对 reduce_optimized 执行）
 compute-sanitizer ./build/02_Reduction/02_reduce_optimized/reduce_optimized
+
+# Nsight Compute 分析
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed \
+    ./build/02_Reduction/02_reduce_optimized/reduce_optimized
 ```
 
-### 推荐阅读
+### 参考资料
 
-- [Mark Harris (NVIDIA): Optimizing Parallel Reduction in CUDA](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) —— （**必读神作**：本项目很大程度上复刻了这篇 PPT 中描述的一步到位优化的全过程思路）
-- [NVIDIA Developer Blog: CUDA Pro Tip - Data Reduction](https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/)
-- CUDA Toolkit Documentation 中对 `__shfl_down_sync()` (Warp 级归约优化原语) 的详解。
+- [Mark Harris, NVIDIA: Optimizing Parallel Reduction in CUDA](https://developer.download.nvidia.com/assets/cuda/files/reduction.pdf) — 必读经典，完整推导从 Naive 到 Warp-Unroll 优化的全过程
+- [NVIDIA Developer Blog: Faster Parallel Reductions on Kepler](https://developer.nvidia.com/blog/faster-parallel-reductions-kepler/) — 介绍 `__shfl_down_sync` 相较于 Shared Memory 归约的优势
+- [CUDA C++ Programming Guide: Warp Shuffle Functions](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#warp-shuffle-functions) — `__shfl_down_sync` 等指令的官方规范与 mask 参数语义
