@@ -1,0 +1,354 @@
+# 07_Quantization 综合测试报告
+
+## 一、 测试条件
+- **测试环境**: 当前 Linux 编译环境 (包含 CMake, NVCC)
+- **硬件配置**: 多卡环境 (2x NVIDIA GeForce RTX 4090, 架构 sm_89)
+- **编译参数**: `nvcc` -O3, 标准 CUDA 运行时，启用 C++17
+- **测试库依赖**: CUDA 原生库 (cuBLAS, cuFFT), CUTLASS, NCCL (针对多卡)
+
+## 二、 测试方法与执行逻辑
+针对此模块下的实现，测试覆盖了：
+1. **正确性验证 (Correctness Check)**：使用 CPU 计算出基准结果 (Reference)，与 GPU 计算结果进行对比并使用宏 `CHECK` 比较误差。
+2. **基本耗时测量 (Timer)**：依赖 `cudaEventRecord` 或者 `std::chrono` 来统计算子的时间。
+3. **安全与内存分析 (Compute Sanitizer)**：部分核心利用 `compute-sanitizer` 检查 Shared Memory/Global Memory 越界。
+4. **性能剖析探测 (Nsight Compute - ncu)**：通过 `ncu` 收集 `sm__throughput`, `dram__bytes` 及寄存器利用率数据。
+
+## 三、 测试命令模板
+```bash
+# 标准正确性运行
+./build/07_Quantization/<sub_directory>/<binary_name>
+
+# 内存排错检查
+compute-sanitizer ./build/07_Quantization/<sub_directory>/<binary_name>
+
+# Nsight Compute 吞吐性能捕获
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./<binary_name>
+```
+
+## 四、 本地自动脚本基础运行记录
+*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+
+# 07_Quantization 综合测试报告
+
+## 一、 测试条件
+- **测试环境**: 当前 Linux 编译环境 (包含 CMake, NVCC)
+- **硬件配置**: 多卡环境 (2x NVIDIA GeForce RTX 4090, 架构 sm_89)
+- **编译参数**: `nvcc` -O3, 标准 CUDA 运行时，启用 C++17
+- **测试库依赖**: CUDA 原生库 (cuBLAS, cuFFT), CUTLASS, NCCL (针对多卡)
+
+## 二、 测试方法与执行逻辑
+针对此模块下的实现，测试覆盖了：
+1. **正确性验证 (Correctness Check)**：使用 CPU 计算出基准结果 (Reference)，与 GPU 计算结果进行对比并使用宏 `CHECK` 比较误差。
+2. **基本耗时测量 (Timer)**：依赖 `cudaEventRecord` 或者 `std::chrono` 来统计算子的时间。
+3. **安全与内存分析 (Compute Sanitizer)**：部分核心利用 `compute-sanitizer` 检查 Shared Memory/Global Memory 越界。
+4. **性能剖析探测 (Nsight Compute - ncu)**：通过 `ncu` 收集 `sm__throughput`, `dram__bytes` 及寄存器利用率数据。
+
+## 三、 测试命令模板
+```bash
+# 标准正确性运行
+./build/07_Quantization/<sub_directory>/<binary_name>
+
+# 内存排错检查
+compute-sanitizer ./build/07_Quantization/<sub_directory>/<binary_name>
+
+# Nsight Compute 吞吐性能捕获
+ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./<binary_name>
+```
+
+## 四、 本地自动脚本基础运行记录
+*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+
+
+### Binary: quant_dequant
+#### Standard Execution & CUDA Timer
+```text
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      量化/反量化性能基准测试
+========================================
+数组大小：10485760 元素
+数据大小：40.00 MB
+Block 大小：256 线程
+Kernel 迭代次数：100 次
+
+--- CPU 计时 ---
+CPU 执行时间：
+ - Quantize Per-Tensor:      86.69 ms
+ - Dequantize Per-Tensor:     7.23 ms
+ - Quantize Per-Channel:     88.31 ms
+ - FP32 to FP16:             95.56 ms
+ - FP16 to FP32:             53.69 ms
+
+--- GPU 版本 1: FP32 to INT8 Per-Tensor 量化 ---
+H2D 传输时间：       4.08 ms
+Kernel 执行时间：    0.02 ms (100 次平均)
+D2H 传输时间：       1.07 ms
+GPU 总时间：         5.17 ms
+
+--- GPU 版本 2: INT8 to FP32 Per-Tensor 反量化 ---
+H2D 传输时间：       1.02 ms
+Kernel 执行时间：    0.02 ms (100 次平均)
+D2H 传输时间：       4.07 ms
+GPU 总时间：         5.11 ms
+
+--- GPU 版本 3: FP32 to INT8 Per-Channel 量化 ---
+H2D 传输时间：       4.00 ms
+Kernel 执行时间：    0.03 ms (100 次平均)
+D2H 传输时间：       1.07 ms
+GPU 总时间：         5.10 ms
+
+--- GPU 版本 4: FP32 to FP16 直接转换 ---
+H2D 传输时间：       4.02 ms
+Kernel 执行时间：    0.02 ms (100 次平均)
+D2H 传输时间：       2.07 ms
+GPU 总时间：         6.11 ms
+
+--- GPU 版本 5: FP16 to FP32 直接转换 ---
+H2D 传输时间：       2.02 ms
+Kernel 执行时间：    0.02 ms (100 次平均)
+D2H 传输时间：       4.04 ms
+GPU 总时间：         6.07 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：
+ - Quantize Per-Tensor:   3599.36x
+ - Dequantize Per-Tensor: 336.83x
+ - Quantize Per-Channel:  2976.84x
+ - FP32 to FP16:          4448.20x
+ - FP16 to FP32:          2502.56x
+
+GPU 有效带宽：
+ - Quantize Per-Tensor:   2176.81 GB/s
+ - Dequantize Per-Tensor: 2443.91 GB/s
+ - Quantize Per-Channel:  1768.78 GB/s
+ - FP32 to FP16:          2928.50 GB/s
+ - FP16 to FP32:          2932.70 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- 结果验证 ---
+✓ Quantize Per-Tensor PASSED: 结果 -7.00 (期望 -7.00)
+✓ Dequantize Per-Tensor PASSED: 结果 -1.40 (期望 -1.40)
+✓ Quantize Per-Channel PASSED: 结果 -113.00 (期望 -113.00)
+✓ FP32 to FP16 Cast PASSED: 结果 -0.34 (期望 -0.34)
+✓ FP16 to FP32 Cast PASSED: 结果 -0.34 (期望 -0.34)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
+```
+### Binary: fp16_gemm
+#### Standard Execution & CUDA Timer
+```text
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      FP16 GEMM 性能基准测试
+========================================
+矩阵维度：A(1024 x 1024) * B(1024 x 1024) = C(1024 x 1024)
+数据大小：6.00 MB
+Block 大小：32 x 32 线程
+Kernel 迭代次数：10 次
+
+--- CPU 计时 ---
+CPU 执行时间：   11289.35 ms
+
+--- GPU 版本 1: Naive FP16 GEMM ---
+H2D 传输时间：       0.47 ms
+Kernel 执行时间：    0.42 ms (10 次平均)
+D2H 传输时间：       0.25 ms
+GPU 总时间：         1.14 ms
+
+--- GPU 版本 2: Tiled FP16 GEMM ---
+H2D 传输时间：       0.45 ms
+Kernel 执行时间：    0.33 ms (10 次平均)
+D2H 传输时间：       0.24 ms
+GPU 总时间：         1.02 ms
+
+--- GPU 版本 3: Vectorized FP16 GEMM ---
+H2D 传输时间：       0.41 ms
+Kernel 执行时间：    0.22 ms (10 次平均)
+D2H 传输时间：       0.24 ms
+GPU 总时间：         0.87 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：51277.95x
+CPU vs GPU 总时间加速比：12974.12x
+GPU 计算性能：9754.20 GFLOPS
+GPU 有效带宽：28.58 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+
+--- Kernel 性能对比 ---
+Naive:         0.4222 ms (基准)
+Tiled:         0.3308 ms (1.28x)
+Vectorized:      0.22 ms (1.92x)
+
+--- 结果验证 ---
+✓ Naive FP16 GEMM PASSED: 结果 -10.12 (期望 -10.12)
+✓ Tiled FP16 GEMM PASSED: 结果 -10.12 (期望 -10.12)
+✓ Vectorized FP16 GEMM PASSED: 结果 -10.10 (期望 -10.12)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
+```
+### Binary: int8_gemm
+#### Standard Execution & CUDA Timer
+```text
+检测到 2 块 CUDA 设备
+设备 0： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.65 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+设备 1： NVIDIA GeForce RTX 4090
+  计算能力：8.9
+  全局显存：23.64 GB
+  每个 Block 共享内存：49152 Bytes
+  每个 Block 最大线程数：1024
+  Block 维度上限：(1024, 1024, 64)
+  Grid 尺寸上限：(2147483647, 65535, 65535)
+  Warp 大小：32
+  SM 数量：128
+  每个 SM 最大线程数：1536
+
+========================================
+      INT8 GEMM 性能基准测试
+========================================
+矩阵维度：A(1024 x 1024) * B(1024 x 1024) = C(1024 x 1024)
+数据大小：6.00 MB
+Block 大小：32 x 32 线程
+Kernel 迭代次数：10 次
+
+--- CPU 计时 ---
+CPU 执行时间：    1485.64 ms
+
+--- GPU 版本 1: Naive INT8 GEMM ---
+H2D 传输时间：       0.32 ms
+Kernel 执行时间：    0.40 ms (10 次平均)
+D2H 传输时间：       0.45 ms
+GPU 总时间：         1.17 ms
+
+--- GPU 版本 2: dp4a INT8 GEMM ---
+H2D 传输时间：       0.27 ms
+Kernel 执行时间：    0.27 ms (10 次平均)
+D2H 传输时间：       0.44 ms
+GPU 总时间：         0.99 ms
+
+--- GPU 版本 3: Vectorized dp4a INT8 GEMM ---
+H2D 传输时间：       0.24 ms
+Kernel 执行时间：    0.19 ms (10 次平均)
+D2H 传输时间：       0.44 ms
+GPU 总时间：         0.87 ms
+
+--- 性能分析 ---
+CPU vs GPU Kernel 加速比：7825.60x
+CPU vs GPU 总时间加速比：1715.45x
+GPU 有效带宽：33.14 GB/s
+(RTX 4090 理论峰值：~1008 GB/s)
+GPU 计算性能：11.31 TOPS
+
+--- Kernel 性能对比 ---
+Naive:              0.4047 ms (基准)
+dp4a:               0.2745 ms (1.47x)
+Vectorized dp4a:      0.19 ms (2.13x)
+
+--- 结果验证 ---
+✓ Naive INT8 GEMM PASSED: 结果 -25897 (期望 -25897)
+✓ dp4a INT8 GEMM PASSED: 结果 -25897 (期望 -25897)
+✓ Vectorized dp4a INT8 GEMM PASSED: 结果 -25897 (期望 -25897)
+✓ GPU/CPU 结果一致性验证通过
+
+========================================
+```
+
+## quant_dequant.cu 代码逻辑与测试
+**代码路径**: `07_Quantization/03_quant_dequant/quant_dequant.cu`
+**测试命令**: `./build/07_Quantization/03_quant_dequant/quant_dequant`
+
+**实现逻辑分析**: 
+1. 定义了相应的 CUDA Kernel 函数进行核心计算。
+2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
+3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+
+**Sanitizer & 运行测试输出**: 
+```text
+========= COMPUTE-SANITIZER
+========= Unable to find injection library libsanitizer-collection.so
+
+```
+
+## fp16_gemm.cu 代码逻辑与测试
+**代码路径**: `07_Quantization/01_fp16_gemm/fp16_gemm.cu`
+**测试命令**: `./build/07_Quantization/01_fp16_gemm/fp16_gemm`
+
+**实现逻辑分析**: 
+1. 定义了相应的 CUDA Kernel 函数进行核心计算。
+2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
+3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+
+**Sanitizer & 运行测试输出**: 
+```text
+========= COMPUTE-SANITIZER
+========= Unable to find injection library libsanitizer-collection.so
+
+```
+
+## int8_gemm.cu 代码逻辑与测试
+**代码路径**: `07_Quantization/02_int8_gemm/int8_gemm.cu`
+**测试命令**: `./build/07_Quantization/02_int8_gemm/int8_gemm`
+
+**实现逻辑分析**: 
+1. 定义了相应的 CUDA Kernel 函数进行核心计算。
+2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
+3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+
+**Sanitizer & 运行测试输出**: 
+```text
+========= COMPUTE-SANITIZER
+========= Unable to find injection library libsanitizer-collection.so
+
+```
