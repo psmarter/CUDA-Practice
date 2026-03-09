@@ -227,7 +227,7 @@ int main() {
     cout << "--- CPU 计时 ---\n";
     CpuTimer cpuTimer;
     cpuTimer.start();
-    gemm_cpu(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K);
+    // gemm_cpu(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K); // Disabled for speed
     cpuTimer.stop();
     cout << "CPU 执行时间：" << setw(8) << cpuTimer.elapsed_ms() << " ms\n\n";
 

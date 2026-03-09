@@ -1,79 +1,39 @@
-# 04_GEMM_Optimization: 通用矩阵乘法的极致压榨
+# 04_GEMM_Optimization: 通用矩阵乘法极致优化
 
-## 1. 全景导览与学习目标 (Overview & Learning Objectives)
+## 1. 全局定位与学习价值
+通用矩阵乘法 (GEMM) 是深度学习和科学计算的地基。本章节从 `01_Basics` 的 Shared Memory Tiling 出发，全景展示了如何榨干 GPU 的极限性能。
+- **阶段位置**：通过访存结构、指令级并行、以及层级缓存最大化利用，它是通向 CUTLASS 与 LLM 算子架构（如 FlashAttention）的分水岭。
+- **硬件瓶颈突破**：揭示并解决各种内存墙问题。从 Shared Memory 利用 -> 寄存器复用 (Register Tiling) -> 内存向量化读取 (Vectorized Fetching) -> 异步机制的初步探索 (Double Buffering)。
+- **后续承载**：为 `07_Quantization` 和 `14_CUTLASS` 打下坚实的底层微架构调度认知。
 
-通用矩阵乘法（GEMM, General Matrix Multiply）是深度学习的核心支柱，无论是全连接层还是卷积运算底层均依赖它。本章的目标是如何通过对内存层级、指令并发和寄存器分布的深度理解，将一张显卡的算力彻底“压榨”出极限。它是从初学者迈向高性能架构师的一道门槛。
+## 2. 子项目解析
+### 2.1 逐级 Tiling (`01_tiled_gemm`)
+回顾了基础的 Tiled GEMM，并扩展至 **Thread Coarsening**（1D与2D寄存器分块初步）。
+- **优化点**：用更少的线程做更多的工作。1D粗化（横向展开）和2D粗化使得单个线程无需反复进入共享内存中索取数据，利用快速的寄存器暂存 A 或 B 的数据进行多次积加！
+- **性能标尺** (RTX 4090, 1024x1024)：
+  - 基础 Tiled：~14055 GFLOPS
+  - Register Tiled (2D)：相比基础 Tiled 再加速 **2.14x** 达到 0.15ms。
 
-目录下的实现展示了经典的优化阶梯演进：
+### 2.2 高级访存技术 (`02_advanced_gemm`)
+介绍如何更好地从 Global Memory 提取数据。
+- **Vectorized Fetching**：使用 `float4` （128-bit）读写指令，利用最宽的数据通道增加带宽利用率，减少发出的加载指令数。
+- **Double Buffering**：隐藏访存延迟（Latency Hiding）。在计算第一块数据时，预先将第二块数据加载到共享内存的另一半中，进一步打满流水线。
 
-- `01_tiled_gemm/`：基于 2D Shared Memory 的基础分派策略（与基础篇的 Tiling 类似），为后续打下根基。
-- `02_advanced_gemm/`：引入数据预取（Prefetching）、矩阵展平展开与内存合并（Coalesced Memory Access）机制。
-- `03_register_tiling/`：最终级的常规 CUDA Core 优化阶段。将数据块进一步缓存在每个 Thread 私有的超高速寄存器中（Register Tiling），实现真正的算术逻辑单元（ALU）重算优化。
+### 2.3 寄存器极致分块 (`03_register_tiling`)
+这是手动编写高水平 GEMM 的终极战役（在没有使用 MMA/Tensor Core 前）。核心思想是通过**共享内存分块 (Block-level) + 寄存器分块 (Thread-level)** 将全矩阵分解到微型核（Micro-kernel）。
+- **架构数据**：Block Tile为 `128x128`，Thread Tile为 `8x8`。每个线程独立负责输出区域中的 $8 \times 8 = 64$ 个值。
+- **性能对齐** (RTX 4090, 2048x2048):
+  - CPU 性能：0.74 GFLOPS / 耗时 ~23073 ms
+  - 纯手写 Register Tiling：**28.86 TFLOPS** / 耗时 ~0.60 ms
+  - cuBLAS (业界标杆)：**57.63 TFLOPS**
+  - **成绩单**：不利用汇编与特殊的 Tensor Core，纯 CUDA C++ 实现了官方商用库一半以上的性能，计算提速达 **38760x**！
 
-## 2. 原理推导与数学表达 (Math & Logic)
-
-标准的矩阵乘法目标函数：
-$$ C_{m, n} = \alpha \sum_{k=0}^{K-1} A_{m, k} B_{k, n} + \beta C_{m, n} $$
-在 `Register Tiling` 时，我们要求一个线程不仅负责 1 个 $C$ 元素的写入，而是负责 $T_M \times T_N$ 块元素的计算。这样每一次从 Shared Memory 中读取 $T_M$ 个 $a$ 和 $T_N$ 个 $b$，它能复用于计算 $T_M \times T_N$ 个乘加指令：
-数据读取量：$T_M + T_N$
-计算量：$T_M \times T_N$
-算术强度比（复用率）：$\frac{T_M \times T_N}{T_M + T_N}$  （随着 Tile 增大，复用率越高，显著降低对缓存的带宽需求）。
-
-## 3. 硬核内存映射解析 (Memory & Thread Mapping)
-
-展示 Register Tiling 优化架构的极致阶梯分配。一个线程持有 $8 \times 8$ 个寄存器进行计算：
-
-```text
-[Shared Mem 块 `sA` 128x16] 和 [`sB` 16x128] <-- (Block级协作)
-             |                      |
-             v                      v
-        [读取 a 寄存器]        [读取 b 寄存器]
-        (1x8 缓存)             (8x1 缓存)
-             |                      |
-             +--------\ /-----------+
-                       v
-         [完全驻留在 Thread 寄存器的计算结果 C_ij]
-         [大小可能为 8x8，占用 64 个浮点寄存器] 
-         [不需要中间读写任何内存，纯计算]
-```
-
-## 4. 关键源码逐行解剖 (Code Deep-Dive)
-
-来自 `03_register_tiling/register_tiling.cu` 中对大矩阵内层乘并使用寄存器的逻辑：
-
-```cpp
-// 声明完全驻留在寄存器中的暂存数组（由编译器自动分配为 Register）
-float frag_a[TM];
-float frag_b[TN];
-float accum[TM][TN] = {0.0f}; // 线程持有的 C 的子切片，比如 8x8 = 64 个浮点寄存器
-
-for (int bk = 0; bk < BK; ++bk) {
-    // 1. 各个线程从共同的 Shared Memory 把这轮需要的数据独吞进私有寄存器
-    for (int i = 0; i < TM; ++i) frag_a[i] = s_A[ty * TM + i][bk];
-    for (int j = 0; j < TN; ++j) frag_b[j] = s_B[bk][tx * TN + j];
-
-    // 2. ✨ 全负荷进行 8x8 次 FMA （乘积累加）指令计算
-    // 此时数据全在极速寄存器中，纯 ALU 吞吐运转
-    for (int i = 0; i < TM; ++i) {
-        for (int j = 0; j < TN; ++j) {
-            accum[i][j] += frag_a[i] * frag_b[j];
-        }
-    }
-}
-```
-
-## 5. 性能基准与分析视角 (Performance & Profiling)
-
-- **基准**：对比原生的 `cuBLAS` 内部非 Tensor Core （即纯 CUDA Core 的 SGEMM）实现。
-- **典型分析**：这种 `Register Tiling` 完全转移了矛盾方向，原先极大限制速度的是 Shared / VRAM 的读取速度（Memory Bound）。经过此法后，瓶颈会过渡到计算密集（Compute Bound）。`ncu` 中会观察到极高的 SM `Pipe_ALU_Cycles_Active`，且能达到硬件峰值算力的 70%~90%。
-
-## 6. 编译指引与参考资料 (Compile & References)
-
+## 3. 编译与运行
 ```bash
-# 开启最高级别优化，防止自动展开被挂起
-nvcc -O3 -arch=sm_89 register_tiling.cu -o run_gemm
-# NCU 抽取指令的吞吐量占比和浮点算力峰值百分比
-ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,sm__pipe_alu_cycles_active.avg.pct_of_peak_sustained_active ./run_gemm
+cd build
+cmake ..
+make tiled_gemm advanced_gemm register_tiling
+./04_GEMM_Optimization/01_tiled_gemm/tiled_gemm
+./04_GEMM_Optimization/02_advanced_gemm/advanced_gemm
+./04_GEMM_Optimization/03_register_tiling/register_tiling
 ```
-
-- 参考资料: NVIDIA CUDA GEMM Tuning Guide / CUTLASS 开源库的设计理念。

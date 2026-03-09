@@ -24,6 +24,20 @@ out/
 *.fatbin
 *.gpu
 
+# 性能分析工具产物 (Nsight)
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# 临时下载文件与库源文件袋
+*.tar.gz
+*.tgz
+*.zip
+nccl*/
+
 # Python & PyTorch C++ Extension 产物
 __pycache__/
 *.pyc

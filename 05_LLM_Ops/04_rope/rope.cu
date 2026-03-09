@@ -131,7 +131,7 @@ GpuTimingResult rope_gpu(Matrix& h_x, CInt seq_len, CInt num_heads, CInt head_di
     const dim3 block(head_dim / 2);
 
     // 预热
-    kernel<<<grid, block>>>(d_x, seq_len, num_heads, head_dim);
+    kernel<<<grid, block>>>(d_x, seq_len, num_heads, head_dim, 10000.0f);
     CUDA_CHECK_LAST();
     CUDA_SYNC_CHECK();
 
@@ -140,7 +140,7 @@ GpuTimingResult rope_gpu(Matrix& h_x, CInt seq_len, CInt num_heads, CInt head_di
     for (int i = 0; i < iterations; ++i) {
         CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), size_bytes, cudaMemcpyHostToDevice));
         timerKernel.start();
-        kernel<<<grid, block>>>(d_x, seq_len, num_heads, head_dim);
+        kernel<<<grid, block>>>(d_x, seq_len, num_heads, head_dim, 10000.0f);
         timerKernel.stop();
         total_kernel_ms += timerKernel.elapsed_ms();
     }

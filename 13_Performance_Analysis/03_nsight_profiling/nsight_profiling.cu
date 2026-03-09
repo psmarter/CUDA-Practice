@@ -17,8 +17,8 @@
   - nsys 已随 CUDA Toolkit 安装 (包含在 /usr/local/cuda/bin/ 或 /opt/nvidia/nsight-systems/)
   - ncu  需单独安装： sudo apt install nsight-compute
   - ⚠️ 注意：apt 安装后 `ncu` 可能不在 PATH 中！
-    请执行：sudo ln -sf /opt/nvidia/nsight-compute/*/ncu /usr/local/bin/ncu
-    以及：  sudo ln -sf /opt/nvidia/nsight-compute/*/ncu-ui /usr/local/bin/ncu-ui
+    请执行：sudo ln -sf /opt/nvidia/nsight-compute/<version>/ncu /usr/local/bin/ncu
+    以及：  sudo ln -sf /opt/nvidia/nsight-compute/<version>/ncu-ui /usr/local/bin/ncu-ui
     或者：
     找到 ncu 的实际位置
     find /opt -name "ncu" -type f 2>/dev/null

@@ -123,7 +123,7 @@ bool verify_complex_results(cufftComplex* gpu_result, const std::vector<Complex>
     // 保存 cout 格式状态，避免被外部 setprecision/fixed 污染
     auto old_flags = cout.flags();
     auto old_prec  = cout.precision();
-    cout << defaultfloat << setprecision(6);
+    cout << std::defaultfloat << setprecision(6);
 
     bool success = true;
     constexpr float atol = 1e-3f;  // 绝对容差 (CPU 参考已用 double，误差 << 1e-3)
@@ -136,7 +136,7 @@ bool verify_complex_results(cufftComplex* gpu_result, const std::vector<Complex>
                     std::max(fabs(cpu_result[i].real()), fabs(cpu_result[i].imag()))));
         float tol = std::max(atol, rtol * mag);
         if (diff_real > tol || diff_imag > tol) {
-            cout << scientific << setprecision(6);
+            cout << std::scientific << setprecision(6);
             cout << "✗ " << kernel_name << " FAILED: 索引 " << i 
                  << " 结果 (" << gpu_result[i].x << "," << gpu_result[i].y << ") "
                  << "期望 (" << cpu_result[i].real() << "," << cpu_result[i].imag() << ")"

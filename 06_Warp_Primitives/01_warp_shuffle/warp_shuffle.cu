@@ -60,7 +60,7 @@ __shfl_up_sync(mask, var, delta)：从 lane - delta 取值。
 }
 
 // Warp Reduce Sum - Warp内归约求和（GPU kernel，手写）
-__global__ void kernel_warp_reduce_sum(CPFloat input, PFloat output, CInt n) {
+__global__ void test_kernel_warp_reduce_sum(CPFloat input, PFloat output, CInt n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < n) {
         float val = input[tid];
@@ -311,7 +311,7 @@ int main() {
 
     cout << "--- GPU 版本 4: Warp Reduce Sum ---\n";
     // 归约操作极容易因为 float 的累加顺序导致末尾产生细微误差，放宽 epsilon
-    GpuTimingResult res_red = warp_shuffle_gpu(h_input, h_reduce_gpu, n, iterations, kernel_warp_reduce_sum, true);
+    GpuTimingResult res_red = warp_shuffle_gpu(h_input, h_reduce_gpu, n, iterations, test_kernel_warp_reduce_sum, true);
     cout << "Kernel 执行时间：" << setw(8) << res_red.kernel_ms << " ms (" << iterations << " 次平均)\n";
     bool pass4 = verify_results(h_reduce_gpu, h_reduce_cpu, "Warp Reduce Sum", 1e-2f);
     cout << "\n";

@@ -1,80 +1,97 @@
-# 13_Performance_Analysis: NCU/NSYS 深度剖析与瓶颈定位
+# 13_Performance_Analysis: 性能分析与瓶颈定位
 
 ## 1. 全景导览与学习目标 (Overview & Learning Objectives)
 
-不善用剖析器（Profiler）的程序员只能在黑箱外猜想，“测量胜于直觉”，在底层硬件优化上更是绝对的真理。本章的学习目标是掌握 NVIDIA 第一方御用两大性能杀器：Nsight Systems (nsys) 与 Nsight Compute (ncu)。通过学习分析屋顶线模型（Roofline Model）、SM 驻留率（Occupancy）等关键指标，精确锁定自己的 Kernel 究竟是“跑太慢”还是“饿死在等待通道上”。
+不善用剖析器（Profiler）的程序员只能在黑箱外猜想，“测量胜于直觉”，在底层硬件优化上更是绝对的真理。本章的学习目标是深入掌握 NVIDIA 的原厂性能杀器：Nsight Systems (`nsys`) 与 Nsight Compute (`ncu`)，并结合理论分析模型剖析 Kernel 性能瓶颈。
 
-目录下的子模块通过不同维度展示了性能度量的基本原理：
+目录下的子模块通过不同维度展示了性能度量的基本原理与实践：
 
-- `01_occupancy/`：提供一个可调变 Shared Memory 与寄存器占用量的示例，用来展示 SM 的驻留率（Occupancy）是如何被某一个超越阈值的硬件资源所瞬间卡死拖累的。
-- `02_roofline/`：使用算数强度可调的 Kernel 函数作为标本，通过 Nsight Compute 实绘制并体会经典的屋顶线模型（Compute vs Memory Bound）。
-- `03_nsight_profiling/`：包含两张使用 `ncu` 和 `nsys` 具体分析的截图与对应的代码标本，介绍如何直观地阅读瀑布流时序图与源级汇编。
+- `01_occupancy/`：探讨 Occupancy（SM 驻留率）与 ILP（指令级并行）的权衡。展示如何通过调整线程数和每线程处理的数据量（Data per Thread），在低 Occupancy 下利用 ILP 完美隐藏延迟并跑满带宽。
+- `02_roofline/`：基于实际测量的硬件峰值（Peak TFLOPS 与 Peak Bandwidth），验证经典的屋顶线模型（Roofline Model）。展示 Vector Add（Memory Bound）与 GEMM（Compute Bound）在算术强度（Arithmetic Intensity）层面的差异。
+- `03_nsight_profiling/`：展示如何使用 NVTX (NVIDIA Tools Extension) 在 C++ 源码中植入 `nvtxRangePush` 和 `nvtxRangePop` 性能标记，以方便 `nsys` 追踪时序以及验证 Coalesced/Non-coalesced 访存行为的带宽差异。
 
 ## 2. 原理推导与数学表达 (Math & Logic)
 
-**屋顶线模型 (Roofline Model)** 的数学表达：
-横轴：算数强度（Arithmetic Intensity）$I$ = (以 FLOPs 计的总计算量) / (以 Byte 计的总内存流量)
-纵轴：内核算力性能 $P$ (FLOPs/second)
+**屋顶线模型 (Roofline Model)** 的核心表达反映了计算量与访存量的制约关系。
+- 横轴：算术强度（Arithmetic Intensity）$I$ = 总计 FLOPs / 总计内存读取与写入 Bytes
+- 纵轴：内核算力性能 $P$ (FLOPs/second)
 
-理论峰值计算力定格为平坦的屋顶：$P_{peak}$
-而受限于内存带宽（带宽带斜率 $BW_{peak}$）的左斜坡极限方程式为：
+屋顶的平坦上限由硬件理论计算峰值限制：$P_{peak}$
+受限于内存带宽的左侧斜坡限制方程式为：带宽高斜率 $BW_{peak}$
 $$ P = I \times BW_{peak} $$
 
-内核的最终成就速度只能取两者的边界下限最小值：
+内核的最终可达性能 $P_{achieved}$ 是二者的下限：
 $$ P_{achieved} = \min(P_{peak}, \; I \times BW_{peak}) $$
-一旦计算落在左斜区，这就是极其绝望的存在：说明你在花极大的代价等待显存，算力核心实际上是在闲置中打盹。
 
-## 3. 硬核内存映射解析 (Memory & Thread Mapping)
+拐点（Ridge Point）计算公式：
+$$ I_{ridge} = \frac{P_{peak}}{BW_{peak}} $$
+当内核的算术强度 $I < I_{ridge}$ 时，处于 Memory Bound 区；反之则处于 Compute Bound 区。
 
-以 Occupancy 为例，展示有限的物理槽位对并行的硬约束。
-假设每个 SM 只有 100KB 容量的 L1/Shared Memory 总槽位，且单个 SM 最多能容纳 1024 个活跃 Thread（比如分布在 4 个 Block 中，每 Block 256 人）：
+## 3. 内存与线程的硬核博弈 (Mapping & Occupancy)
 
-```text
-[SM 硬件限制] 最大并发 Block 数量被两方钳制：
-资源1: Thread 数 (上限 1024)
-资源2: Shared Mem 容量 (上限 100KB)
+Occupancy（驻留率）指的是当前 SM 上活跃的 Warp 数占该 SM 最大可并发 Warp 数的比例。经典的直觉认为 100% 的 Occupancy 能最大化隐蔽全局访存延迟。然而，通过 `01_occupancy` 可证实指令级并行（ILP）的威力。
 
-情况 A (好实现): 
-    每个 Block(256Thread) 只申请 20KB Shared Mem
-    ==> SM 刚好挤满 4 个 Block (4x256=1024, 4x20K=80K)。Occupancy=100%
-    如果某个 Block 发成访存阻塞，立刻就有其他排队的 Block 换入！
+在同样的 256M 个浮点数拷贝任务中：
+- **高 Occupancy (256 Threads, 1 element/thread)**：虽然有更多的活跃 Warp 在等待，但由于单线程执行指令的跨度太短，带宽利用率约为 1212 GB/s。
+- **低 Occupancy + ILP (64 Threads, 16 elements/thread)**：通过寄存器展开，单个线程一次性发射多条独立访存指令。此时 Occupancy 极低，但掩盖延迟的效率极高，带宽飙升至 1365 GB/s。
 
-情况 B (差实现):
-    每个 Block(256Thread) 粗心多申请了一点点，变为 35KB
-    ==> SM 最多只能塞进 2 个 Block ！(因为 3x35K > 100K 物理炸了)
-    ==> 该 SM 里只有 512 个 Thread 在活跃。Occupancy 暴跌至 50%！
-```
+> **核心结论**：盲目追求 100% Occupancy 是误区。适当增加每个线程的工作量（Register Pressure / ILP），只要不引发严重的 Register Spilling，往往能带来突破物理占用上限的极致性能。
 
 ## 4. 关键源码逐行解剖 (Code Deep-Dive)
 
-来自 `01_occupancy/occupancy.cu`，通过 API 运行时探测最大承力点：
+来自 `03_nsight_profiling/nsight_profiling.cu`，利用 NVTX 辅助 profiling 发射测定。
+通过 RAII 机制包装 `nvtxRangePush`，我们可以在 Nsight 系统时间轴上看到极为干净明了的色带，完美避开 CPU/GPU 异步执行带来的测量杂讯。
 
 ```cpp
-// 并不是开满 Block 就能跑满显卡。我们需要探查编译器给我们用了多少寄存器
-int numBlocks;
-int blockSize = 256; 
-size_t dynamicSMemSize = 0; // 这将受到你使用 malloc 或者 shared 取决
+// NVTX (NVIDIA Tools Extension SDK) 标记初始化结构
+#include <nvtx3/nvToolsExt.h>
 
-// ✨ CUDA runtime 提供了极其硬核的占据率测算黑魔法 API
-// 它会根据你这套代码编译时的「寄存器消耗量」和「静态共享内存消耗量」
-// 告诉你在该硬件上，一个 SM 最高能并发容纳几个这样的 Block
-cudaOccupancyMaxActiveBlocksPerMultiprocessor(&numBlocks, test_kernel, blockSize, dynamicSMemSize);
+// 利用 C++ RAII 原则封装的 NVTX 区间追踪器
+class NVTXRange {
+public:
+    NVTXRange(const char* name) {
+        nvtxRangePush(name); // 压入带有名称的阶段标签，方便 nsys 可视化
+    }
+    ~NVTXRange() {
+        nvtxRangePop();      // 生命周期结束时自动弹出标签
+    }
+};
 
-printf("单 SM 最大可并发承载该 Kernel 的 Block 数: %d\n", numBlocks);
+void run_benchmark() {
+    // 实例化后，它会自动统计后续 kernel_launch 直到作用域结束的完整时长
+    NVTXRange range("Benchmark_Coalesced_Memory");
+    
+    // 发射 Kernel
+    good_kernel<<<grid, block>>>(d_in, d_out, N);
+    
+    // 强制系统同步，确保 NVTX 的 Pop 操作准确打在 Kernel 结束后 
+    cudaDeviceSynchronize(); 
+}
 ```
 
-## 5. 性能基准与分析视角 (Performance & Profiling)
+## 5. 性能基准与诊断基准 (Performance & Profiling)
 
-- **基准目标**：找出瓶颈到底在 Compute, Memory Bandwidth 还是 Latency 侧。
-- **典型分析**：`nsys` 给出的全局时间轴线能瞬间发现 API 发射之间的气泡与 PCI-E 异常拥堵。而 `ncu` 主控微观：它提供的 `Memory Workload Analysis` 和 `Source Counters`，能精准地在一个源代码句子旁边标注：此处触发了由于 L2 Cache 未命中导致的巨量长挂起（Stall Long Score）。
+| 场景 | 配置 | 带宽(GB/s) / 算力(GFLOPS) | 瓶颈分析 / 结论 |
+|----|----|---------|---------------|
+| `Occupancy 满载` | 256 Threads, 1 Data | 1212.02 GB/s | 虽然活跃 Warp 多，每线程吞吐贫弱。 |
+| `ILP 指令级并行` | 64 Threads, 16 Data | **1365.11 GB/s** | 显著逼近 4090 的峰值显存带宽，指令流水线填满。 |
+| `Roofline: VecAdd` | 算术强度 I ≈ 0.083 | 78.69 GFLOPS | $I < 85.33$，极其缺乏复用，标准的 Memory Bound。 |
+| `Roofline: GEMM` | 算术强度 I ≈ 170.6 | **5215.82 GFLOPS** | $I > 85.33$，计算密集型，被 Peak TFLOPS 限制。 |
+| `Nsight: 坏访存` | 步长 32 跳跃访问 | 273.52 GB/s | Non-coalesced 触发 Cache 惩罚，读取大量无效数据。|
+| `Nsight: 连续访存`| 顺延物理内存寻址 | **1223.57 GB/s** | Coalesced 完全命中了 128 Bytes 一次性提取事务局域性。|
 
-## 6. 编译指引与参考资料 (Compile & References)
+## 6. 编译构建与调试指引 (Compile & Build)
+
+本目录的性能分析示例依赖于完整的编译报告和 `-lineinfo`。
+在 `03_nsight_profiling` 中还需要链接 NVTX SDK 库（`-lnvToolsExt`）。
 
 ```bash
-# 务必挂上 -lineinfo 标签，否则 NCU 无法把汇编映射回原始 C++ 源码
-nvcc -O3 -arch=sm_89 -lineinfo roofline.cu -o run_roofline
-# 获取极为详尽带分析建议的命令行性能报告
-ncu --set full ./run_roofline
-```
+# 所有项目已集成于 CMakeLists.txt，标准构建：
+cd build && make -j4
 
-- 参考资料: NVIDIA Nsight Compute User Interface Manual / Roofline Performance Model。
+# Nsight Systems 系统级全局时序追踪分析（宏观）
+nsys profile -t cuda,nvtx -o my_profile --stats=true ./13_Performance_Analysis/03_nsight_profiling/nsight_profiling
+
+# Nsight Compute 内核级深度硬件监控分析（微观），必需加 -lineinfo 编译
+ncu --set full -o ncu_report ./13_Performance_Analysis/03_nsight_profiling/nsight_profiling
+```

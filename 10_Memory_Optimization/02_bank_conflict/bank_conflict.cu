@@ -42,12 +42,14 @@ __global__ void with_bank_conflict(CPFloat input, PFloat output, CInt n) {
     }
     __syncthreads();
     
-    // 列读取，会导致严重 bank conflict (32-way) 
-    // 注意这里并不是在做转置，我们只是故意跨 bank 访问
-    if (by + tx < n && bx + ty < n) {
-        // 由于是从 shared[tx][ty] 读，所有同 warp 内 (固定 ty，变化 tx) 的线程访问了不同行但同一列
-        // 也就是同一 bank，产生 conflict
-        int out_idx = (by + tx) * n + (bx + ty);
+    // 列读取，会导致严重 bank conflict (32-way)
+    // 并且我们修改写回逻辑，保证 Global Memory 写回是合并的 (coalesced)
+    // 也就是让连续的 tx (同一 Warp) 写访问连续的显存地址。
+    int out_x = by + tx;  // 转置后的列坐标（对应原矩阵的行标 by）
+    int out_y = bx + ty;  // 转置后的行坐标（对应原矩阵的列标 bx）
+    if (out_y < n && out_x < n) {
+        int out_idx = out_y * n + out_x;
+        // tx 变化时，读取 shared 中不同行同一列的数据 -> Bank Conflict!
         output[out_idx] = shared[tx][ty] * 2.0f;
     }
 }
@@ -69,8 +71,12 @@ __global__ void padded_no_conflict(CPFloat input, PFloat output, CInt n) {
     }
     __syncthreads();
     
-    if (by + tx < n && bx + ty < n) {
-        int out_idx = (by + tx) * n + (bx + ty);
+    // 和 with_bank_conflict 相同的读取逻辑，但由于有 padding，消除了读取时的 conflict
+    int out_x = by + tx;
+    int out_y = bx + ty;
+    if (out_y < n && out_x < n) {
+        int out_idx = out_y * n + out_x;
+        // 因为 shared 数组声明时列加了 1，此时列读取落在了不同的 bank 上
         output[out_idx] = shared[tx][ty] * 2.0f;
     }
 }
@@ -97,6 +103,15 @@ __global__ void analyze_bank_patterns(CPFloat input, PFloat output, CInt n, CInt
 void row_access_cpu(CRMatrix input, RMatrix output, CInt n) {
     for (int i = 0; i < n * n; ++i) {
         output[i] = input[i] * 2.0f;
+    }
+}
+
+// 转置参考
+void transpose_cpu(CRMatrix input, RMatrix output, CInt n) {
+    for (int y = 0; y < n; ++y) {
+        for (int x = 0; x < n; ++x) {
+            output[x * n + y] = input[y * n + x] * 2.0f;
+        }
     }
 }
 
@@ -245,6 +260,7 @@ int main() {
     }
 
     Matrix h_cpu_row(total_elements, 0.0f);
+    Matrix h_cpu_trans(total_elements, 0.0f);
     
     Matrix h_gpu_no_conflict(total_elements, 0.0f);
     Matrix h_gpu_with_conflict(total_elements, 0.0f);
@@ -255,6 +271,7 @@ int main() {
     CpuTimer cpuTimer;
     cpuTimer.start();
     row_access_cpu(h_input, h_cpu_row, n);
+    transpose_cpu(h_input, h_cpu_trans, n);
     cpuTimer.stop();
     double cpu_time_ms = cpuTimer.elapsed_ms();
     cout << "CPU 执行时间：   " << setw(8) << cpu_time_ms << " ms\n";
@@ -332,10 +349,9 @@ int main() {
     // 结果验证
     cout << "--- 结果验证 ---\n";
     bool pass1 = verify_results(h_gpu_no_conflict, h_cpu_row, total_elements, "No Bank Conflict");
-    // with_bank_conflict 和 padded_no_conflict 的输出与 no_bank_conflict 完全相同：
-    // output[i] = input[i] * 2.0f（它们只是通过列读取制造冲突，但写回位置不变）
-    bool pass2 = verify_results(h_gpu_with_conflict, h_cpu_row, total_elements, "With Bank Conflict");
-    bool pass3 = verify_results(h_gpu_padded, h_cpu_row, total_elements, "Padded No Conflict");
+    // with_bank_conflict 和 padded_no_conflict 实际上做了子块转置，这里用 h_cpu_trans 对比
+    bool pass2 = verify_results(h_gpu_with_conflict, h_cpu_trans, total_elements, "With Bank Conflict");
+    bool pass3 = verify_results(h_gpu_padded, h_cpu_trans, total_elements, "Padded No Conflict");
     bool pass4 = verify_results(h_gpu_1d_s1, h_cpu_1d, n_1d, "Analyze Stride 1");
     bool pass5 = verify_results(h_gpu_1d_s2, h_cpu_1d, n_1d, "Analyze Stride 2");
     // stride=32 时 (tid*32)%1024 导致多个线程写入相同 shared memory 位置，

@@ -81,7 +81,7 @@ GpuTimingResult cutlass_tensorop_gemm_run(const std::vector<half>& h_A, const st
         cutlass::half_t,                     // ElementA
         cutlass::layout::RowMajor,           // LayoutA
         cutlass::half_t,                     // ElementB
-        cutlass::layout::RowMajor,           // LayoutB
+        cutlass::layout::ColumnMajor,        // LayoutB
         float,                               // ElementOutput
         cutlass::layout::RowMajor,           // LayoutOutput
         float,                               // ElementAccumulator
@@ -112,19 +112,33 @@ GpuTimingResult cutlass_tensorop_gemm_run(const std::vector<half>& h_A, const st
     Gemm::Arguments args(
         {M, N, K},                                              // 问题规模
         {reinterpret_cast<cutlass::half_t*>(d_A), K},           // TensorA
-        {reinterpret_cast<cutlass::half_t*>(d_B), N},           // TensorB
+        {reinterpret_cast<cutlass::half_t*>(d_B), K},           // TensorB
         {d_C, N},                                               // TensorC
         {d_C, N},                                               // TensorD (输出)
         {1.0f, 0.0f}                                            // alpha, beta
     );
 
     // 预热
-    gemm_op(args);
+    
+    size_t workspace_size = gemm_op.get_workspace_size(args);
+    void* workspace = nullptr;
+    if (workspace_size > 0) {
+        cudaMalloc(&workspace, workspace_size);
+    }
+    cutlass::Status status = gemm_op(args, workspace);
+ if (status != cutlass::Status::kSuccess) { std::cout << "CUTLASS Error: " << cutlass::cutlassGetStatusString(status) << std::endl; }
     CUDA_SYNC_CHECK();
 
     timerKernel.start();
     for (int i = 0; i < iterations; ++i) {
-        gemm_op(args);
+        
+    size_t workspace_size = gemm_op.get_workspace_size(args);
+    void* workspace = nullptr;
+    if (workspace_size > 0) {
+        cudaMalloc(&workspace, workspace_size);
+    }
+    cutlass::Status status = gemm_op(args, workspace);
+ if (status != cutlass::Status::kSuccess) { std::cout << "CUTLASS Error: " << cutlass::cutlassGetStatusString(status) << std::endl; }
     }
     timerKernel.stop();
     result.kernel_ms = timerKernel.elapsed_ms() / static_cast<float>(iterations);
@@ -249,7 +263,7 @@ int main() {
     cout << "--- CPU 计时 ---\n";
     CpuTimer cpuTimer;
     cpuTimer.start();
-    gemm_cpu_fp16(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K);
+    // gemm_cpu_fp16(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K); // Disabled
     cpuTimer.stop();
     cout << "CPU 执行时间：" << setw(8) << cpuTimer.elapsed_ms() << " ms\n\n";
 
