@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**工程架构优化与诊断（L3-L4）**阶段。在优化 CUDA 算子时，仅凭直觉和 `std::chrono` 计时是远远不够的。必须建立量化的性能物理边界（Roofline Model），理解硬件掩盖延迟的机制（Occupancy），并熟练使用 NVIDIA 官方的微架构探针（Nsight Compute / Nsight Systems）。
+本子项目属于 CUDA-Practice 学习体系的 **工程架构优化与诊断（L3-L4）** 阶段。在优化 CUDA 算子时，仅凭直觉和 `std::chrono` 计时是远远不够的。必须建立量化的性能物理边界（Roofline Model），理解硬件掩盖延迟的机制（Occupancy），并熟练使用 NVIDIA 官方的微架构探针（Nsight Compute / Nsight Systems）。
 
 本模块提供了三套性能诊断的底层分析视角：
 
@@ -18,10 +18,12 @@
 
 ### 1. Roofline Model（屋顶模型）
 
-定义**算术强度（Arithmetic Intensity, $I$）**为算法执行的浮点运算次数（FLOPs）与交换的内存字节数（Bytes）之比：
+定义 **算术强度（Arithmetic Intensity, $I$）** 为算法执行的浮点运算次数（FLOPs）与交换的内存字节数（Bytes）之比：
+
 $$I = \frac{\text{FLOPs}}{\text{Bytes}} \quad (\text{FLOPS/Byte})$$
 
 假设 GPU 的理论峰值算力为 $P_{\text{peak}}$（FLOPS），理论峰值带宽为 $B_{\text{peak}}$（GB/s），则实际可达到的最大性能 $P$ 受双重制约：
+
 $$P = \min(P_{\text{peak}}, I \times B_{\text{peak}})$$
 
 **机器拐点（Ridge Point）**：$I_{\text{ridge}} = \frac{P_{\text{peak}}}{B_{\text{peak}}}$
@@ -65,7 +67,7 @@ graph TD
 
 1. **`sm__throughput.avg`**：算子计算吞吐通常极低（如 < 10%）。
 2. **`dram__throughput.avg`**：显存带宽吞吐也不高，这是为什么？
-3. **`l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld`**（每个全局内存加载请求命中的 L1 sector 扇区数）：该指标暴涨至 **32**（完美合并访存应为近乎 1）。这**直接指明了** 32 线程读了 32 个分散地址，浪费了 96% 的事务载量。
+3. **`l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld`**（每个全局内存加载请求命中的 L1 sector 扇区数）：该指标暴涨至 **32**（完美合并访存应为近乎 1）。这 **直接指明了** 32 线程读了 32 个分散地址，浪费了 96% 的事务载量。
 
 ---
 
@@ -136,9 +138,9 @@ __global__ void configurable_kernel(CPFloat input, PFloat output, CInt n) {
 *\* `<64, 16>` 的理论 Occupancy 仍达 100%，是因为编译器对 `#pragma unroll` 展开后的寄存器分配做了良好优化，使每 Block 寄存器需求未超出 SM 上限。尽管每 Block 仅 64 线程，SM 可同时驻留足够多的 Block 以填满线程槽位。真正的性能优势来自 ILP——每线程 16 个独立访存操作掩盖了内存延迟。*
 
 ```mermaid
-xychart
+xychart-beta
   title "高 Occupancy vs 低 Occupancy-高 ILP 带宽表现 (GB/s，越高越好)"
-  x-axis ["高 Occ/低 ILP (<256,1>)", "低 Occ/高 ILP (<64,16>)", "被共享内存挤占至 50% Occ"]
+  x-axis ["高 Occ/低 ILP (&lt;256,1&gt;)", "低 Occ/高 ILP (&lt;64,16&gt;)", "被共享内存挤占至 50% Occ"]
   y-axis "GB/s" 800 --> 1450
   bar [1230, 1365, 1020]
 ```

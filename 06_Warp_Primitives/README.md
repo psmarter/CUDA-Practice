@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**微架构级优化（L2）**阶段，专注于 Warp（32 个线程的硬件调度单元）内部的无共享内存直接通信机制——**Warp Shuffle 指令**。掌握 Warp 级原语是实现高性能归约、前缀和和 LLM 算子（如 Softmax、LayerNorm）的前提。
+本子项目属于 CUDA-Practice 学习体系的 **微架构级优化（L2）** 阶段，专注于 Warp（32 个线程的硬件调度单元）内部的无共享内存直接通信机制——**Warp Shuffle 指令**。掌握 Warp 级原语是实现高性能归约、前缀和和 LLM 算子（如 Softmax、LayerNorm）的前提。
 
 三个源文件按从底层到应用的顺序递进：
 
@@ -141,7 +141,7 @@ if (warp_id == 0) {
 | **GPU Block Exclusive Scan** | **0.30 ms** | **884.58 GB/s** | **170.00×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "32 M 元素各 Kernel 有效带宽（GB/s）"
   x-axis ["Broadcast", "XOR Shuffle", "Reduce Sum", "Block Reduce", "Inc Scan"]
   y-axis "GB/s" 800 --> 960

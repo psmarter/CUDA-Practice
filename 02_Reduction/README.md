@@ -2,9 +2,9 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**经典算子与并发（L2）**阶段。归约（Reduction）是将 $N$ 个元素通过满足结合律的二元运算符折叠为单个标量的经典并行原语，是求和、求最大值、点积等操作的基础。
+本子项目属于 CUDA-Practice 学习体系的 **经典算子与并发（L2）** 阶段。归约（Reduction）是将 $N$ 个元素通过满足结合律的二元运算符折叠为单个标量的经典并行原语，是求和、求最大值、点积等操作的基础。
 
-与上一模块的"映射"（Map）操作不同，归约面临的核心难点是**多线程数据汇聚时的协作同步**——如何在消除 Warp 发散（Warp Divergence）的同时最大化内存带宽利用率。
+与上一模块的"映射"（Map）操作不同，归约面临的核心难点是 **多线程数据汇聚时的协作同步**——如何在消除 Warp 发散（Warp Divergence）的同时最大化内存带宽利用率。
 
 三个源文件构成完整的优化演进链：
 
@@ -33,7 +33,9 @@ $$V^{(d+1)}_i = V^{(d)}_i \oplus V^{(d)}_{i + 2^d}, \quad \text{stride} = 2^D, 2
 2. **Convergent（收敛版）**：stride 从 blockDim 减半到 1。活跃线程始终从 `tid=0` 起连续排列（同一 Warp 内所有活跃线程步调一致），从根本上消除了 Divergence。
 
 3. **Thread Coarsening（粗化版）**：每线程在进入并行归约前，串行地在寄存器中预累加 `COARSE_FACTOR×2 = 8` 个元素。数学上等价于：
+
    $$\text{local\_sum} = \sum_{j=0}^{2 \cdot \text{COARSE} - 1} x_{tid + j \cdot \text{BLOCK\_SIZE}}$$
+
    大幅削减了启动的 Block 总数和 `__syncthreads()` 调用次数。
 
 ---
@@ -156,7 +158,7 @@ shared_data[tid] = sum;
 *\* 注：1506.49 GB/s 超过 DRAM 理论峰值（~1008 GB/s），系 1MB 数组完全驻留在 L2 Cache（72 MB）中的正常缓存命中现象，非硬件限制。*
 
 ```mermaid
-xychart
+xychart-beta
   title "各版本 Kernel 耗时对比（越低越好，单位 ms）"
   x-axis ["Reduce Simple", "Reduce Convergent", "Reduce Coarsened(1M)", "DotProd FMA(1M)"]
   y-axis "时间 (ms)" 0 --> 0.011

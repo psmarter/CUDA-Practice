@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**部署与量化推理（L3）**阶段。大语言模型（LLM）的推理（生成阶段）通常不是 Compute Bound，而是极端严重的 **Memory Bound（访存瓶颈）** 与 **Capacity Bound（显存容量瓶颈）**。
+本子项目属于 CUDA-Practice 学习体系的 **部署与量化推理（L3）** 阶段。大语言模型（LLM）的推理（生成阶段）通常不是 Compute Bound，而是极端严重的 **Memory Bound（访存瓶颈）** 与 **Capacity Bound（显存容量瓶颈）**。
 
 本模块聚焦现代推理引擎（如 vLLM, TensorRT-LLM, TGI）最核心的三大系统级访存优化技术：
 
@@ -32,7 +32,7 @@
 ### 2. PagedAttention 机制
 
 传统 KV Cache 甚至在请求刚发来时，就为 `max_seq_length` 分配连续的显存，导致大量内部碎片（浪费可达 60%）。
-PagedAttention 借鉴操作系统的**虚实映射**原理：
+PagedAttention 借鉴操作系统的 **虚实映射** 原理：
 
 - 将 KV Cache 划分为固定大小的 Block（如 16 Tokens）。
 - 在逻辑上是连续的 Seq，在物理显存上打散分配。
@@ -79,7 +79,7 @@ graph TD
     L2 -.-> T2; T2 --> P9
 ```
 
-**性能代价**：在 Kernel 内部读取 KV 时，需引入一次指针解引用（间接寻址 `block_table[log_blk_idx]`）。这会轻微降低物理算力，但省出的海量显存让 Server 能够**显著提升并发 Batch Size**，从而最终提升整体吞吐。
+**性能代价**：在 Kernel 内部读取 KV 时，需引入一次指针解引用（间接寻址 `block_table[log_blk_idx]`）。这会轻微降低物理算力，但省出的海量显存让 Server 能够 **显著提升并发 Batch Size**，从而最终提升整体吞吐。
 
 ---
 
@@ -146,7 +146,7 @@ output[batch_idx * num_heads * head_dim + head_idx * head_dim + tid] = acc;
 | **动态紧凑批处理 (Varlen Packed Tensor)** | **1.69 ms** | **1D 变长压紧，抛弃掩码** | **1311.22 MB** |
 
 ```mermaid
-xychart
+xychart-beta
   title "批处理显存开销 (Static Padding vs Varlen Packed) (MB，越低越好)"
   x-axis ["Static", "Continuous (Varlen Packed)"]
   y-axis "显存 (MB)" 0 --> 4200

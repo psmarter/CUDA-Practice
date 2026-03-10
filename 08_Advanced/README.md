@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**工程架构优化（L3）**阶段。随着单个 Kernel 的性能被榨干，系统级瓶颈（如 CPU 发射开销、Host-Device 数据传输等待、框架层调用隔离）开始显著影响端到端吞吐量。
+本子项目属于 CUDA-Practice 学习体系的 **工程架构优化（L3）** 阶段。随着单个 Kernel 的性能被榨干，系统级瓶颈（如 CPU 发射开销、Host-Device 数据传输等待、框架层调用隔离）开始显著影响端到端吞吐量。
 
 本模块从全栈视角出发，通过三种工业级高级技术打破系统壁垒：
 
@@ -76,7 +76,7 @@ gantt
 ```mermaid
 graph TD
     PY[PyTorch Python 脚本\n import my_extension] --> |pybind11 接口层| CPP[C++ Wrapper\nTORCH_EXTENSION_NAME]
-    CPP --> |ATen 张量转指针\ntensor.data_ptr<float>()| CU[CUDA 核函数\n custom_swish_kernel]
+    CPP --> |"ATen 张量转指针\ntensor.data_ptr&lt;float&gt;()"| CU[CUDA 核函数\n custom_swish_kernel]
     CU --> GPU((GPU 硬件计算))
 ```
 

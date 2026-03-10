@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目是 CUDA-Practice 学习体系的起点，对应**基础与访存调优（L1）**阶段。这里的核心任务是建立 GPU 编程的底层直觉：理解 Grid-Block-Thread 三级并行模型、掌握 Host/Device 内存管理（H2D / D2H），并通过 Shared Memory 初步体验片上高速缓存对性能的决定性影响。
+本子项目是 CUDA-Practice 学习体系的起点，对应 **基础与访存调优（L1）** 阶段。这里的核心任务是建立 GPU 编程的底层直觉：理解 Grid-Block-Thread 三级并行模型、掌握 Host/Device 内存管理（H2D / D2H），并通过 Shared Memory 初步体验片上高速缓存对性能的决定性影响。
 
 三个源文件构成一条递进优化链：
 
@@ -137,7 +137,7 @@ for (int tile = 0; tile < num_tiles; ++tile) {
 | **GPU Tiled GEMM** | **0.31 ms** | **6893.42 GFLOPS** | **6696.47×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "GEMM Kernel 时间对比（1024×1024，ms，越低越好）"
   x-axis ["Naive GPU", "Tiled GPU (Shared Mem)"]
   y-axis "时间 (ms)" 0 --> 0.5
