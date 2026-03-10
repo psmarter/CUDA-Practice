@@ -131,7 +131,7 @@ for (int i = 0; i < cdiv(N, TILE_SIZE); ++i) {
 | cuBLAS SGEMM（基准）| 0.30 ms | 57.49 TFLOPS | 100% |
 
 ```mermaid
-xychart
+xychart-beta
   title "各版本 GEMM 吞吐对比（1024×1024 + 2048×2048 混合，TFLOPS）"
   x-axis ["Tiled(1K)", "CoarseGEMM(1K)", "RegTiled2D(1K)", "DblBuffer(1K)", "RegTiling-2K", "cuBLAS-2K"]
   y-axis "TFLOPS" 0 --> 60

@@ -141,7 +141,7 @@ if (warp_id == 0) {
 | **GPU Block Exclusive Scan** | **0.30 ms** | **884.58 GB/s** | **170.00×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "32 M 元素各 Kernel 有效带宽（GB/s）"
   x-axis ["Broadcast", "XOR Shuffle", "Reduce Sum", "Block Reduce", "Inc Scan"]
   y-axis "GB/s" 800 --> 960

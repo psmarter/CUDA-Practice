@@ -137,7 +137,7 @@ for (int tile = 0; tile < num_tiles; ++tile) {
 | **GPU Tiled GEMM** | **0.31 ms** | **6893.42 GFLOPS** | **6696.47×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "GEMM Kernel 时间对比（1024×1024，ms，越低越好）"
   x-axis ["Naive GPU", "Tiled GPU (Shared Mem)"]
   y-axis "时间 (ms)" 0 --> 0.5

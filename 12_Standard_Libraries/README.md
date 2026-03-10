@@ -138,7 +138,7 @@ thrust::transform(
 | `transform` (SAXPY) | 29.20 ms (for 循环) | 0.13 ms | **222×** | 849.73 GB/s |
 
 ```mermaid
-xychart
+xychart-beta
   title "千万规模操作 CPU (STL) vs GPU (Thrust) 耗时对比 (对数比例感知)"
   x-axis ["Sort (CPU)", "Sort (GPU)", "Reduce (CPU)", "Reduce (GPU)"]
   y-axis "耗时 (ms)" 0 --> 2200

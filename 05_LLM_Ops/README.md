@@ -162,7 +162,7 @@ output[row * seq_len + tid] = exp_val / sum_val;
 | **Vectorized RoPE（float2）**| **~0.039 ms** | **1734.27 GB/s** | **1751.1×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "各 LLM 算子 GPU 有效带宽（GB/s，越高越好）"
   x-axis ["Softmax Warp", "LN Welford", "LN Naive", "RMSNorm Warp", "RoPE Vec"]
   y-axis "GB/s" 0 --> 2700
