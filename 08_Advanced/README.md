@@ -76,7 +76,7 @@ gantt
 ```mermaid
 graph TD
     PY[PyTorch Python 脚本\n import my_extension] --> |pybind11 接口层| CPP[C++ Wrapper\nTORCH_EXTENSION_NAME]
-    CPP --> |ATen 张量转指针\ntensor.data_ptr<float>()| CU[CUDA 核函数\n custom_swish_kernel]
+    CPP --> |"ATen 张量转指针\ntensor.data_ptr&lt;float&gt;()"| CU[CUDA 核函数\n custom_swish_kernel]
     CU --> GPU((GPU 硬件计算))
 ```
 

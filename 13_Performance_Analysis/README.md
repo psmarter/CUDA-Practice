@@ -140,7 +140,7 @@ __global__ void configurable_kernel(CPFloat input, PFloat output, CInt n) {
 ```mermaid
 xychart-beta
   title "高 Occupancy vs 低 Occupancy-高 ILP 带宽表现 (GB/s，越高越好)"
-  x-axis ["高 Occ/低 ILP (<256,1>)", "低 Occ/高 ILP (<64,16>)", "被共享内存挤占至 50% Occ"]
+  x-axis ["高 Occ/低 ILP (&lt;256,1&gt;)", "低 Occ/高 ILP (&lt;64,16&gt;)", "被共享内存挤占至 50% Occ"]
   y-axis "GB/s" 800 --> 1450
   bar [1230, 1365, 1020]
 ```
