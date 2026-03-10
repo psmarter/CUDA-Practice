@@ -1,152 +1,240 @@
 ---
-title: "[CUDA 架构与算法实战] 03_Scan：跨越状态隔阂的 Scan 与极深屏障墙 (Kogge-Stone)"
-date: 2026-03-09 22:30:00
-tags: [CUDA, 高性能计算, Scan, Kogge-Stone, Synchronize, Stream Compaction]
+title: "[CUDA 架构与算法实战] 03_Scan：并行前缀和——Kogge-Stone 与 Brent-Kung 的硬件博弈，以及多 Block 全局 Scan 的三遍架构"
+date: 2026-03-09 23:00:00
+tags: [CUDA, 高性能计算, Prefix Sum, Kogge-Stone, Brent-Kung, Parallel Scan]
 categories: 深度学习系统架构
 ---
 
-## 楔子：直击痛点 (The Hook & Motivation)
+## 楔子：直击痛点
 
-在建立现代系统级的底层组件时（例如：流压缩 Stream Compaction、大基数排序 Radix Sort，或构建内存分配器的位图索引），我们必然会遭遇一个比归约 (Reduction) 更刁钻的对手：**前缀和 (Prefix Sum / Scan)**。
+Prefix Sum（前缀和）看似不起眼，却是并行计算的"瑞士军刀"。Stream Compaction（稠密化）需要它、Radix Sort 需要它、稀疏矩阵的 CSR 行指针需要它、甚至 GPU 上的动态内存分配也依赖它。一切需要将局部决策汇聚为全局偏移量的场景，都绕不开 Scan。
 
-归约允许我们将庞大的数据肆意揉捏，只求最终那一个坍缩的标量。而基于严苛定义的包含扫描 (Inclusive Scan)，不仅要求总和，它还**强制保留计算路径上的每一个中间状态**：
-$$y_i = \sum_{j=0}^{i} x_j$$
-每一个 $y_i$ 都死死依赖着 $y_{i-1}$ 的运算结果。这似乎是一个彻底串行化的诅咒：你要算第 1024 个结果，就必须等前 1023 个全部到位。如果 GPU 不能打破这种 $O(N)$ 的长链依赖依赖关系，那么在遇到稀疏拉平 (Sparse-to-Dense) 这种需要几百万次前缀和的任务时，整个 HBM 将沦为一条排长队的收费站。如何用空间（极度冗余的并行度）换取时间？
+但 Scan 和 Reduction 有着本质的不同：Reduction 只输出 1 个标量，Scan 必须输出 $N$ 个值——**每个位置都需要知道它之前所有元素的累计和**。这种强数据依赖让并行化变得极其棘手。
 
----
+两位计算机科学先驱分别给出了截然不同的并行方案——**Kogge-Stone** 和 **Brent-Kung**。它们在理论复杂度上交锋：KS 用更多的加法换取更少的步骤（低延迟），BK 用更少的加法换取更高的效率（低工作量）。但在 GPU 的 SIMT 架构上，理论复杂度并不直接等于实际性能——**硬件利用率才是真正的裁判**。
 
-## 第一性原理与数学重构 (Mathematical Formulation)
-
-如果一维排队行不通，架构师的首要任务是通过**分层跨步递推**切断串行链条。
-
-### Kogge-Stone (步骤高效) 算法数学推演
-
-Kogge-Stone 算法 (KS) 的核心思想是**让所有元素同时起跑，每一轮收集指数级膨胀的历史视野**。
-在步骤 $d$ ($d=1,2,3...$)，如果元素的索引 $i \ge 2^{d-1}$，则该位的结果将融合左侧相距 $2^{d-1}$ 处的结果：
-$$y^{(d)}_i = y^{(d-1)}_i \oplus y^{(d-1)}_{i - 2^{d-1}}$$
-
-这一公式极具暴力美学：只需短短 $\log_2 N$ 次迭代，处于最末尾的第 $N$ 个元素就能神奇地囊括从起点到自身的全部信息（因为 $1+2+4+... = N-1$）。
-代价是什么？冗余加法次数直逼 $O(N \log N)$ 级别。但是，在极度渴望独立并发调度的 GPU 上，这种“极其平坦但运算超发”的模型才是最高效的。
-
-### Brent-Kung (工作量高效) 算法数学推演
-
-纯从算法复杂度 (Big-O) 分析，KS 的超额计算并不完美。于是学者们提出了 Brent-Kung (BK) 算法。
-BK 将求解拆分成两阶段：
-
-1. **Up-sweep (树形规约阶段)**：类似普通 Reduction，自底向上构建满二叉树，仅消耗 $O(N)$ 算力。
-2. **Down-sweep (散发扩散阶段)**：从树根反向将中间结果分发至叶子节点补全。
-
-理论上，BK 的总加法工作量严格控制在了 $O(N)$，是一种具有理论绝对美感的“工作量极简”算法。但当我们把它放入硅片时，发生了什么？
+本章通过两组实验——单 Block 的 KS vs BK 算法对比，以及多 Block 的三遍全局 Scan——展示并行前缀和的完整工程实践。
 
 ---
 
-## 核心优化演进与硬件映射 (Architecture Mapping)
+## 第一性原理与数学重构
 
-我们必须直接画出 KS 算法在 Shared Memory 中与线程（Thread）交织的动作拓扑图，才能看透它为何在 GPU 上称王。
+### Scan 的形式化定义
 
-### Kogge-Stone 指令流向图 (N=8)
+给定输入数组 $[a_0, a_1, ..., a_{N-1}]$，Inclusive Prefix Sum 的输出为：
+
+$$y_i = \sum_{k=0}^{i} a_k$$
+
+即 $y_0 = a_0, \quad y_1 = a_0 + a_1, \quad y_2 = a_0 + a_1 + a_2, \quad ...$
+
+串行实现只需一个 `for` 循环：$y_i = y_{i-1} + a_i$，复杂度 $O(N)$。但每一步都依赖前一步的结果，似乎无法并行。
+
+### Kogge-Stone 算法：用冗余换低延迟
+
+KS 的核心思想是：在每一步中，让每个元素向前"看"越来越远的邻居，逐步扩大它的前缀覆盖范围。
+
+$$\text{Step } s: \quad a_i^{(s)} = \begin{cases} a_i^{(s-1)} + a_{i-2^{s-1}}^{(s-1)} & \text{if } i \geq 2^{s-1} \\ a_i^{(s-1)} & \text{otherwise} \end{cases}$$
+
+以 $N = 8$ 为例，KS 算法的完整执行过程：
+
+| Step | stride | 活跃线程 | 加法次数 | 操作 |
+|:-----|:-------|:---------|:---------|:-----|
+| 1 | 1 | 线程 1-7 | 7 | 每个元素加上左邻 |
+| 2 | 2 | 线程 2-7 | 6 | 每个元素加上隔 1 个的邻居 |
+| 3 | 4 | 线程 4-7 | 4 | 每个元素加上隔 3 个的邻居 |
+
+**总步数 = $\lceil \log_2 N \rceil = 3$，总加法 = 17**（串行仅 7 次）。KS 多做了 2.4 倍的计算，但步数从 7 减为 3——这是用**计算冗余（Work）换取了延迟（Span）**。
+
+### Brent-Kung 算法：用理论最优工作量换延迟
+
+BK 分两个阶段：
+
+**Up-sweep（规约阶段）**：从底向上做树形归约，将部分和逐层堆叠到间距更大的位置。和 Reduction 的结构完全一致。
+
+$$\text{Up stride } s: \quad a_{(k+1) \cdot 2^s - 1} \mathrel{+}= a_{(k+1) \cdot 2^s - 1 - 2^{s-1}}$$
+
+**Down-sweep（分发阶段）**：将已经计算好的部分和向中间位置分发，填补 Up-sweep 没有覆盖到的位置。
+
+$$\text{Down stride } s: \quad a_{(k+1) \cdot 2^s - 1 + 2^{s-1}} \mathrel{+}= a_{(k+1) \cdot 2^s - 1}$$
+
+总加法 $\approx 2N - 2 - \log_2 N$，接近串行的 Work 量。但步数 = $2 \log_2 N - 1$，比 KS 的 $\log_2 N$ 多了近一倍。
+
+### KS vs BK：理论博弈
+
+| 指标 | Kogge-Stone | Brent-Kung |
+|:-----|:-----------|:-----------|
+| **步数 (Span)** | $\log_2 N$ | $2\log_2 N - 1$ |
+| **总加法 (Work)** | $N \log_2 N - N + 1$ | $2N - 2 - \log_2 N$ |
+| **每步活跃线程** | 几乎全员（$N - 2^s$） | 指数递减/递增 |
+| **GPU 适配性** | ✅ 高——所有 Warp 持续忙碌 | ❌ 低——大量 Warp 闲置 |
+
+在 GPU 上，**算力是"免费"的，空闲才是代价**。KS 虽然多做了加法，但每一步都让几乎全部线程参与计算，所有 Warp 保持忙碌。BK 虽然总加法少，但在 Up-sweep 末期和 Down-sweep 初期只有极少数线程在工作——128 个 SM 中可能只有 1 个在干活，其余 127 个等待。
+
+---
+
+## 核心优化演进与硬件映射
+
+### Kogge-Stone 的双屏障关键设计
+
+KS 算法在 CUDA 实现中需要一个精巧的同步策略——每一步需要**两道** `__syncthreads()`：
+
+```mermaid
+sequenceDiagram
+    participant T_fast as 快线程 (低 tid)
+    participant T_slow as 慢线程 (高 tid)
+    participant SRAM as Shared Memory
+
+    Note over T_fast,T_slow: Step s (stride = 2^s)
+
+    T_fast->>T_fast: val = shared[tid] + shared[tid-stride]
+    T_slow->>T_slow: val = shared[tid] + shared[tid-stride]
+
+    Note over T_fast,T_slow: ❶ __syncthreads() 读屏障
+    Note right of SRAM: 确保所有线程已读取旧值\n才能开始写入新值
+
+    T_fast->>SRAM: shared[tid] = val
+    T_slow->>SRAM: shared[tid] = val
+
+    Note over T_fast,T_slow: ❷ __syncthreads() 写屏障
+    Note right of SRAM: 确保所有线程已写入完毕\n才能进入下一步读取
+```
+
+**为什么需要两道屏障？** 如果只有一道 `__syncthreads()`（在写入之后），快线程可能在慢线程还没读取 `shared[tid-stride]` 的旧值之前，就已经覆盖了那个位置的数据。这是经典的 **Read-After-Write (RAW) Hazard**。解法是先用局部变量 `val` 保存计算结果，等所有人都读完之后再统一写入。
+
+### 多 Block 全局 Scan：三遍架构
+
+单 Block 的 Scan 最多处理 `BLOCK_SIZE` 个元素（1024）。为了支持百万级数组，`segmented_scan.cu` 实现了经典的三遍全局 Scan：
 
 ```mermaid
 graph TD
-    classDef read fill:#f9d0c4,stroke:#333;
-    classDef write fill:#bbf,stroke:#333;
-
-    subgraph "初始状态 (SRAM)"
-        X0[1] X1[2] X2[3] X3[4] X4[5] X5[6] X6[7] X7[8]
+    subgraph "Pass 1: Block-level Scan"
+        A["输入数组 (1M 元素)"] --> B["Block 0\nKS Scan\n1024 元素"]
+        A --> C["Block 1\nKS Scan\n1024 元素"]
+        A --> D["...\n(1024 Blocks)"]
+        A --> E["Block 1023\nKS Scan\n1024 元素"]
+        B -->|"末尾值"| BS0["block_sums[0]"]
+        C -->|"末尾值"| BS1["block_sums[1]"]
+        E -->|"末尾值"| BS1023["block_sums[1023]"]
     end
 
-    subgraph "Step-1 (stride=1, 并发度=7/8)"
-        R1[1+2=3]:::write R2[2+3=5]:::write R3[3+4=7]:::write R4[4+5=9]:::write R5[5+6=11]:::write R6[6+7=13]:::write R7[7+8=15]:::write
-        X0-->R1
-        X0 -.->|跨1步读取| X1
-        X1-->R1; X1 -.-> R2
-        X2-->R2; X2 -.-> R3
-        X6-->R6; X6 -.-> R7; X7-->R7
+    subgraph "Pass 2: Block-Sums Scan"
+        BS0 --> F["对 block_sums[]\n执行 KS Scan\n(单 Block)"]
+        BS1 --> F
+        BS1023 --> F
+        F --> SBS["scanned_block_sums[]"]
     end
 
-    subgraph "Step-2 (stride=2, 并发度=6/8)"
-        T2[3+3=6]:::write T3[5+4=9]:::write T4[7+5=12]:::write T7[15+10=25]:::write
-        X0 -.->|跨2步读取| R2
-        R1 -.->|跨2步读取| R3
-        R2 --> T2; R3 --> T3
+    subgraph "Pass 3: Add Back"
+        SBS --> G["Block 1 的每个元素\n+= scanned_sums[0]"]
+        SBS --> H["Block 2 的每个元素\n+= scanned_sums[1]"]
+        SBS --> I["Block 1023 的元素\n+= scanned_sums[1022]"]
     end
 ```
 
-**底层真相解码**：你会发现，即使到了晚期循环，Kogge-Stone 算法的大量线程依然处于**存活状态**（Step-2 中有 6/8 个线程依然在运作）。对于以 Warp（32个线程为一组同步执行）调度的 GPU 而言，这种充沛的存活率使得 Warp 内的算术单元 (ALU) 利用率极高。
-相比之下，Brent-Kung 由于依赖树形遍历，在上扫和下扫的最顶端，整个 SM 可能会因为极少数几个存活节点而造成大规模的 Warp 空转。计算复杂度的小($O(N)$)并没有战胜硅片并发调度上的荒芜。
+这个三遍架构的关键约束：Block 数量不能超过 `BLOCK_SIZE`（1024），否则 Pass 2 自身又超出了单 Block Scan 的处理能力，需要递归。在 $N = 1M$ 时，1024 个 Block 恰好处在上限边缘。
+
+### Coarse Scan：Thread Coarsening + 段内 KS
+
+`coarse_scan` 在单 Block 内通过 Thread Coarsening 扩展处理范围——每个线程负责 `COARSE_FACTOR = 4` 个连续元素：
+
+1. **串行前缀和**：每个线程在 Shared Memory 中对自己负责的 4 个元素做串行的 Inclusive Scan
+2. **收集段尾值**：将每个线程处理的最后一个元素提取到 `section_sums[]`
+3. **KS Scan**：对 `section_sums[]` 做 Kogge-Stone Scan，得到跨段累加值
+4. **分发回写**：将跨段累加值加回每个非首段的元素
+
+这样 1024 个线程 × 4 个元素 = 4096 元素/Block，避免了多 Block 架构的额外开销。
 
 ---
 
-## 源码手术刀：关键代码深度赏析 (Surgical Code Analysis)
+## 源码手术刀：关键代码深度赏析
 
-想要在真实世界运行 KS 算法，存在一个致命的 **DATA HAZARD（数据冒险）**陷阱。我们截取 `01_prefix_sum/prefix_sum.cu` 中最危险的内核：
+### Kogge-Stone 的双屏障内核
 
 ```cpp
-// 在寄存器和 Shared Memory 间构建防线
 for (int stride = 1; stride < blockDim.x; stride *= 2) {
-    // 【第一道屏障】确保上一轮所有写入都已在 SRAM 中落定
-    __syncthreads();
-    
-    // 强制使用私有寄存器 val 进行拦截
+    __syncthreads();                          // ❶ 读屏障
     float val = 0.0f;
     if (tid >= stride) {
-        // [危险读取]: 这里在读取别的线程上一轮刚刚写入的位置
         val = shared_data[tid] + shared_data[tid - stride];
     }
-    
-    // 【第二道屏障】绝对禁止极速线程过早覆盖当前轮次的数据！
-    __syncthreads();
-    
+    __syncthreads();                          // ❷ 写屏障
     if (tid >= stride) {
-        // [安全回写]: 所有线程读取完毕后，统一释放入 SRAM
         shared_data[tid] = val;
     }
 }
 ```
 
-**手术刀剖析：双重屏障的物理防御**
-你认为一个 `__syncthreads()` 就够了吗？绝对不行。
-如果将伪代码写为 `data[tid] += data[tid-stride]` 然后仅在末尾 `__syncthreads()`，那么硬件的微架构将爆发混乱：
-某些 Warp 的调度速度极快，它们会瞬间修改自己的 `data[tid]`。这直接污染了后续由于分配延迟还未执行到本行的“慢线程”即将要读取的 `data[tid-stride]` 内存。这就是典型的 **Read-After-Write (RAW) / Write-After-Read (WAR)** 冲突。
-架构师为了消除这种因乱序执行引发的脏数据灾难，故意引入了线程独占的**内部寄存器 `val` 作为防覆盖缓冲**，并设立了两重极其严苛的栅栏掩体。牺牲少量的指令发射效率，换取多线程内存访问的绝对确定性。
+**逐行解析：**
 
----
+- **`stride *= 2`**：stride 从 1 倍增到 `blockDim.x/2`，共 $\log_2(1024) = 10$ 步。每步将前缀覆盖范围翻倍。
+- **第一个 `__syncthreads()`**：保护上一步的写入已全部完成，当前步才能安全读取。
+- **`val = shared_data[tid] + shared_data[tid - stride]`**：所有线程同时读取 Shared Memory 中的旧值，存入寄存器 `val`——此时不修改 SRAM，所以不会产生 RAW 冲突。
+- **第二个 `__syncthreads()`**：确认所有线程都读完旧值后，才统一写入新值。
+- **`if (tid >= stride)`**：只有前缀范围足够的线程才参与计算。当 `stride = 1` 时，线程 0 不参与（它已经是自身的前缀和）。
 
-## 理论与实际的对决：极限剖析 (Theory vs Reality Profiling)
+### 三遍 Scan 的 Pass 3 分发
 
-让我们调出 `Results/03_Scan.md` (RTX 4090, SM_89, FP32 运算)，看看残酷的数据面板：
-
-```mermaid
-xychart-beta
-  title "前缀和不同算法 Kernel 耗时（N=1024, ms, 越低越好）"
-  x-axis ["KS 扫描 O(N logN)", "BK 扫描 O(N)"]
-  y-axis "时间 (ms)" 0 --> 0.005
-  bar [0.0028, 0.0037]
+```cpp
+__global__ void add_block_sums(float* output, const float* scanned_block_sums, int n) {
+    int gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (blockIdx.x > 0 && gid < n) {
+        output[gid] += scanned_block_sums[blockIdx.x - 1];
+    }
+}
 ```
 
-| Block 级版本 | 工作复杂度 | Kernel 时间 (ms) | vs KS 加速比 |
-| :--- | :--- | :--- | :--- |
-| **GPU Kogge-Stone** | $O(N \log N)$ | **0.0028** | **基准** |
-| **GPU Brent-Kung** | $O(N)$ | **0.0037** | **0.76× (较慢)** |
-
-### 极限溯源与自洽性反思
-
-这组数据打破了多数程序员在大学课堂上习得的第一直觉——**复杂度低的算法在现代加速器上大概率更慢**。
-BK 的耗时为什么比 KS 高出 32%？
-
-1. 相较于 KS 的绝对平坦发射网，BK 强迫芯片执行一个陡峭的控制流树（Up-Sweep与Down-Sweep 分离），引起了沉重的分支预测错乱和极低填充率。
-2. KS 的 $\log N$ 次循环在共享内存中的通信极短极快，虽然冗余了 ALU 的加法指令，但 FMA 计算只需 1 拍，而一次因为数据依赖带来的等待停顿需要上百拍来掩盖！在这里，多做加法就是节约时间。
-
-### 工业推广 (大规模 Scan 表现)
-
-进一步延伸至百万元素的 `02_segmented_scan/segmented_scan.cu`（1M 模型）：
-RTX 4090 跑出了 **0.0221 ms** 的极端成绩，产生了约 **378 GB/s** 的有效带宽（约为 1008GB/s 的理论吞吐 37%）。对比普通 CPU Scan（1.79 ms），达成了 **80 倍纯粹的并行暴击**。
-当数据超过 1024 极化扩容后，三遍算法 (3-Pass) 被触发：计算所有局部 Block Sum，再扫描全局 Block 汇总，最后反哺入局。即便引入了极其昂贵的三次 Kernel HBM 往返，依然将延迟狠狠砸在这极速水平面上。
+这个 Kernel 极度简洁但至关重要：它将 Pass 2 计算出的跨 Block 前缀和"广播"给每个 Block 的所有元素。`blockIdx.x > 0` 确保 Block 0 不被修改（它本身的前缀和已经正确）。每个线程只做一次 Global Memory 读取和一次加法——纯 Memory Bound，完美的合并访存。
 
 ---
 
-## 架构师视角的总结 (Architect's Takeaway)
+## 理论与实际的对决：极限剖析
 
-1. **大 O 复杂度学说在并行世界的坍塌**：在标量处理器时代，$O(N)$ 必胜 $O(N \log N)$。但在超大规模并行机身上，消除 **Warp Divergence** 以及**降低指令调度深度（Step Depth）**带来收益，远超节约几个乘加器的价值。
-2. **警惕并行的自作聪明 (Sync Hazard)**：任何时候多个并发实体存在交错的读写依赖，不仅要锁上边界，更要用各自私有的 Register File 建立免疫缓冲区。
-3. **分层治理的大道 (Divide and Conquer)**：任何看似无法避免 $O(N)$ 锁链的长序列依赖（如累计积分），都可以被“解雇式分包”——让块内并行，提炼全局粗粒度信息再次并行，最终合并下放。这是将硬件物理潜力压榨到极尽的唯一解药。
+所有数据来自 `Results/03_Scan.md`。硬件：2× RTX 4090 (sm_89)。
+
+### 单 Block：KS vs BK（1024 元素）
+
+| 算法 | Kernel 时间 (ms) | vs KS 比率 |
+|:-----|:----------------|:----------|
+| **Kogge-Stone** | **0.0028** | **1× (基准)** |
+| Brent-Kung | 0.0037 | 0.76× (更慢) |
+
+KS 比 BK 快 **32%**——在机器级别完全印证了我们的理论分析：BK 的 Down-sweep 阶段活跃线程太少，大量 Warp 空转消耗时钟周期，而 KS 每一步都有 $N - 2^s$ 个线程忙碌，Warp 利用率远高于 BK。
+
+在 1024 元素的极小规模下，GPU 有效带宽仅 2.21 GB/s——与峰值 1008 GB/s 相去甚远。但这不是算法的问题：4 KB 的数据跑 Kernel 启动开销本身就 dominate 了运行时间（~5 µs launch overhead vs ~3 µs kernel execution）。
+
+### 多 Block 全局 Scan（1M 元素）
+
+| 场景 | 算法 | Kernel 时间 (ms) | CPU加速比 | 有效带宽 |
+|:-----|:-----|:----------------|:---------|:---------|
+| 小规模 4096 元素 | Coarse Scan | 0.0047 | 1.27× | 6.93 GB/s |
+| 小规模 4096 元素 | Segmented Scan | 0.0059 | — | — |
+| **大规模 1M 元素** | **Segmented Scan** | **0.0221** | **80.69×** | **378.77 GB/s** |
+
+**理论极限推导**：
+
+数据量 = $1M \times 4B = 4$ MB（读取）+ $4$ MB（写入，因为 Scan 输出 = 输入规模）= $8$ MB 最小搬运量。
+但三遍 Scan 总计搬运量 = Pass 1 读写 $2 \times 4$ MB + Pass 2 读写 $2 \times 4$ KB（block_sums, 可忽略）+ Pass 3 读写 $2 \times 4$ MB ≈ **16 MB**。
+理论最小耗时 = $16 \text{ MB} / 1008 \text{ GB/s} \approx 0.016 \text{ ms}$。
+
+实测 0.0221 ms → 有效带宽 378.77 GB/s = **理论峰值的 37.6%**。
+
+**为何仅达到理论的 37.6%？深度溯源：**
+
+1. **三遍 Kernel Launch Overhead**：三个独立 Kernel（`segmented_scan` × 2 + `add_block_sums` × 1）各有 ~5 µs 的启动开销，总计 ~15 µs，占 22.1 µs Kernel 时间的 ~68%！这是小数据量 + 多遍架构的致命伤。
+2. **KS 算法内部的 Work 冗余**：$N \log_2 N = 1024 \times 10 = 10240$ 次加法，远超串行的 1023 次。多出的 9000 多次加法不仅无法喂饱 ALU（因为是 Shared Memory Bound），反而增加了每一步的 `__syncthreads()` 等待时间。
+3. **Scan 的固有并行效率低**：与 Reduction 不同，Scan 的每一步都需要**全数组同步**（不仅仅是局部 Warp），导致 `__syncthreads()` 频率极高——KS 在单 Block 内执行 20 次 `__syncthreads()`（每步 2 次 × 10 步）。
+
+**数据规模扩展的亚线性特性**：数据量从 4096 增长到 1M（256 倍），Kernel 时间仅增长 3.78 倍——这说明并行度确实在起作用，只是被 Kernel Launch 和同步开销严重稀释了。
+
+---
+
+## 架构师视角的总结
+
+**铁律一：在 GPU 上，"少做事"不如"让所有人都有事做"。**
+BK 理论上做的加法更少（$2N$ vs $N\log N$），但在 4090 的 128 个 SM 上，它的 Down-sweep 阶段大量 SM 闲置。GPU 从来不怕你多算几次，它怕的是 Warp 吃白饭。KS 的"浪费"恰好是 SIMT 架构最需要的——保持全员忙碌，就是最大的效率。
+
+**铁律二：多 Kernel Launch 是小数据量的隐形杀手。**
+三遍全局 Scan 在算法层面是优雅的，但每次 Kernel Launch 都有不可压缩的固定开销。当数据量不够大时（< 几十 MB），Launch Overhead 可能占据 Kernel 总时间的 50% 以上。解法要么是合并 Kernel（如 `coarse_scan` 在单 Block 内完成整个流程），要么是使用 CUDA Graph 将多 Kernel 静态编排为一个 DAG（`08_Advanced`），要么是用 CUB/Thrust 等库的优化实现。
+
+**铁律三：Scan 是并行计算的"试金石"——同步成本无法隐藏。**
+Reduction 只关心最终的 1 个值，中间结果可以随便覆盖。Scan 必须保留每一步的中间值，并且每一步都依赖上一步的全局状态——这使得 `__syncthreads()` 的频率极高。KS 的双屏障设计（先读后写，两次同步）是对 RAW Hazard 的教科书应对，但它也揭示了 Scan 操作在 SIMT 架构上的天然劣势。后续 `06_Warp_Primitives` 将展示如何用 `__shfl_up_sync` 在 Warp 内零开销地完成小规模 Scan。

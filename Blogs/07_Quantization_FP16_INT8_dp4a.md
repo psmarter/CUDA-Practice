@@ -1,158 +1,212 @@
 ---
-title: "[CUDA 架构与算法实战] 07_Quantization：榨干 ALU 吞吐极限——INT8 dp4a 微架构与 FP16 向量化"
-date: 2026-03-09 23:35:00
-tags: [CUDA, 高性能计算, 量化, DP4A, FP16, Tensor Core前置]
+title: "[CUDA 架构与算法实战] 07_Quantization：从 FP32 到 INT8——dp4a 四位一体点积指令与量化 GEMM 的工业级实战"
+date: 2026-03-10 11:30:00
+tags: [CUDA, 高性能计算, 量化, INT8, FP16, dp4a, GEMM, 推理加速]
 categories: 深度学习系统架构
 ---
 
-## 楔子：直击痛点 (The Hook & Motivation)
+## 楔子：大模型推理的带宽墙与量化破壁
 
-在大语言模型（LLM）推理的残酷舞台上，显存容量和带宽（Memory Wall）永远是不够用的。我们之前在 `04_GEMM_Optimization` 中拼尽全力写出了 28 TFLOPS 的 FP32 内核，但这在动辄千亿参数的模型面前依然杯水车薪。
+GPT-4 级别的模型拥有数千亿参数。以 FP32（4 Bytes/参数）存储时，仅权重就占据数百 GB 显存。即便是 A100 80GB 也无法单卡装下。更关键的是，推理时的瓶颈不在算力（RTX 4090 拥有 82.6 TFLOPS FP32），而在于**将这些庞大权重从 HBM 中搬运到 SM 的带宽**（~1008 GB/s）。
 
-出路只有一个：**降维打击——量化 (Quantization)**。
-既然我们在访存上捉襟见肘，那我们就把搬运的数据硬生生砍掉一半 (FP16/BF16) 甚至四分之三 (INT8)！更可怕的是，NVIDIA 的架构师们在硬件底层埋了“外挂”：对于低精度数据，ALU 的吞吐量是成倍暴涨的！
+量化的核心思想极其朴素：**用更少的 bit 表示同样的数据**。
 
-本篇，我们将抛开高大上的 Tensor Core（这属于后话），纯粹从 CUDA 核心本身的微架构出发，深挖两个能让算力原地起飞的暴力指令：
+| 精度格式 | 字节数 | 存储缩减 | 关键能力 |
+|:---:|:---:|:---:|:---|
+| FP32 | 4 | 1× | 全局精度基准 |
+| FP16 | 2 | **2×** | `__hfma2` 双发射乘加 |
+| INT8 | 1 | **4×** | `__dp4a` 四路并行乘累加 |
 
-1. **FP16 领域的 `__hfma2`**：一个指令同时做两次半精度浮点乘加！
-2. **INT8 领域的 `__dp4a` (Dot Product Accumulate 4)**：传说中的四位一体点积核爆按钮，单时钟周期吞吐 4 倍算力！
+当权重从 FP32 压缩到 INT8 时，同样的 1008 GB/s HBM 带宽可以每秒**搬运 4 倍多的参数**。这不是工程 trick，而是物理带宽红利的基础数学。
 
----
-
-## 第一性原理与数学重构 (Mathematical Formulation)
-
-### 量化数学：如何将连续的宇宙塞进 256 个盒子里？
-
-核心思想是**绝对最大值对称量化 (Absmax Quantization)**。
-对于任意包含正负浮点数的张量 $X_{fp32}$，要将其优雅地塞进 $[-127, 127]$ (INT8)，我们需要一个缩放因子 (Scale) $s$：
-$$s = \frac{127}{\max(|X_{fp32}|)}$$
-
-那么，前向投射方程为：
-$$X_{int8} = \text{round}(s \cdot X_{fp32})$$
-
-而在做 GEMM ($C = A \times B$) 时，真正的奇迹在于：**我们根本不需要在 O(N^3) 的计算密集区进行任何 FP32 操作**。
-$$C_{i,j} \approx \frac{1}{s_{A,i} \cdot s_{B,j}} \sum_{k=0}^{N-1} \left( A^{int8}_{i,k} \cdot B^{int8}_{k,j} \right)$$
-看！那个庞大的 $\Sigma$ 里面的所有操作，全部变成了纯粹的 8-bit 整型乘加！只有在最后写回结果 $C$ 的一瞬间，才需要除以那两个轻量级的常数 Scale 返回 FP32 世界。这就叫“数据面降维，控制面升维”。
+但量化的代价是什么？精度！本文将从量化的数学基础出发，深入 `dp4a` 硬件指令的微架构，再用真机跑分回答一个核心问题：**手写的 dp4a INT8 GEMM 到底能榨出多少吞吐？**
 
 ---
 
-## 核心优化演进与硬件映射 (Architecture Mapping)
+## 第一性原理与数学重构
 
-既然数学上跑通了纯整数通道，那么硬件层面如何接得住这泼天的富贵？
-欢迎来到基于 Pascal 架构 (SM 6.1) 引入的杀手锏：**DP4A 指令 (Dot Product Accumulate)**。
+### 一、绝对最大值对称量化（Absmax Symmetric Quantization）
 
-### DP4A：单周期核爆指令拓扑
+将 FP32 张量线性映射到 INT8 的 $[-127, 127]$ 空间：
 
-在传统 CPU 或早期的 GPU 上，做 4 次 INT8 乘加需要发射（Issue）多少条指令？4 次乘法 + 3 次加法 = 至少需要数个周期的流水线停顿。
+$$s = \frac{127}{\max(|X|)}, \quad X_{\text{int8}} = \text{round}(s \cdot X_{\text{fp32}}), \quad \hat{X} = \frac{X_{\text{int8}}}{s}$$
 
-而 `__dp4a(int a, int b, int c)` 的硬件连线是这样设计的：
+其中 Scale $s$ 是一个 FP32 标量。核心问题在于 $s$ 的粒度：
+
+- **Per-Tensor**：整个张量共享一个 $s$。计算简单，但**一个异常值就能摧毁整个张量的精度**。例如一个 $[-1, 1]$ 范围的张量中混入一个 $100$，Scale 变为 $127/100 = 1.27$，导致 $[-1, 1]$ 范围内的值只能映射到 $\{-1, 0, 1\}$，信息损失 99%。
+- **Per-Channel**：每行/每列独立计算 $s_i$。GPU 上需要额外一次行级 Reduce Max，但异常值只影响自己所在的通道，其他通道不受牵连。
+
+### 二、INT8 GEMM 的缩放复原
+
+对于 $C = A \times B$，量化后：
+
+$$C_{i,j} \approx \frac{1}{s_{A,i} \cdot s_{B,j}} \sum_{k} \hat{A}_{i,k} \cdot \hat{B}_{k,j}$$
+
+核心内积 $\sum \hat{A} \cdot \hat{B}$ 全在 **INT8 域**完成（使用 INT32 累加器防溢出），仅在最终写回时乘以 FP32 Scale。这意味着计算密度提升 4×（每个 32-bit 寄存器打包 4 个 INT8），而 FP32 的 Scale 恢复只是末尾的一次标量乘法。
+
+### 三、FP16 与 `half2` 双发射
+
+FP16（IEEE 754 半精度）使用 1 位符号 + 5 位指数 + 10 位尾数。CUDA 提供 `__half2` 类型，将两个 FP16 打包到 32 位寄存器中，配合 `__hfma2(a, b, c)` 在一个时钟内完成**两次独立的融合乘加**——吞吐量直接翻倍。
+
+---
+
+## 核心优化演进与硬件映射
+
+### `dp4a`：四位一体的硬件点积引擎
+
+NVIDIA 的 `__dp4a(int a, int b, int c)` 是 INT8 计算的杀手锏。它在一个时钟内完成：
+
+$$c_{\text{new}} = c + \sum_{i=0}^{3} a_i \cdot b_i$$
+
+其中 $a$ 和 $b$ 是 32-bit 寄存器，各自打包了 4 个 INT8 值。
 
 ```mermaid
-graph TD
-    classDef reg32 fill:#bbf,stroke:#333,stroke-width:2px;
-    classDef reg8 fill:#d4e157,stroke:#333,stroke-width:2px;
-    classDef acc fill:#ffb74d,stroke:#333,stroke-width:2px;
+graph LR
+    classDef reg fill:#bbf,stroke:#333;
+    classDef mul fill:#d4e157,stroke:#333;
+    classDef acc fill:#ffb74d,stroke:#333;
 
-    subgraph "32-bit Register A [含 4 个 8-bit]"
-        A3[A_3]:::reg8 --- A2[A_2]:::reg8 --- A1[A_1]:::reg8 --- A0[A_0]:::reg8
+    subgraph "32-bit 寄存器 A"
+        A3["A₃"]:::reg --> M3
+        A2["A₂"]:::reg --> M2
+        A1["A₁"]:::reg --> M1
+        A0["A₀"]:::reg --> M0
     end
 
-    subgraph "32-bit Register B [含 4 个 8-bit]"
-        B3[B_3]:::reg8 --- B2[B_2]:::reg8 --- B1[B_1]:::reg8 --- B0[B_0]:::reg8
+    subgraph "32-bit 寄存器 B"
+        B3["B₃"]:::reg --> M3
+        B2["B₂"]:::reg --> M2
+        B1["B₁"]:::reg --> M1
+        B0["B₀"]:::reg --> M0
     end
 
-    subgraph "DP4A 硬件硅片直连执行单元"
-        M3((×))
-        M2((×))
-        M1((×))
-        M0((×))
-    end
+    M3((×)):::mul --> SUM
+    M2((×)):::mul --> SUM
+    M1((×)):::mul --> SUM
+    M0((×)):::mul --> SUM
 
-    subgraph "32-bit 累加器 C (输出)"
-        Add((+))
-        C_out["C_new = C_old + \n(A0×B0 + A1×B1 + A2×B2 + A3×B3)"]:::acc
-    end
-
-    A3 --> M3; B3 --> M3; M3 --> Add
-    A2 --> M2; B2 --> M2; M2 --> Add
-    A1 --> M1; B1 --> M1; M1 --> Add
-    A0 --> M0; B0 --> M0; M0 --> Add
-    
-    Add --> C_out
+    SUM(("+")):::acc --> C["C_new = C + ΣAᵢBᵢ"]:::acc
 ```
 
-**底层真相解码：**
-这三个变量 `a`, `b`, `c` 原本都只是 32-bit 的极度普通的 `int32_t` 寄存器。但指令译码器强行把 `a` 和 `b` 脑补成了结构体 `struct { int8_t x, y, z, w; }`。在一个原子时钟周期内，硬件网格直接爆发出 4 路乘法器并将结果路由至 32-bit 的 `c` 里面累加防溢出。
-这就是以一敌四的暴力！指令槽位 (Issue Slot) 利用率直接飙升 400%！
+**对比传统标量方式**：计算 4 对 INT8 乘积需要 4 次乘法 + 3 次加法 = 7 条指令。`dp4a` 将其压缩为 **1 条指令**，纯计算吞吐提升 7×。
+
+### INT8 GEMM 的三级优化阶梯
+
+| 版本 | 核心策略 | 每循环迭代的乘累加数 | Kernel 时间 |
+|:---|:---|:---:|:---:|
+| Naive | 逐元素 INT8 乘加 | 1 | 0.41 ms |
+| dp4a | 4 路打包点积 | 4 | 0.28 ms |
+| **Vectorized dp4a** | `int4` 128-bit 加载 + 4 列并行 | **16** | **0.19 ms** |
+
+Vectorized 版本的关键跃迁：
+
+1. **访存侧**：用 `reinterpret_cast<const int32_t*>` 将 4 个连续 INT8 合并为 1 次 32-bit 读取
+2. **计算侧**：每个线程同时计算 4 列输出，共享同一个 `a_val`，将 A 矩阵的访存复用 4×
+3. **写回侧**：用 `int4`（128-bit）向量化存储 4 个 INT32 结果
 
 ---
 
-## 源码手术刀：关键代码深度赏析 (Surgical Code Analysis)
+## 源码手术刀：关键代码深度赏析
 
-要在代码里召唤这头怪兽，可比单纯写个 `#pragma` 难多了。数据必须亲手打包包装好才能喂给 `__dp4a`。
-
-打开 `07_Quantization/02_int8_gemm/int8_gemm.cu`，我们鉴赏一下最极端的 **Vectorized INT4 读取并拆封 DP4A 喂食** 操作：
+### Vectorized dp4a GEMM 的核心循环
 
 ```cpp
-// 终极性能形态：一个线程一次性吞吐 16 字节 (1个 int4，包裹着 16个 INT8)
-int4 a_vec = *reinterpret_cast<const int4*>(&A[row * N + i]);
-// b_rowX_pack 分别从 4 个不同行吞进 4 个 int32 (一共16个INT8)
-int32_t b_row0_pack = *reinterpret_cast<const int32_t*>(&B[(i + 0) * K + col]);
-// ... [省略 b_row1 到 b_row3]
+// 每个线程负责 C[row, col:col+4] 的 4 个输出元素
+int32_t sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
 
-// 🤯 最恶心也是最重要的“数据洗牌打包 (Data Swizzling)” 🤯
-// a_vec 的 x,y,z,w 已经是横向行连续打包的，不用管。
-// 但 B 矩阵在 global 内存里是一行一行存的！我们需要抽出每行的第 0 列组成一个新的 column包！
-int8_t r0_c0 = b_row0_pack & 0xFF;         // 提第 0 行第 0 列 (最低 8-bit)
-int8_t r1_c0 = b_row1_pack & 0xFF;         // 提第 1 行第 0 列
-// ... [位运算剥夺重组]
-// 手动将来自 4 行的四个游离 INT8 强行按小端序融合成极其纯粹的 1 个竖向载体 (32-bit)
-int32_t col0_val = ((r3_c0 & 0xFF) << 24) | ((r2_c0 & 0xFF) << 16) | ((r1_c0 & 0xFF) << 8) | (r0_c0 & 0xFF);
+for (int i = 0; i < N; i += 4) {
+    // A 矩阵：一次 32-bit 读取，获得 4 个 INT8 元素
+    int32_t a_val = *reinterpret_cast<const int32_t*>(&A[row * N + i]);
 
-// 🔥 开炮时间：4 次 dp4a 疯狂输出，等效于传统 16 次乘法指令 🔥
-sum0 = compat_dp4a(a_vec.x, col0_val, sum0);  
-// ... [其余计算省略]
+    // B 矩阵：读取 4 行 × 4 列的 INT8 数据块，手动转置打包
+    // b_row{0..3}_pack 各包含 B[i+{0..3}, col:col+4] 的 4 个 INT8
+    int32_t col0_val = /* 从 4 行中提取第 0 列的 4 个 INT8 并打包 */;
+    int32_t col1_val = /* 第 1 列 */;
+    int32_t col2_val = /* 第 2 列 */;
+    int32_t col3_val = /* 第 3 列 */;
+
+    // 4 次 dp4a: 一次循环消耗 16 对 INT8 乘加
+    sum0 = compat_dp4a(a_val, col0_val, sum0);
+    sum1 = compat_dp4a(a_val, col1_val, sum1);
+    sum2 = compat_dp4a(a_val, col2_val, sum2);
+    sum3 = compat_dp4a(a_val, col3_val, sum3);
+}
+// 一次 int4 向量化写回
+*reinterpret_cast<int4*>(&C[row * K + col]) = {sum0, sum1, sum2, sum3};
 ```
 
-**手术刀剖析：**
-你看到了什么？是满屏的位运算（Bitwise `&`, `>>`, `|`）。由于我们在写矩阵乘法，而对于普通矩阵布局，B 矩阵的数据在竖直方向上内存是不连续的！`dp4a` 最痛恨的就是数据不紧密。
-因此在寄存器端，哪怕用 `<< 24` 这种晦涩的移位去剥夺重组变量，其付出的几条极其廉价的 ALU 指令周期，相比于让 Global Memory 发起 4 次零散读取并破坏全局总线事务而言，简直就是暴赚的无本买卖。
+**硬件级解读**：
 
-> 同理，在 `01_fp16_gemm/fp16_gemm.cu` 中，我们使用的是 `__hfma2` 原语。它的逻辑完全相同：把 2 个 FP16 打包进一个 32-bit 的 `half2` 结构中劈头盖脸地发射算力。
+1. **A 矩阵复用 4×**：`a_val` 被 4 次 `dp4a` 共享，避免了重复访存。在寄存器层面，这 4 条 `dp4a` 指令可以被 SM 的多个函数单元 pipeline 化执行。
+2. **B 矩阵转置打包**：因为 B 矩阵按行存储，但我们需要按列计算点积，所以必须手动用位操作（`>> 8 & 0xFF`）从 4 行中提取同一列的 4 个元素，重新打包成一个 `int32_t` 送入 `dp4a`。这就是量化 GEMM 的 "脏活"——数据布局适配。
 
 ---
 
-## 理论与实际的对决：极限剖析 (Theory vs Reality Profiling)
+## 理论与实际的对决：极限剖析
 
-让我们抽拉出项目 `Results/07_Quantization.md` 中的真机实测数据 (RTX 4090, SM_89, M=N=K=1024)：
+> **测试环境**：NVIDIA GeForce RTX 4090 × 2（sm_89），Linux，nvcc -O3 -std=c++17
+
+### 量化/反量化开销（10M 元素，100 次平均）
+
+| 操作 | Kernel 时间 (ms) | 有效带宽 (GB/s) | vs CPU 加速比 |
+|:---|:---:|:---:|:---:|
+| FP32 → FP16 Cast | 0.02 | 2912 | 4433× |
+| FP16 → FP32 Cast | 0.02 | 2923 | 2567× |
+| **FP32 → INT8 Per-Tensor** | **0.02** | **2167** | **3581×** |
+| FP32 → INT8 Per-Channel | 0.03 | 1763 | 2986× |
+
+所有量化 Kernel 的有效带宽都远超 1008 GB/s 的 DRAM 理论峰值——这再次印证了 L2 Cache 效应：10M × 4B = 40 MB 的数据完全驻留在 RTX 4090 的 72 MB L2 Cache 中。**量化本身不是推理延迟的瓶颈，可以放心使用。**
+
+### FP16 GEMM（1024 × 1024，10 次平均）
+
+| 版本 | Kernel 时间 (ms) | 计算吞吐 | vs Naive 加速比 |
+|:---|:---:|:---:|:---:|
+| Naive FP16 | 0.42 | ~5.1 TFLOPS | 1× |
+| Tiled FP16 | 0.33 | ~6.5 TFLOPS | 1.28× |
+| **Vectorized (`half2`)** | **0.22** | **9.70 TFLOPS** | **1.91×** |
+
+### INT8 GEMM（1024 × 1024，10 次平均）
+
+| 版本 | Kernel 时间 (ms) | 计算吞吐 | vs Naive 加速比 |
+|:---|:---:|:---:|:---:|
+| Naive INT8 | 0.41 | ~5.2 TOPS | 1× |
+| dp4a INT8 | 0.28 | ~7.7 TOPS | 1.48× |
+| **Vectorized dp4a** | **0.19** | **11.31 TOPS** | **2.14×** |
 
 ```mermaid
 xychart-beta
-  title "高计算强度下各基元 GEMM 的耗时骤降 (1024规模, ms越低越好)"
-  x-axis ["Naive FP32 (推算)", "Naive_FP16", "Vectorized_FP16", "dp4a_INT8", "Vectorized_dp4a"]
-  y-axis "耗时 (ms)" 0 --> 0.6
-  bar [0.55, 0.42, 0.22, 0.28, 0.19]
+  title "1024×1024 GEMM 各版本耗时对比 (ms，越低越好)"
+  x-axis ["Naive FP16", "Naive INT8", "Tiled FP16", "dp4a INT8", "Vec FP16", "Vec dp4a"]
+  y-axis "ms" 0 --> 0.45
+  bar [0.42, 0.41, 0.33, 0.28, 0.22, 0.19]
 ```
 
-| 算子变体 | 内部发射内核 | Kernel 耗时 (ms) | 加速红利与底层瓶颈分析 |
-| :--- | :--- | :--- | :--- |
-| **FP32** (推算值) | `fma` | ~0.55 ms | 最传统、占用指令槽和宽度的笨重基准。 |
-| **Naive FP16** | `__hfma` | 0.42 ms | 纯粹换数据类型，没发挥向量化，寄存器闲置，浪费了位宽。 |
-| **Vec FP16** | `__hfma2` | **0.22 ms** | 极具美感！**一箭双雕，计算吞吐量 9.70 TFLOPS，耗时砍半！** |
-| **dp4a INT8** | `__dp4a` | 0.28 ms | 虽然打包了，但内存读取一次 4 字节不够过瘾，触发了少许访存等待。 |
-| **Vec dp4a INT8** | **四轮组合拳** | **0.19 ms** | **最终形态：吞吐量暴涨至 11.31 TOPS！彻底将计算压制成一道闪电，是朴素 FP16 的 2 倍多速度。** |
+### 理论自洽性分析
 
-### 极限溯源与“反直觉”自洽性反思
+**Vec dp4a INT8 的 11.31 TOPS vs 理论峰值**
 
-你会发现，虽然 `dp4a` 有不可一世的 4 倍算力吞吐系数，相比 `hfma2` 的 2 倍理论系数更高，但为何 **FP16 (0.22ms)** 和 **Vec dp4a (0.19ms)** 之间的差距没有体现出 2 倍那么夸张？
-揭开 Profiling 的迷雾：
-当 M=N=K=1024 这个体量时，矩阵规模对于宏大的 4090 而言属于“中小规模”。由于我们前文看到由于 INT8 `dp4a` 要求打包，导致内部多了极其繁琐的 `reinterpret_cast`、以及移位元组的洗牌逻辑。在小矩阵红利铺开的前期，**大量的 ALU 时钟周期实际上是消耗在了这些非计算属性的 “Bit manipulation (位元揉捏)” 之上的。**
-只有当矩阵极速扩大（如 4096+），计算密集度彻底击穿天花板时，点积 4 重并发的光芒才会彻底掩盖那些打包耗时。而对于更高级的 Tensor Core (`mma.sync` 甚至 `mma.m16n8k16.int8`)，就是专门设计成“连打包洗牌的苦力活都在硅片硬件层面替你干完”的终极形态。
+RTX 4090 的 FP32 CUDA Core 算力为 82.6 TFLOPS。INT8 没有独立的标量管线，`dp4a` 复用 INT32 ALU，因此 INT8 标量峰值约等于 FP32 的 $82.6 \times 2 = 165$ TOPS（每 cycle 2 个 INT32 op，每 op 含 4 次 INT8 乘加 = 8 INT8 ops，但 dp4a 本身消耗一个 INT32 slot）。
+
+$11.31 / 165 \approx 6.9\%$ 利用率——**为什么这么低？**
+
+1. **1024×1024 矩阵太小**：总计算量 $2 \times 1024^3 = 2.1 \text{G}$ ops，仅需 0.013 ms 即可完成。0.19 ms 的实测时间说明 Kernel 被 launch 开销和访存延迟主导。
+2. **无 Shared Memory Tiling**：当前 Vectorized dp4a 仍是全局内存直读，没有利用 SMEM 减少冗余加载。对比 04_GEMM 中的 Register Tiling 方案，这里的优化还有巨大空间。
+3. **B 矩阵转置开销**：手动逐字节位操作重打包 B 列数据的延迟（4 次 `>> & |` 每 dp4a）在小矩阵上占比显著。
+
+要达到 RTX 4090 的 INT8 峰值性能，需要：① Tensor Core（WMMA/MMA）而非标量 dp4a；② CUTLASS 级别的多级 Tiling；③ 4096+ 规模矩阵以摊薄固定开销。
 
 ---
 
-## 架构师视角的总结 (Architect's Takeaway)
+## 架构师视角的总结
 
-1. **类型铸造（Type Casting）的白嫖红利**：在深度学习端，将巨大的计算量从 32 位精度下降到 16 位甚至 8 位，其带来的不仅仅是显存放大了 2~4 倍，更是**片内数据移动功耗 (Energy per bit traveled) 的腰斩**。这是走向端侧部署（Edge AI）的唯一正道。
-2. **底层算力暴增的暗黑密码（Data Packing）**：不管是 `__hfma2` 还是 `__dp4a`，NVIDIA 教会了我们一件事：**只要你敢把数据打包成 32 字节甚至 128 字节凑够大巴车发车，硬件就敢拨出特殊的乘法器专线给你走后门。**
-3. **汇编层面的取舍法则**：没有免费的午餐。INT8 带来了 4 倍强算的错觉，却逼研发者手动在 CUDA 端去用位运算倒腾内存对不齐的矩阵。这迫使我们极其渴望下一代全自动张量阵列硬件——即将在后文大放异彩的 **Tensor Core (CUTLASS)** 会彻底撕开这个枷锁！
+### 铁律一：量化的价值不在于 "计算更少"，而在于 "搬运更少"
+
+在 Memory Bound 的推理场景中，INT8 将权重体积压缩 4×，这意味着相同带宽下可以每秒处理 4× 的 Token。`dp4a` 带来的计算效率提升只是锦上添花——**真正的杀手收益来自带宽层面**。
+
+### 铁律二：dp4a 是标量 INT8 的天花板，但不是 INT8 的终点
+
+`dp4a` 在 FP32/INT32 ALU 管线中执行，吞吐上限受制于标量管线宽度。真正释放 INT8 算力的是 **Tensor Core**（从 Turing 架构开始），它可以在一个时钟内完成 $16 \times 16$ 矩阵的 INT8 乘累加——这就是 09_Tensor_Core 章节的主题。
+
+### 铁律三：Per-Channel 量化是工业级量化的最低门槛
+
+从 SmoothQuant 到 AWQ，现代量化方案几乎全部采用 Per-Channel（甚至 Per-Group）粒度。Per-Tensor 在 LLM 的 Attention 层中会遇到 Activation Outlier（某些通道的激活值比其他通道大 100 倍），导致 INT8 精度崩塌。GPU 端的额外开销仅为每行一次 Reduce Max，但换来了精度安全的保障。
