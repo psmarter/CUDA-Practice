@@ -59,7 +59,7 @@ graph TD
         L8["(2,0)"]:::logic --- L9["(2,1)"]:::logic --- LA["(2,2)"]:::logic --- LB["(2,3)"]:::logic
     end
 
-    subgraph "物理内存偏移 (1D Stride<4, 1>)"
+    subgraph "物理内存偏移 (1D Stride(4, 1))"
         M0["[0]"]:::mem --- M1["[1]"]:::mem --- M2["[2]"]:::mem --- M3["[3]"]:::mem
         M4["[4]"]:::mem --- M5["[5]"]:::mem --- M6["[6]"]:::mem --- M7["[7]"]:::mem
         M8["[8]"]:::mem --- M9["[9]"]:::mem --- MA["[10]"]:::mem --- MB["[11]"]:::mem

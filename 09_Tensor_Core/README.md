@@ -51,9 +51,9 @@ graph TD
     end
 
     subgraph "Warp 寄存器堆 (32 线程协作)"
-        FragA["wmma::fragment<matrix_a, 16,16,16, half, ...>\n(每个线程持有 A 的部分比特)"]:::reg
-        FragB["wmma::fragment<matrix_b, 16,16,16, half, ...>\n(每个线程持有 B 的部分比特)"]:::reg
-        FragC["wmma::fragment<accumulator, 16,16,16, float>\n(每个线程持有 C 的部分 32-bit 位)"]:::reg
+        FragA["wmma::fragment&lt;matrix_a, 16,16,16, half, ...&gt;\n(每个线程持有 A 的部分比特)"]:::reg
+        FragB["wmma::fragment&lt;matrix_b, 16,16,16, half, ...&gt;\n(每个线程持有 B 的部分比特)"]:::reg
+        FragC["wmma::fragment&lt;accumulator, 16,16,16, float&gt;\n(每个线程持有 C 的部分 32-bit 位)"]:::reg
     end
 
     subgraph "Tensor Core (硬件执行单元)"
@@ -119,7 +119,7 @@ wmma::store_matrix_sync(C + row * N + col, c_frag, N, wmma::mem_row_major);
 | **WMMA Mixed** | **FP16 输入 + TC + FP32 累加** | **0.0546 ms** | **39.36 TFLOPS** | **7.21×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "常规 FMA (FP32) vs Tensor Core 混合精度 (TFLOPS) (1024 规模)"
   x-axis ["Naive FP32 FMA", "WMMA Mixed Precision"]
   y-axis "TFLOPS" 0 --> 45

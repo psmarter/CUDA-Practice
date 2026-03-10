@@ -138,7 +138,7 @@ __syncthreads(); // ③ 确保写入完成，下一轮 stride 才可继续
 | **GPU 三遍分段扫描** | **0.0221 ms** | **378.77 GB/s** | **80.69×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "前缀和不同规模 Kernel 耗时（ms，越低越好）"
   x-axis ["KS(1K)", "BK(1K)", "Coarse(4K)", "Seg(4K)", "Seg(1M)"]
   y-axis "时间 (ms)" 0 --> 0.025

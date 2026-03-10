@@ -155,7 +155,7 @@ for (int i = 0; i < N; i += 4) {
 | **Vectorized `dp4a` (int4)** | **0.19 ms** | **11.31 TOPS** | **2.14×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "不同精度 GEMM 耗时对比 (ms，越低越好，1024 规模)"
   x-axis ["Naive FP32", "Naive INT8", "Tiled FP16", "dp4a INT8", "Vec FP16", "Vec dp4a"]
   y-axis "时间 (ms)" 0 --> 0.45
