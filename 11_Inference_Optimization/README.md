@@ -146,7 +146,7 @@ output[batch_idx * num_heads * head_dim + head_idx * head_dim + tid] = acc;
 | **动态紧凑批处理 (Varlen Packed Tensor)** | **1.69 ms** | **1D 变长压紧，抛弃掩码** | **1311.22 MB** |
 
 ```mermaid
-xychart-beta
+xychart
   title "批处理显存开销 (Static Padding vs Varlen Packed) (MB，越低越好)"
   x-axis ["Static", "Continuous (Varlen Packed)"]
   y-axis "显存 (MB)" 0 --> 4200

@@ -119,7 +119,7 @@ wmma::store_matrix_sync(C + row * N + col, c_frag, N, wmma::mem_row_major);
 | **WMMA Mixed** | **FP16 输入 + TC + FP32 累加** | **0.0546 ms** | **39.36 TFLOPS** | **7.21×** |
 
 ```mermaid
-xychart-beta
+xychart
   title "常规 FMA (FP32) vs Tensor Core 混合精度 (TFLOPS) (1024 规模)"
   x-axis ["Naive FP32 FMA", "WMMA Mixed Precision"]
   y-axis "TFLOPS" 0 --> 45

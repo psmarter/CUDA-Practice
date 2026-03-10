@@ -156,7 +156,7 @@ shared_data[tid] = sum;
 *\* 注：1506.49 GB/s 超过 DRAM 理论峰值（~1008 GB/s），系 1MB 数组完全驻留在 L2 Cache（72 MB）中的正常缓存命中现象，非硬件限制。*
 
 ```mermaid
-xychart-beta
+xychart
   title "各版本 Kernel 耗时对比（越低越好，单位 ms）"
   x-axis ["Reduce Simple", "Reduce Convergent", "Reduce Coarsened(1M)", "DotProd FMA(1M)"]
   y-axis "时间 (ms)" 0 --> 0.011

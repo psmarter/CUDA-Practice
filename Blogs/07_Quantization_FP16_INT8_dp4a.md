@@ -1,170 +1,144 @@
 ---
-title: "07_Quantization：FP16、INT8 和 dp4a——用数据精度换计算速度"
+title: "07_Quantization：FP16 带宽翻倍、INT8 dp4a 指令和量化的工程代价"
 date: 2026-03-10 11:30:00
-tags: [CUDA, 高性能计算, 量化, INT8, FP16, dp4a, GEMM, 推理加速]
+tags: [CUDA, 高性能计算, 量化, FP16, INT8, dp4a, 混合精度, Vectorized, GEMM]
 categories: 深度学习系统架构
 ---
 
-> 📖 **前置阅读**：01_Basics（GEMM 基础）、04_GEMM_Optimization（Register Tiling）  
-> 📖 **推荐后续**：09_Tensor_Core（硬件级低精度计算）、11_Inference_Optimization（量化推理部署）
+> 📖 **前置阅读**：01_Basics（带宽与算术强度）、04_GEMM_Optimization（FP32 GEMM 天花板）
+> 📖 **推荐后续**：09_Tensor_Core（WMMA 硬件加速 FP16）、11_Inference_Optimization（推理级融合）
 
-## 为什么要量化
+FP32 一个元素 4 字节。FP16 只要 2 字节。同一条 HBM 通道，FP16 的**有效数据吞吐翻倍**。INT8 再砍一半，1 字节。这就是量化的第一个收益——不需要改任何 Kernel 逻辑，光靠缩小数据宽度就能提速。
 
-FP32 一个数占 4 字节，FP16 占 2 字节，INT8 占 1 字节。把权重和激活值从 FP32 转成低精度格式，好处很直接：
-
-1. **带宽省了**：对 Memory Bound 算子，数据量少一半就快一倍
-2. **计算密度高了**：RTX 4090 的 FP16 吞吐是 FP32 的 2 倍，INT8 通过 dp4a 指令更进一步
-
-代价是精度损失。不过大量实验表明，推理场景下 FP16 几乎无损，INT8 在大多数任务也可接受。
+但"缩小数据宽度"不是免费的。FP16 的有效精度只有 $\sim 3.3$ 位十进制，INT8 只有 256 个离散值。量化需要找到一条路：**用最低的精度损失换最大的性能提升**。
 
 ---
 
-## 量化的数学
+## FP16 GEMM：从 Naive 到 Vectorized
 
-### 绝对最大值对称量化
+### 数据格式
 
-FP32 到 INT8 的线性映射：
+FP16（IEEE 754 `binary16`）：1 位符号 + 5 位指数 + 10 位尾数。动态范围 $[6 \times 10^{-8},\ 65504]$，精度 $\epsilon = 2^{-10} \approx 0.001$。
 
-$$s = \frac{127}{\max(|X|)}, \quad X_{\text{int8}} = \text{round}(s \cdot X_{\text{fp32}}), \quad \hat{X} = \frac{X_{\text{int8}}}{s}$$
+BF16（Google Brain Float16）：1+8+7，动态范围和 FP32 一样（8 位指数），精度更低（7 位尾数）。BF16 用于训练更稳定，FP16 用于推理精度更高。
 
-Scale $s$ 的粒度是关键：
-
-- **Per-Tensor**：整个张量共享一个 $s$。简单但脆弱——一个异常值就能毁掉整个张量的精度。比如 $[-1, 1]$ 范围的张量混入一个 100，Scale 变成 $127/100 = 1.27$，正常范围内的值只能映射到 $\{-1, 0, 1\}$——信息基本丢光了。
-- **Per-Channel**：每行/每列独立计算 Scale。异常值只影响自己的通道，GPU 上需要额外一次行级 Reduce Max。
-
-### INT8 GEMM 的缩放恢复
-
-$C = A \times B$ 量化后：
-
-$$C_{i,j} \approx \frac{1}{s_{A,i} \cdot s_{B,j}} \sum_{k} \hat{A}_{i,k} \cdot \hat{B}_{k,j}$$
-
-核心内积全在 INT8 域完成（用 INT32 累加器防溢出），最后写回时乘以 FP32 Scale——只是一次标量乘法。
-
----
-
-## FP16 GEMM：half2 双发射
-
-`half` 类型（IEEE 754 半精度）：1 位符号 + 5 位指数 + 10 位尾数，动态范围 $6.1 \times 10^{-5}$ 到 $6.55 \times 10^4$。
-
-CUDA 提供 `__half2` 类型，把两个 FP16 打包到一个 32 位寄存器里，配合 `__hfma2(a, b, c)` 一个时钟完成两次独立的 FMA——吞吐直接翻倍。
-
-### 实测（$1024 \times 1024$，10 次平均）
-
-| 版本 | Kernel 时间 | 吞吐 (GFLOPS) | vs Naive |
-|:---|:---|:---|:---|
-| Naive | 0.42 ms | 5,074 | 1× |
-| Tiled | 0.33 ms | 6,494 | 1.28× |
-| Vectorized (half2) | 0.22 ms | **9,697** | 1.91× |
-
-Vectorized 用 `half2` 一次处理两个值，`__hfma2` 原生支持双发射 FMA。9697 GFLOPS ≈ 9.7 TFLOPS。
-
-这里有个看似矛盾的地方：FP16 比 FP32 应该快，但 9.7 TFLOPS 反而低于 FP32 Register Tiling 的 14 TFLOPS。原因是这个 FP16 版只做了向量化 Tiling，没有 Register Tiling。给 FP16 也加上 Register Tiling + Tensor Core，数字会飙到 100+ TFLOPS（09_Tensor_Core 的事）。
-
----
-
-## INT8 GEMM 和 dp4a 指令
-
-CUDA Core 的 FMA 单元不直接支持 int8 乘法。`dp4a`（Dot Product of 4 Accumulate）指令是 NVIDIA 的方案：
-
-$$\text{dp4a}(a, b, c) = c + \sum_{k=0}^{3} a_k \cdot b_k$$
-
-一条指令完成 4 对 int8 的乘加，结果累加到 int32。$a$ 和 $b$ 各是一个打包的 4×int8（塞在一个 32 位寄存器里）。
-
-```mermaid
-graph LR
-    classDef reg fill:#bbf,stroke:#333;
-    classDef mul fill:#d4e157,stroke:#333;
-    classDef acc fill:#ffb74d,stroke:#333;
-
-    subgraph "32-bit 寄存器 A"
-        A3["A₃"]:::reg --> M3
-        A2["A₂"]:::reg --> M2
-        A1["A₁"]:::reg --> M1
-        A0["A₀"]:::reg --> M0
-    end
-
-    subgraph "32-bit 寄存器 B"
-        B3["B₃"]:::reg --> M3
-        B2["B₂"]:::reg --> M2
-        B1["B₁"]:::reg --> M1
-        B0["B₀"]:::reg --> M0
-    end
-
-    M3((×)):::mul --> SUM
-    M2((×)):::mul --> SUM
-    M1((×)):::mul --> SUM
-    M0((×)):::mul --> SUM
-
-    SUM(("+")):::acc --> C["C_new = C + ΣAᵢBᵢ"]:::acc
-```
-
-传统标量方式算 4 对 int8 乘积要 7 条指令（4 乘 + 3 加），`dp4a` 压成 1 条。
-
-### 代码模式
+### 三版 FP16 Kernel
 
 ```cpp
-// 朴素版
+// V1: Naive —— 标量 half 运算
 for (int k = 0; k < K; ++k)
-    sum += (int)A[row][k] * (int)B[k][col];
+    sum = __hfma(A[row*K+k], B[k*N+col], sum);
 
-// dp4a 版：4 个 int8 打包处理
-for (int k = 0; k < K; k += 4) {
-    int a_pack = *reinterpret_cast<const int*>(&A[row][k]);
-    int b_pack = *reinterpret_cast<const int*>(&B[k][col]);
-    sum = __dp4a(a_pack, b_pack, sum);
-}
+// V2: Tiled —— Shared Memory 分块
+__shared__ half tileA[T][T], tileB[T][T];
+// ... 加载 + sync + 计算
+
+// V3: Vectorized —— half2 向量化
+half2 a2 = *reinterpret_cast<const half2*>(&A[...]);
+half2 b2 = *reinterpret_cast<const half2*>(&B[...]);
+sum2 = __hfma2(a2, b2, sum2);  // 一条指令做 2 个 FMA
 ```
 
-### Vectorized dp4a 的进一步优化
+`half2` 把两个 FP16 打包成 32 位——一条 `HFMA2` 指令同时做两个乘加，指令吞吐翻倍。
 
-每个线程同时计算 4 列输出，共享同一个 `a_val`，把 A 矩阵的访存复用了 4 倍。一次循环消耗 16 对 INT8 乘加。写回用 `int4`（128-bit）向量化存储。
+### 实测（1024 × 1024，10 次平均）
 
-### 实测（$1024 \times 1024$，10 次平均）
-
-| 版本 | Kernel 时间 | 吞吐 | vs Naive |
-|:---|:---|:---|:---|
-| Naive INT8 | 0.41 ms | ~5.2 TOPS | 1× |
-| dp4a | 0.28 ms | ~7.7 TOPS | 1.48× |
-| Vectorized dp4a | 0.19 ms | **11.31 TOPS** | 2.14× |
-
-11.31 TOPS。dp4a 的提升没到理论的 4 倍——瓶颈不完全在计算，还有 B 矩阵的转置打包开销（每次 dp4a 前需要用位操作从 4 行中提取同列 4 个元素重新打包）和 SRAM/Global Memory 的访问延迟。
+| 版本 | Kernel (ms) | 加速比 | GFLOPS |
+|:---|:---:|:---:|:---:|
+| Naive FP16 | 0.424 | 1× | — |
+| Tiled FP16 | 0.331 | **1.28×** | — |
+| **Vectorized FP16** | **0.222** | **1.91×** | **9697** |
 
 ```mermaid
 xychart-beta
-  title "1024×1024 GEMM 各版本耗时对比 (ms)"
-  x-axis ["Naive FP16", "Naive INT8", "Tiled FP16", "dp4a INT8", "Vec FP16", "Vec dp4a"]
-  y-axis "ms" 0 --> 0.45
-  bar [0.42, 0.41, 0.33, 0.28, 0.22, 0.19]
+  title "FP16 GEMM 优化路径 (ms)"
+  x-axis ["Naive", "Tiled", "Vectorized"]
+  y-axis "Kernel 耗时 ms" 0 --> 0.5
+  bar [0.424, 0.331, 0.222]
 ```
 
 ---
 
-## 量化和反量化的开销
+## INT8 和 dp4a 指令
 
-量化不只是 GEMM 内部用低精度——你还需要把 FP32 数据转成 INT8 的前端，和把结果转回的后端。
+### 量化数学
 
-### 实测（$N = 10{,}485{,}760$，10M 元素，100 次平均）
+$$x_{\text{int8}} = \text{round}\left(\frac{x_{\text{fp32}}}{\Delta}\right), \quad \Delta = \frac{\max(|x|)}{127}$$
 
-| 操作 | Kernel 时间 | 有效带宽 | vs CPU |
-|:---|:---|:---|:---|
-| FP32 → FP16 | 0.02 ms | 2912 GB/s | 4433× |
-| FP16 → FP32 | 0.02 ms | 2923 GB/s | 2567× |
-| Quantize Per-Tensor | 0.02 ms | 2167 GB/s | 3581× |
-| Quantize Per-Channel | 0.03 ms | 1763 GB/s | 2986× |
-| Dequantize Per-Tensor | 0.02 ms | 2440 GB/s | 388× |
+$\Delta$ 是 Scale Factor。反量化 = $x_{\text{fp32}} \approx x_{\text{int8}} \times \Delta$。
 
-所有操作的有效带宽都远超 HBM 理论峰值 1008 GB/s——因为 40 MB 数据完全被 72 MB 的 L2 Cache 吃下了（L2 Cache 命中效应）。量化本身不是推理延迟的瓶颈。
+Per-Tensor 量化对整个张量用同一个 $\Delta$。Per-Channel 量化每个输出通道算自己的 $\Delta$——精度更好但 Kernel 更复杂。
 
-Per-Channel 比 Per-Tensor 稍慢（0.03ms vs 0.02ms），因为每个元素需要额外读一个 channel-specific 的 Scale 值。
+### dp4a：一条指令做 4 个 INT8 乘加
+
+`__dp4a(a, b, c)` 展开为：
+
+$$c' = c + a_0 \times b_0 + a_1 \times b_1 + a_2 \times b_2 + a_3 \times b_3$$
+
+4 个 INT8 元素打包成一个 32 位 `int`。每条 `dp4a` 完成 8 个整数运算（4 乘 + 4 加），INT32 累加避免溢出。
+
+```cpp
+// V1: Naive —— 标量 int8 乘加
+for (int k = 0; k < K; ++k)
+    sum += (int)A[row*K+k] * (int)B[k*N+col];
+
+// V2: dp4a —— 4 路打包
+int a4 = *reinterpret_cast<const int*>(&A[row*K + k]);
+int b4 = *reinterpret_cast<const int*>(&B[k*N + col]);
+sum = __dp4a(a4, b4, sum);
+
+// V3: Vectorized dp4a —— int4 向量化
+int4 a16 = *reinterpret_cast<const int4*>(&A[...]);
+int4 b16 = *reinterpret_cast<const int4*>(&B[...]);
+// 4 个 dp4a 展开
+sum = __dp4a(a16.x, b16.x, sum);
+sum = __dp4a(a16.y, b16.y, sum);
+sum = __dp4a(a16.z, b16.z, sum);
+sum = __dp4a(a16.w, b16.w, sum);
+```
+
+### 实测（1024 × 1024，10 次平均）
+
+| 版本 | Kernel (ms) | 加速比 | TOPS |
+|:---|:---:|:---:|:---:|
+| Naive INT8 | 0.407 | 1× | — |
+| dp4a | 0.276 | **1.48×** | — |
+| **Vectorized dp4a** | **0.190** | **2.14×** | **11.31** |
+
+```mermaid
+xychart-beta
+  title "INT8 GEMM 优化路径 (ms)"
+  x-axis ["Naive", "dp4a", "Vec dp4a"]
+  y-axis "Kernel 耗时 ms" 0 --> 0.45
+  bar [0.407, 0.276, 0.190]
+```
 
 ---
 
-## 从这些实验里能学到什么
+## 量化/反量化的带宽开销
 
-**量化的核心收益在带宽，不在计算。** 在 Memory Bound 的推理场景中，INT8 把权重体积压缩 4 倍——同等带宽下每秒能搬运 4 倍参数。dp4a 的计算效率提升是锦上添花，真正的杀手收益在搬运层面。
+量化本身也是 Kernel——在低精度 GEMM 之前要跑一遍 Quant，之后可能还要跑 Dequant。开销有多大？
 
-**dp4a 是标量 INT8 的天花板，但不是终点。** dp4a 复用 INT32 ALU 管线，吞吐受标量管线宽度限制。真正释放 INT8 算力要靠 Tensor Core——从 Turing 架构开始，一个时钟做 $16 \times 16$ 的 INT8 矩阵乘累加。这是 09_Tensor_Core 的内容。
+### 实测（$N = 10M$，40 MB，100 次平均）
 
-**Per-Channel 是工业级量化的最低门槛。** 从 SmoothQuant 到 AWQ，现代量化方案几乎都用 Per-Channel 甚至 Per-Group 粒度。Per-Tensor 在 LLM 的 Attention 层会遇到 Activation Outlier（某些通道激活值比别的大 100 倍），导致 INT8 精度崩塌。GPU 端多出来的只是每行一次 Reduce Max 的开销。
+| 操作 | Kernel (ms) | 有效带宽 |
+|:---|:---:|:---:|
+| FP32 → INT8 Per-Tensor | 0.02 | 2167 GB/s |
+| INT8 → FP32 Per-Tensor | 0.02 | 2440 GB/s |
+| FP32 → INT8 Per-Channel | 0.03 | 1763 GB/s |
+| FP32 → FP16 Cast | 0.02 | 2912 GB/s |
+| FP16 → FP32 Cast | 0.02 | 2923 GB/s |
 
-**L2 Cache 让小数据量的 benchmark 看起来特别快。** 2000+ GB/s 的"有效带宽"不代表 HBM 真有这么快。超过 1008 GB/s 的数字都是 L2 命中率高的效果。评估算子性能时，要用足够大的数据量（远超 L2 容量）才能测到真实的 HBM 带宽。
+带宽全部远超 DRAM 峰值（1008 GB/s）——因为 40 MB 数据完全命中 L2 Cache（72 MB）。说明量化/反量化对小张量几乎零开销。
+
+但**生产中量化开销不能忽略**。在 PyTorch 的 `torch.quantize_per_channel` 中，量化不只是除法取整——还要计算每通道的 min/max（一轮 Reduce）、计算 Scale 和 Zero Point、再做量化写入。对大张量这些加起来可以占推理延迟的 5-10%。
+
+---
+
+## 用好量化的前提
+
+$$\text{总加速} = \underbrace{\frac{BW_{\text{quant}}}{BW_{\text{fp32}}}}_{\text{访存收益}} \times \underbrace{\frac{OPS_{\text{quant}}}{OPS_{\text{fp32}}}}_{\text{计算收益}} - \underbrace{\text{Quant/Dequant 开销}}_{\text{额外成本}}$$
+
+对 Memory Bound 算子（Softmax、LN、逐元素操作），量化的收益主要来自访存。对 Compute Bound 算子（GEMM），收益主要来自计算密度（dp4a、Tensor Core）。
+
+量化收益最大的场景是推理端大模型 GEMM：权重量化为 INT8/INT4 后常驻显存，每次请求只需要量化激活值，权重反量化已经被融合进 GEMM Kernel。这就是 GPTQ、AWQ 等 Weight-Only 量化方案的工程逻辑。

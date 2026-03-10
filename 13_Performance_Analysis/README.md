@@ -130,11 +130,13 @@ __global__ void configurable_kernel(CPFloat input, PFloat output, CInt n) {
 | Kernel 配置维度 | 理论 Occupancy | Kernel 耗时 | 有效物理带宽分析 |
 |---------------|---------------|------------|----------------|
 | <256 线程, 1 数据> | 100.00% | 0.07 ms | 1230.12 GB/s |
-| **<64 线程, 16 数据>** | **100.00% (此项存疑，应为低 Occupancy 但高 ILP)** | **0.06 ms** | **1365.92 GB/s (最快!)** |
+| **<64 线程, 16 数据>** | **100.00%**\* | **0.06 ms** | **1365.92 GB/s (最快!)** |
 | 强制 32KB 共享内存限制 | **50.00%** | **0.08 ms** | 1020.48 GB/s |
 
+*\* `<64, 16>` 的理论 Occupancy 仍达 100%，是因为编译器对 `#pragma unroll` 展开后的寄存器分配做了良好优化，使每 Block 寄存器需求未超出 SM 上限。尽管每 Block 仅 64 线程，SM 可同时驻留足够多的 Block 以填满线程槽位。真正的性能优势来自 ILP——每线程 16 个独立访存操作掩盖了内存延迟。*
+
 ```mermaid
-xychart-beta
+xychart
   title "高 Occupancy vs 低 Occupancy-高 ILP 带宽表现 (GB/s，越高越好)"
   x-axis ["高 Occ/低 ILP (<256,1>)", "低 Occ/高 ILP (<64,16>)", "被共享内存挤占至 50% Occ"]
   y-axis "GB/s" 800 --> 1450

@@ -44,9 +44,9 @@ CuTe 将一切数据结构定义为 **Tensor = Engine + Layout**：
 
 ### CuTe Layout(Shape, Stride) 解析图
 
-假设存在一个 3×4 的矩阵，我们想要以**列主序（Col-Major）**的方式访问在内存中连续存储的扁平数据。
+假设存在一个 3×4 的矩阵，我们想要以**行主序（Row-Major）**的方式访问在内存中连续存储的扁平数据（与 C/C++ 数组的默认存储顺序一致）。
 
-代码表达：`Layout<Shape<_3, _4>, Stride<_1, _3>>`
+代码表达：`Layout<Shape<_3, _4>, Stride<_4, _1>>`
 
 ```mermaid
 graph TD
@@ -59,17 +59,17 @@ graph TD
         L8["(2,0)"]:::logic --- L9["(2,1)"]:::logic --- LA["(2,2)"]:::logic --- LB["(2,3)"]:::logic
     end
 
-    subgraph "物理内存偏移 (1D Stride<1, 3>)"
-        M0["[0]"]:::mem --- M3["[3]"]:::mem --- M6["[6]"]:::mem --- M9["[9]"]:::mem
-        M1["[1]"]:::mem --- M4["[4]"]:::mem --- M7["[7]"]:::mem --- MA["[10]"]:::mem
-        M2["[2]"]:::mem --- M5["[5]"]:::mem --- M8["[8]"]:::mem --- MB["[11]"]:::mem
+    subgraph "物理内存偏移 (1D Stride<4, 1>)"
+        M0["[0]"]:::mem --- M1["[1]"]:::mem --- M2["[2]"]:::mem --- M3["[3]"]:::mem
+        M4["[4]"]:::mem --- M5["[5]"]:::mem --- M6["[6]"]:::mem --- M7["[7]"]:::mem
+        M8["[8]"]:::mem --- M9["[9]"]:::mem --- MA["[10]"]:::mem --- MB["[11]"]:::mem
     end
     
-    L1 -.-> |"计算: 0*1 + 1*3 = 3"| M3
-    L8 -.-> |"计算: 2*1 + 0*3 = 2"| M2
+    L6 -.-> |"计算: 1*4 + 2*1 = 6"| M6
+    L8 -.-> |"计算: 2*4 + 0*1 = 8"| M8
 ```
 
-有了 CuTe，开发者只需 `tensor(2, 0)`，引擎自动映射到一维地址 `[2]`，再也不需要手工维护跨步乘法。
+有了 CuTe，开发者只需 `tensor(1, 2)`，引擎自动映射到一维地址 `[6]`，再也不需要手工维护跨步乘法。
 
 ---
 
@@ -127,23 +127,23 @@ cutlass::Status status = gemm_op(args);
 
 | 版本 | 探测状态 | 日志报告记录 |
 |------|---------|------------|
-| cuBLAS Tensro Core | 正常 | 0.11 ms (157.07 TFLOPS) |
+| cuBLAS Tensor Core | 正常 | 0.11 ms (157.07 TFLOPS) |
 | **CUTLASS Tensor Core** | **异常中断** | **内部 Error 返回** (日志误判吞吐天际) |
 
 **真机调优笔记**：日志中 `CUTLASS Error: Error Internal` 提示该模块下的 CUTLASS TensorOp 模板参数组合 (可能因 Layout 或者 Warp Shape 对齐问题) 在当前 `sm_89` 上未成功启动。cuBLAS Tensor Core 成功跑出了 **157.07 TFLOPS**（逼近硬件 FP16 TC 的理论无稀疏满配算力）。这也真实折射出 CUTLASS 虽好，但其极度复杂的模板约束在实际工业界中很容易引发断崖式崩溃。
 
 ### 3. CuTe 布局追踪验证 (`cute_basics`)
 
-工具成功复刻了我们在上述【架构篇】演示的 `Layout<Shape<_3, _4>, Stride<_1, _3>>`：
+工具成功复刻了我们在上述【架构篇】演示的 `Layout<Shape<_3, _4>, Stride<_4, _1>>`（行主序）：
 
 ```text
-Layout 2D Shape: (0, 0) # 静态化输出
-Index(1, 2) 的一维偏移量: 6   # <=> 1*1 + 2*3 = 7 (注：0索引基) 0*1 + 2*3 = 6 吻合逻辑
+Layout 2D Shape: (3, 4)
+Index(1, 2) 的一维偏移量: 6   # 1*4 + 2*1 = 6
 --- CuTe 循环打印 --- 
 layout(0)=0, layout(1)=4, layout(2)=8...
 ```
 
-CuTe 引擎通过编译期模板推演，在 GPU 核函数运行时**不存在任何乘法开销**，全化简为直接内存基址漂移。
+1D 索引遍历时，CuTe 按列优先（colex）展开逻辑坐标：`layout(0)` → 坐标 $(0,0)$ → $0 \times 4 + 0 \times 1 = 0$；`layout(1)` → $(1,0)$ → $1 \times 4 + 0 \times 1 = 4$；以此类推。CuTe 引擎通过编译期模板推演，在 GPU 核函数运行时**不存在任何乘法开销**，全化简为直接内存基址漂移。
 
 ---
 

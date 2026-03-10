@@ -1,174 +1,174 @@
 ---
-title: "08_Advanced：CUDA Graphs、Multi-Stream 和 PyTorch Extension——系统级优化三件套"
+title: "08_Advanced：Multi-Stream 隐藏延迟、CUDA Graphs 削减 Launch 开销和 PyTorch Extension 自定义算子"
 date: 2026-03-10 12:00:00
-tags: [CUDA, 高性能计算, Multi-Stream, CUDA Graphs, PyTorch Extension, 系统优化, Pinned Memory]
+tags: [CUDA, 高性能计算, Multi-Stream, CUDA Graphs, PyTorch Extension, Swish, 并发, Kernel Launch]
 categories: 深度学习系统架构
 ---
 
-> 📖 **推荐后续**：11_Inference_Optimization（Kernel Fusion 和 KV Cache）、13_Performance_Analysis（Nsight 性能分析）
+> 📖 **前置阅读**：01_Basics（Kernel 发射模型）、10_Memory_Optimization（合并访存和带宽上限）
+> 📖 **推荐后续**：11_Inference_Optimization（算子融合）、14_CUTLASS（流水线）
 
-## 这一章讲的不是 Kernel 内部
-
-前面几章都在 Kernel 里做文章——Tiling、Register Tiling、Warp Shuffle。这一章退后一步，看三个 Kernel 外部的系统级问题。
-
-GPU 系统内部有三台独立的硬件引擎：Compute Engine（SM 执行 Kernel）、Copy Engine 0（H2D DMA）、Copy Engine 1（D2H DMA）。默认的单 Stream 编程模型让这三台引擎排队串行——好比三车道高速公路只开了一条。
-
-| 系统瓶颈 | 浪费了什么 | 量级 | 对策 |
-|:---|:---|:---:|:---|
-| PCIe 传输期间 SM 空闲 | 计算资源 | 数十 ms | Multi-Stream |
-| 每个 Kernel 的 CPU-GPU 握手 | CPU 时间 | ~1-5 µs/Kernel | CUDA Graphs |
-| Python → PyTorch → CUDA 转换链 | 端到端延迟 | 数 ms | C++ Extension |
+写 Kernel 把单个算子优化到硬件极限之后，性能瓶颈会转移到三个计算逻辑之外的地方：PCIe 传输延迟、CPU 端 Kernel 发射开销、以及 Python 框架调用链。三个工具各解决一个问题。
 
 ---
 
-## Multi-Stream：让搬运和计算叠起来
+## Multi-Stream：把空闲的硬件单元用起来
 
-不同 Stream 之间没有顺序约束。把大块数据切成 $N$ 个 Chunk、分配到独立 Stream，硬件调度器就可以在三台引擎间交错调度——一批数据在计算时，下一批可以同时在搬运。
+GPU 有独立的 Copy Engine 和 Compute Engine。默认模式下它们排在同一个队列（default stream）里串行执行：H2D → Kernel → D2H → H2D → Kernel → D2H → ...
 
-理想情况下三个阶段（H2D、Compute、D2H）完全重叠，加速比趋近 3×。但实际受限于 PCIe 带宽的非对称性和 DMA 引擎数量，通常在 1.1-2.5× 之间。
+多流让不同 Segment 的传输和计算重叠——Segment 1 的 D2H 和 Segment 2 的 H2D 和 Segment 3 的 Compute 可以同时进行。
 
 ```mermaid
 gantt
     dateFormat s
-    title 单流串行 vs 4-Stream 并发
+    title 单流 vs 4 流执行时间线
 
-    section 单流串行
-    H2D全量 :a1, 0, 4s
-    Kernel全量 :a2, after a1, 4s
-    D2H全量 :a3, after a2, 4s
+    section Default Stream
+    H2D :a, 0, 3s
+    Compute :b, 3, 3s
+    D2H :c, 6, 3s
+
+    section Stream 0
+    H2D-0 :d, 0, 1s
+    Compute-0 :e, 1, 1s
 
     section Stream 1
-    H2D-1 :b1, 0, 1s
-    Kernel-1 :b2, after b1, 1s
-    D2H-1 :b3, after b2, 1s
+    H2D-1 :f, 1, 1s
+    Compute-1 :g, 2, 1s
+    D2H-0 :h, 2, 1s
 
     section Stream 2
-    H2D-2 :c1, 1, 1s
-    Kernel-2 :c2, after c1, 1s
-    D2H-2 :c3, after c2, 1s
+    H2D-2 :i, 2, 1s
+    D2H-1 :j, 3, 1s
 ```
 
-有一个隐蔽的前提：**Pinned Memory**。`cudaMemcpyAsync` 要求 Host 端用 `cudaHostAlloc` 分配锁页内存。普通 `malloc` 的内存可以被操作系统换页，DMA 控制器不敢直接碰——`cudaMemcpyAsync` 会悄无声息地退化为同步拷贝。不报错、不告警，就是默默变慢。这是最隐蔽的性能陷阱之一。
-
-### 核心代码模式
+关键限制：`cudaMemcpyAsync` 需要 Pinned Memory（`cudaMallocHost`），否则退化成同步拷贝。
 
 ```cpp
-cudaHostAlloc((void**)&h_A, bytes, cudaHostAllocDefault);
+cudaStream_t streams[NUM_STREAMS];
+for (int i = 0; i < NUM_STREAMS; ++i)
+    cudaStreamCreate(&streams[i]);
 
-for (int i = 0; i < NUM_STREAMS; ++i) {
-    int offset = i * streamSize;
-    cudaMemcpyAsync(&d_A[offset], &h_A[offset], streamBytes,
-                    cudaMemcpyHostToDevice, streams[i]);
-    compute_kernel<<<grid, block, 0, streams[i]>>>(
-                    &d_A[offset], &d_out[offset], streamSize);
-    cudaMemcpyAsync(&h_out[offset], &d_out[offset], streamBytes,
-                    cudaMemcpyDeviceToHost, streams[i]);
+for (int seg = 0; seg < NUM_SEGMENTS; ++seg) {
+    int s = seg % NUM_STREAMS;
+    int offset = seg * seg_size;
+    cudaMemcpyAsync(d_in + offset, h_in + offset,
+                    seg_bytes, cudaMemcpyHostToDevice, streams[s]);
+    kernel<<<grid, block, 0, streams[s]>>>(d_in + offset,
+                                            d_out + offset, seg_size);
+    cudaMemcpyAsync(h_out + offset, d_out + offset,
+                    seg_bytes, cudaMemcpyDeviceToHost, streams[s]);
 }
 ```
 
-同一 Stream 内部 H2D → Kernel → D2H 严格串行；但 Stream 0 的 Kernel 和 Stream 1 的 H2D 可以同时跑——因为它们用的是不同的硬件引擎。
+### 实测（$N = 16M$，192 MB，4 流，10 次平均）
+
+| 模式 | Pipeline 耗时 | 加速比 |
+|:---|:---:|:---:|
+| 单流串行 | 15.55 ms | 1× |
+| **4 流并发** | **13.73 ms** | **1.13×** |
+
+只有 13% 提升——因为 RTX 4090 的 Kernel 计算时间远小于传输时间。多流的效果与 **传输/计算耗时比** 正相关：如果 Kernel 和 H2D/D2H 时间接近，重叠收益最大。
 
 ---
 
-## CUDA Graphs：录制一次，回放无数次
+## CUDA Graphs：把 Launch 开销降到接近零
 
-每次 `kernel<<<grid, block>>>()` 都有 CPU 端开销——参数打包、Kernel 选择、PCIe 命令入队。大约 1-5 µs。当 Kernel 本身只跑 4 µs 时，Launch 开销就占了一半以上。
+每次 `kernel<<<>>>()` 调用，CPU 端需要和 Driver 通信、打包参数、入队——每次 ~5-10 µs。单个重量级 Kernel 这不是问题，但一条推理链可能有 100+ 个微小 Kernel（Bias、Activation、Residual...），Launch 开销加起来就占了毫秒级。
 
-CUDA Graphs 的方案：第一次执行时把操作序列录制成一张图（DAG），后续直接回放——绕过逐次的 API 调用开销。
+CUDA Graphs 把整条工作流录成一张 DAG，之后只需 `cudaGraphLaunch` 一次——100 个 Kernel 的 Launch 开销压缩到 1 次。
 
 ```mermaid
 graph LR
-    classDef capture fill:#4ecdc4,stroke:#333,color:#fff;
-    classDef replay fill:#ff6b6b,stroke:#333,color:#fff;
+    classDef capture fill:#fcf1c8,stroke:#333;
+    classDef replay fill:#2ecc71,stroke:#333,color:#fff;
 
-    subgraph "一次性录制"
-        BC[BeginCapture]:::capture --> K1["add_kernel"]:::capture
-        K1 --> K2["mul_kernel"]:::capture
-        K2 --> K3["add_kernel"]:::capture
-        K3 --> EC[EndCapture]:::capture
-        EC --> GI[GraphInstantiate]:::capture
+    subgraph "Step 1: Capture"
+        C1["Stream Capture"]:::capture
+        C1 --> K1["Add Kernel"]:::capture
+        C1 --> K2["Mul Kernel"]:::capture
+        K1 --> K3["Add Kernel"]:::capture
+        K2 --> K3
     end
 
-    subgraph "N 次回放"
-        GI --> GL1["GraphLaunch #1"]:::replay
-        GL1 --> GL2["GraphLaunch #2"]:::replay
-        GL2 --> GLN["GraphLaunch #N"]:::replay
+    subgraph "Step 2: Instantiate + Launch"
+        G["cudaGraphInstantiate"]:::replay --> L["cudaGraphLaunch\n一次发射全部 Kernel"]:::replay
     end
 ```
 
-`cudaStreamBeginCapture` 后提交的 Kernel 不会立即执行——它们被录制到一个 DAG 中。`cudaGraphInstantiate` 把 DAG 编译成 GPU 端的命令缓冲，后续 `cudaGraphLaunch` 直接提交预编译的缓冲。CPU 端跳过参数打包和驱动调度的全部流程——本质上是把"解释执行"变成了"编译执行"。
+### 实测（3 个链式 Kernel，数据 0.38 MB，1000 次平均）
 
-Graph 一旦实例化，拓扑和参数不可修改。适用于参数固定的重复性工作负载（GNN 固定拓扑推理、RNN step-by-step 执行），不适合 LLM 推理中 Batch Size 动态变化的场景。
+| 模式 | Kernel 耗时 | 加速比 |
+|:---|:---:|:---:|
+| 传统多次 Launch | 4.9 µs | 1× |
+| **CUDA Graph** | **4.2 µs** | **1.18×** |
+
+数据量很小（0.38 MB），Kernel 执行本身极短，Launch 开销占比才显著。数据量大时 Kernel 计算时间主导，Graph 的加速比会趋近 1×。
+
+Graph 的限制：图是静态的——shape 变了（如不同长度的序列）需要重新 Capture。TensorRT 的 Engine 底层就是 CUDA Graph。
 
 ---
 
-## PyTorch Extension：消灭中间张量
+## PyTorch Extension：把 CUDA Kernel 注入 Python
 
-Python 中写 `x * torch.sigmoid(x)`（Swish 激活），Eager Mode 会拆成两个 Kernel——sigmoid 和 mul，多一个中间张量的 HBM 往返。融合成单个 Kernel 后搬运量从 $5N \times 4B$ 降到 $2N \times 4B$。
+在 PyTorch 中实现自定义算子通常有两条路：`torch.autograd.Function` 用 Python 写，或者用 C++ Extension 直接调 CUDA Kernel。后者省去了 Python 解释器开销和 PyTorch 的 Dispatch 链路。
+
+### Swish 激活函数
+
+$$\text{Swish}(x) = x \cdot \sigma(x) = \frac{x}{1 + e^{-x}}$$
+
+Forward 和 Backward 各只需要一次逐元素遍历——典型的 Memory Bound 场景。
 
 ```cpp
-__global__ void swish_forward_kernel(const float* x, float* y, int n) {
+__global__ void swish_forward_kernel(const float* input,
+                                      float* output, int n) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid < n)
-        y[tid] = x[tid] / (1.0f + expf(-x[tid]));
+    if (tid < n) {
+        float x = input[tid];
+        float sigmoid = 1.0f / (1.0f + expf(-x));
+        output[tid] = x * sigmoid;
+    }
+}
+
+__global__ void swish_backward_kernel(const float* grad_out,
+        const float* input, float* grad_in, int n) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) {
+        float x = input[tid];
+        float sigmoid = 1.0f / (1.0f + expf(-x));
+        grad_in[tid] = grad_out[tid] * (sigmoid + x * sigmoid * (1 - sigmoid));
+    }
 }
 ```
 
-通过 pybind11，`x.data_ptr<float>()` 零拷贝获取张量的裸指针直接传给 CUDA Kernel。
+### 实测（$N = 10M$，40 MB，100 次平均）
 
----
+| 方向 | CPU | GPU Kernel | 加速比 | 有效带宽 |
+|:---|:---:|:---:|:---:|:---:|
+| Forward | 30.30 ms | **0.08 ms** | **369×** | **1022 GB/s** |
+| Backward | 46.01 ms | **0.13 ms** | **342×** | 936 GB/s |
 
-## 实测数据
+Forward 1022 GB/s 超过了 DRAM 理论峰值 1008 GB/s——受益于 L2 Cache（72 MB）对 40 MB 数据的高命中率。
 
-测试环境：2× RTX 4090 (sm_89)，nvcc -O3，C++17。
+在生产环境中将这类 Extension 注册到 PyTorch：
 
-### Multi-Stream（16.7M 元素，192 MB，4 流，10 次平均）
+```python
+from torch.utils.cpp_extension import load
+swish_cuda = load(name="swish_cuda", sources=["swish.cu"])
 
-| 版本 | Pipeline 周期 | vs 单流 |
-|:---|:---|:---|
-| 单流串行 | 15.55 ms | 1× |
-| 4-Stream 并发 | 13.73 ms | **1.13×** |
-
-只快了 13%——因为这个测试搬运量（192 MB）远大于计算量，搬运占总时间 80%+。即使计算被完全掩盖也就省那 20%。Multi-Stream 的价值在 Compute Bound 场景下更明显：搬运量小但计算量大的 Kernel 链条。
-
-### CUDA Graphs（100K 元素，$(A+B) \times D + F = G$，1000 次回放）
-
-| 版本 | 单圈耗时 | vs 传统发射 |
-|:---|:---|:---|
-| 传统多 Kernel 发射 | 0.0049 ms | 1× |
-| CUDA Graph 回放 | 0.0042 ms | **1.18×** |
-
-```mermaid
-xychart-beta
-  title "CUDA Graph vs 传统发射 (ms)"
-  x-axis ["传统发射", "Graph 回放"]
-  y-axis "ms" 0 --> 0.006
-  bar [0.0049, 0.0042]
+class SwishFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input):
+        ctx.save_for_backward(input)
+        return swish_cuda.forward(input)
 ```
 
-18% 的加速完全来自消除 CPU 端驱动开销。3 个 Kernel × ~1.5 µs/Launch ≈ 4.5 µs CPU 开销。Graph 把 3 次 launch 合并为 1 次，省掉 ~3 µs。在 Kernel 更密集的场景（100 个小 Kernel 的 GNN 推理循环），收益可达 2-5×。
-
-### PyTorch Extension Swish（10.4M 元素，40 MB，100 次平均）
-
-| 操作 | Kernel 时间 | 有效带宽 | 带宽利用率 |
-|:---|:---|:---|:---|
-| Forward | 0.08 ms | 1022 GB/s | ~100% |
-| Backward | 0.13 ms | 936 GB/s | 92.9% |
-
-Forward 的 1022 GB/s 超过了 HBM 理论峰值——40 MB 数据大部分命中 L2 Cache。Swish 的算术强度极低（每元素一次 sigmoid + 一次乘），纯 Memory Bound。
-
-这类简单逐元素算子写 Extension 的收益不大——PyTorch 内置的 `torch.nn.SiLU` 已经做了融合。Extension 的真正价值在实现 PyTorch 没有的复杂算子（FlashAttention、自定义量化层）。
-
 ---
 
-## 几个要点
+## 三个工具的适用判断
 
-| 技术 | 适用场景 | 收益来源 |
+| 瓶颈特征 | 诊断方法 | 对策 |
 |:---|:---|:---|
-| CUDA Graphs | 短 Kernel 链（<10 µs/kernel） | 消除 CPU Launch 开销 |
-| Multi-Stream | 搬运和计算量可比的流水线 | 重叠搬运与计算 |
-| PyTorch Extension | 自定义算子集成 | 消除中间张量 HBM 往返 |
-
-这三个技术的共同点：它们解决的不是 GPU 计算效率问题，而是 GPU 利用率问题。Kernel 里面优化得再好，如果 GPU 大部分时间在等 CPU 发指令或者等数据搬运，整体效率还是上不去。
-
-**Pinned Memory 的重要性值得再强调一次：** `cudaMemcpyAsync` 在非 Pinned Memory 上会静默退化为同步。系统级优化的第一步不是改 Kernel，是检查所有 Host 内存分配是否用了 `cudaHostAlloc`。
+| Nsight 显示大量 Copy-Compute 串行 | Timeline 里 Copy 和 Compute 不重叠 | **Multi-Stream** |
+| `nsys` 显示大量 CUDA API 调用 | Runtime 层占比 > 10% | **CUDA Graphs** |
+| PyTorch Profiler 显示 Python 开销 | `torch.autograd` 耗时 >> Kernel 耗时 | **C++ Extension** |

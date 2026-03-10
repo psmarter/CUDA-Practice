@@ -20,7 +20,7 @@
 
 cuBLAS 提供了传统 BLAS 级别（Level 1 向量、Level 2 矩阵-向量、Level 3 矩阵-矩阵）的完整实现。
 
-- **`cublasSgemm`**：标准的单精度矩阵乘法接口，需注意其默认采用 **列主序（Column-Major）**，在处理 C/C++ 的行主序矩阵时，需要利用转置法则 $C^T = B^T A^T$巧妙传参。
+- **`cublasSgemm`**：标准的单精度矩阵乘法接口，需注意其默认采用 **列主序（Column-Major）**，在处理 C/C++ 的行主序矩阵时，需要利用转置法则 $C^T = B^T A^T$ 巧妙传参。
 - **`cublasLtMatmul`**：cuBLAS 引入的底层轻量级（Lightweight）接口，允许用户显式配置算法启发式搜索（Heurisitics）、指定 Tensor Core 开启情况、支持 FP8/FP16 等混合精度拓展，并在内部融合了激活函数（Epilogue）。
 
 ### 2. cuFFT：频域转换引擎
@@ -138,7 +138,7 @@ thrust::transform(
 | `transform` (SAXPY) | 29.20 ms (for 循环) | 0.13 ms | **222×** | 849.73 GB/s |
 
 ```mermaid
-xychart-beta
+xychart
   title "千万规模操作 CPU (STL) vs GPU (Thrust) 耗时对比 (对数比例感知)"
   x-axis ["Sort (CPU)", "Sort (GPU)", "Reduce (CPU)", "Reduce (GPU)"]
   y-axis "耗时 (ms)" 0 --> 2200

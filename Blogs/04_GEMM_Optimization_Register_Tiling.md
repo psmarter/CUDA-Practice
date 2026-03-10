@@ -1,171 +1,117 @@
 ---
-title: "04_GEMM_Optimization：Register Tiling——把数据锁死在寄存器里"
-date: 2026-03-10 23:30:00
-tags: [CUDA, 高性能计算, GEMM, Register Tiling, Outer Product, Bank Conflict, cuBLAS]
+title: "04_GEMM_Optimization：从 SMEM Tiling 到 Register Tiling——每个线程算 64 个元素的外积结构"
+date: 2026-03-10 10:00:00
+tags: [CUDA, 高性能计算, GEMM, Register Tiling, Shared Memory, 外积, Thread Coarsening, cuBLAS]
 categories: 深度学习系统架构
 ---
 
-> 📖 **前置阅读**：01_Basics（Shared Memory Tiling 基础）  
-> 📖 **推荐后续**：09_Tensor_Core（硬件级矩阵指令）、14_CUTLASS（工业级模板 GEMM）、10_Memory_Optimization（Bank Conflict 详解）
+> 📖 **前置阅读**：01_Basics（Tiling 和算术强度）
+> 📖 **推荐后续**：09_Tensor_Core（WMMA 硬件加速）、14_CUTLASS（模板元编程 GEMM）
 
-## 01_Basics 的 Tiled GEMM 卡在哪了
+01_Basics 里 Naive GEMM 跑出 0.5 TFLOPS——82.6 TFLOPS 峰值的 0.6%。Tiling 到 SMEM 后大幅改善。但还有一个问题：每个线程只算 $C$ 的一个元素，每次从 SMEM 读两个 `float` 做一次 FMA——SMEM 的读带宽成了新瓶颈。
 
-上一章用 Shared Memory Tiling 把 GEMM 从 Naive 的 5225 GFLOPS 提到了 6893 GFLOPS。听着不错，但 RTX 4090 的 FP32 峰值是 82,600 GFLOPS——我们才用了 8.35%。差了一个数量级。
-
-瓶颈已经不在 Global Memory 了（Tiling 解决了那个问题）。瓶颈转移到了 Shared Memory 本身。
-
-算一笔账：Tiled GEMM 内层循环中，每轮从 SRAM 读 2 个 float（8 字节），做 1 次 FMA（2 FLOP）。算术强度 = 2/8 = 0.25 FLOP/Byte。而 SRAM 的带宽虽然比 HBM 快很多，但也不是无限的。要真正逼近计算峰值，需要把算术强度再提高——怎么提？把数据从 SRAM 进一步搬到寄存器里，在寄存器里反复复用。
-
-这就是 Register Tiling 的核心思路：每个线程不再只负责 C 的一个元素，而是负责一个 $TM \times TN$ 的小块——从 SRAM 取 $(TM + TN)$ 个数，在寄存器里做 $TM \times TN$ 次 FMA。
+Register Tiling 的思路：让每个线程算 $C$ 的 $T_M \times T_N$ 个元素（本项目用 $8 \times 8 = 64$），一行 A 和一列 B 在寄存器中被复用 8 次。SMEM 读取次数减少到 $1/T$ = 1/8。
 
 ---
 
-## Register Tiling 的数学
+## 外积结构
 
-### 三级 Tiling 层级
+传统的"内积"视角：$C_{ij} = \sum_k A_{ik} \cdot B_{kj}$——每个 $C$ 元素需要一轮独立的乘加。
 
-| 层级 | 负责范围 | 对应硬件 | Tile 尺寸 |
-|:---|:---|:---|:---|
-| Grid → Block | C 的一个大块 | Thread Block | $BM \times BN$ (128×128) |
-| Block → SRAM | K 维度切片 | Shared Memory | $BM \times BK + BK \times BN$ |
-| Thread → Register | C 的一个小块 | 寄存器堆 | $TM \times TN$ (8×8) |
+Register Tiling 换成"外积"视角：一个线程持有 A 的 $T_M = 8$ 个值和 B 的 $T_N = 8$ 个值（共 16 个寄存器），做一次外积就更新 $8 \times 8 = 64$ 个 $C$ 元素。
 
-每个 Block 有 256 个线程（$(BM/TM) \times (BN/TN) = 16 \times 16$），每个线程在寄存器里持有 64 个 `float regC[8][8]` 的累加器。
+$$\text{寄存器中：} \quad \vec{a} \cdot \vec{b}^T = \begin{pmatrix} a_0 b_0 & a_0 b_1 & \cdots & a_0 b_7 \\ a_1 b_0 & \cdots & & a_1 b_7 \\ \vdots & & & \vdots \\ a_7 b_0 & \cdots & & a_7 b_7 \end{pmatrix}$$
 
-### 关键的外积（Outer Product）结构
-
-内层循环的计算模式不是点积，是外积：
-
-```
-对于 K 维度的每一步 dotIdx:
-    取 regA[0..7] = sA 的一列 (TM 个)
-    取 regB[0..7] = sB 的一行 (TN 个)
-    regC[i][j] += regA[i] * regB[j]   // 8×8 = 64 次 FMA
-```
-
-从 SRAM 读了 $TM + TN = 16$ 个 float（64 字节），做了 $TM \times TN = 64$ 次 FMA（128 FLOP）。算术强度 = $128 / 64 = 2$ FLOP/Byte。比 01_Basics 的 0.25 FLOP/Byte 高了 **8 倍**。
-
-这 8 倍就是 Register Tiling 性能飞跃的数学来源。
-
-### 数据流
-
-```mermaid
-graph TD
-    classDef gm fill:#f9d0c4,stroke:#333;
-    classDef sm fill:#fcf1c8,stroke:#333;
-    classDef reg fill:#bbf,stroke:#333;
-
-    subgraph "Global Memory"
-        GA["A: BM×BK 子块"]:::gm
-        GB["B: BK×BN 子块"]:::gm
-    end
-
-    subgraph "Shared Memory (片上 SRAM)"
-        SA["sA: 128×8"]:::sm
-        SB["sB: 8×128"]:::sm
-    end
-
-    subgraph "寄存器 (每线程)"
-        RA["regA: float[8]"]:::reg
-        RB["regB: float[8]"]:::reg
-        RC["regC: float[8][8]"]:::reg
-    end
-
-    GA -- "256 线程协作搬运" --> SA
-    GB -- "256 线程协作搬运" --> SB
-    SA -- "每线程取 TM=8 个" --> RA
-    SB -- "每线程取 TN=8 个" --> RB
-    RA --> RC
-    RB --> RC
-```
-
----
-
-## 关键代码解析
-
-### 外积累加的核心
+每次 SMEM → 寄存器搬运 16 个 float，产出 64 次 FMA。算术强度 = $64 / 16 = 4$ FLOP/read——比内积的 $2/2 = 1$ 提高了 4 倍。
 
 ```cpp
-for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
-    // SRAM → 寄存器
-    for (int i = 0; i < TM; ++i)
-        regA[i] = sA[threadRow * TM + i][dotIdx];
-    for (int j = 0; j < TN; ++j)
-        regB[j] = sB[dotIdx][threadCol * TN + j];
+// 外积核心循环
+float a_reg[TM], b_reg[TN];
+float c_reg[TM][TN] = {0};
 
-    // 寄存器内外积: 64 次 FMA，零访存
-    for (int i = 0; i < TM; ++i)
+for (int bk = 0; bk < K; bk += BK) {
+    // 协作加载 A[BM×BK] 和 B[BK×BN] 到 SMEM
+    load_tile_to_smem(A, B, smem_a, smem_b, bk);
+    __syncthreads();
+    
+    for (int k = 0; k < BK; ++k) {
+        // 从 SMEM 加载到寄存器
+        for (int i = 0; i < TM; ++i)
+            a_reg[i] = smem_a[thread_row * TM + i][k];
         for (int j = 0; j < TN; ++j)
-            regC[i][j] = fmaf(regA[i], regB[j], regC[i][j]);
+            b_reg[j] = smem_b[k][thread_col * TN + j];
+        
+        // 8×8 外积
+        for (int i = 0; i < TM; ++i)
+            for (int j = 0; j < TN; ++j)
+                c_reg[i][j] += a_reg[i] * b_reg[j];
+    }
+    __syncthreads();
 }
 ```
 
-内层双重循环会被编译器完全展开（`#pragma unroll` 或者 nvcc 自动展开），生成 64 条 `FFMA` 指令。这些 FMA 之间没有数据依赖（每条都写不同的 `regC[i][j]`），GPU 的指令调度器可以背靠背发射——理想情况下每 cycle 发射一条。
+---
 
-### Bank Conflict 的隐患
+## 配置参数
 
-源码中有一段注释值得注意：
-
-> 同一个 Warp 内的 16 个线程同时读 `sB` 的同一行、不同列。由于 `TN=8`，相邻线程的访问间隔是 8 个 float = 32 字节，恰好隔了 8 个 Bank。这会产生 4-way Bank Conflict。
-
-标准修复方案是 `__shared__ float sB[BK][BN + 1]`，加一列 Padding 打散 Bank 对齐（具体原理在 10_Memory_Optimization 中展开）。这里为了代码可读性没有加 Padding，性能因此有一些损失。
+| 参数 | 值 | 含义 |
+|:---|:---:|:---|
+| $B_M, B_N$ | 128 | Block Tile 尺寸 |
+| $B_K$ | 8 | K 步长 |
+| $T_M, T_N$ | 8 | 每线程计算子块 |
+| 线程数/Block | $(128/8) \times (128/8) = 256$ | — |
+| 每线程 FMA/步 | $8 \times 8 = 64$ | — |
+| SMEM 占用 | $2 \times 128 \times 8 \times 4 = 8$ KB | — |
 
 ---
 
-## 实测数据
+## 优化阶梯
 
-测试环境：2× RTX 4090 (sm_89)，nvcc -O3，C++17。
+### 1024 × 1024（10 次平均）
 
-### 三版 GEMM 对比（$1024 \times 1024$，10 次平均）
-
-| 版本 | Kernel 时间 | 吞吐 (GFLOPS) | vs Tiled |
-|:---|:---|:---|:---|
-| Tiled GEMM | 0.33 ms | 6,544 | 1× |
-| Coarse 1D | 0.30 ms | 7,075 | 1.07× |
-| Register Tiled 2D | 0.15 ms | 14,055 | **2.14×** |
+| 版本 | Kernel (ms) | 加速比 | GFLOPS |
+|:---|:---:|:---:|:---:|
+| Tiled GEMM (32×32 Tile) | 0.327 | 1× | 6575 |
+| Coarse GEMM (1D, F=4) | 0.305 | 1.07× | 7050 |
+| **Register Tiled (2D, 8×8)** | **0.153** | **2.14×** | **14055** |
 
 ```mermaid
 xychart-beta
-  title "1024×1024 GEMM 各版本吞吐 (GFLOPS)"
-  x-axis ["Tiled", "Coarse 1D", "Reg Tiled 2D"]
-  y-axis "GFLOPS" 0 --> 16000
-  bar [6544, 7075, 14055]
+  title "1024×1024 GEMM 优化路径 (GFLOPS)"
+  x-axis ["Tiled", "Coarse 1D", "Register 2D"]
+  y-axis "GFLOPS" 0 --> 15000
+  bar [6575, 7050, 14055]
 ```
 
-Register Tiled 比朴素 Tiled 快了 2.14 倍。Coarse 1D（只在一个维度做粗化）的提升有限（1.07×），说明二维展开才能充分利用 Outer Product 的算术强度优势。
+### 进阶优化（1024 × 1024，10 次平均）
 
-### Vectorized 和 Double Buffer（$1024 \times 1024$，10 次平均）
+| 版本 | Kernel (ms) | 加速比 |
+|:---|:---:|:---:|
+| Vectorized (float4 加载) | 0.382 | 1× |
+| **Double Buffer** | **0.315** | **1.21×** |
 
-| 版本 | Kernel 时间 | 吞吐 (GFLOPS) | vs Tiled |
-|:---|:---|:---|:---|
-| Vectorized GEMM | 0.38 ms | 5,621 | 0.86× (慢了!) |
-| Double Buffer GEMM | 0.31 ms | 6,820 | 1.04× |
+Double Buffering 用两组 SMEM 交替——加载 $k+1$ 的 Tile 同时计算 $k$ 的 Tile——隐藏 SMEM 加载延迟。
 
-这两个"更高级"的版本反而没比 Tiled 快多少，Vectorized 甚至更慢了。这里有个容易忽略的原因：
+### 大规模（2048 × 2048，20 次平均）
 
-- **Vectorized** 用 `float4` 做读写，理论上减少了指令数。但如果 SRAM 布局不配合（地址没对齐到 16 字节），`float4` 的加载反而会拆成 4 次标量加载，白忙一场。
-- **Double Buffer** 用两组 SRAM 交替加载和计算，理论上实现流水线重叠。但在 $1024 \times 1024$ 这个规模下，计算时间本身就很短（~0.3ms），流水线的启动和排空开销占比不小，净收益有限。
+| 版本 | Kernel (ms) | 算力 (TFLOPS) | vs cuBLAS |
+|:---|:---:|:---:|:---:|
+| **Register Tiling** | **0.60** | **28.79** | 50.1% |
+| cuBLAS `cublasSgemm` | 0.30 | 57.49 | 100% |
 
-### Register Tiling vs cuBLAS（$2048 \times 2048$，20 次平均）
+28.79 TFLOPS = 理论峰值的 34.8%。cuBLAS 的 57.49 TFLOPS = 69.6%。差距 2 倍——来自 cuBLAS 的 PTX/SASS 级调优：
 
-| 版本 | Kernel 时间 | 吞吐 (TFLOPS) | vs 理论峰值 |
-|:---|:---|:---|:---|
-| Register Tiling | 0.60 ms | 28.79 | 34.9% |
-| cuBLAS | 0.30 ms | 57.49 | 69.6% |
-
-手写 Register Tiling 达到了 cuBLAS 的 50.1%。余下的差距来自哪里？
-
-1. **Bank Conflict**：没有做 Padding，sB 存在 4-way Bank Conflict
-2. **指令级优化**：cuBLAS 的核心 Kernel 是 SASS 汇编手写的，针对 RTX 4090 的指令调度器做了逐条指令调优
-3. **Warp 级 Tiling**：cuBLAS 在 Warp 内部还有一层 Tiling（类似 CUTLASS 的做法），进一步提高数据局部性
-4. **Auto-Tuning**：cuBLAS 会根据 $(M, N, K)$ 自动选择最优的 Kernel 变体
+| 差距来源 | 预估占比 |
+|:---|:---:|
+| SMEM 加载无 padding 导致 Bank Conflict | ~10% |
+| 无 Double Buffering（手写版在 advanced_gemm 里补了） | ~15% |
+| 指令调度非最优（寄存器 Bank Conflict、ILP 不足） | ~15% |
+| 无 Epilogue 融合（写回 C 的 Store 是纯串行） | ~10% |
 
 ---
 
-## 总结
+## Register Tiling 是 GEMM 优化的分水岭
 
-**Register Tiling 的本质是把算术强度从 SRAM 级别推到寄存器级别。** 同样是两次 SRAM 读，点积模式算 1 个 FMA，外积模式算 64 个 FMA。8 倍的算术强度差距直接映射为 2× 的实测性能提升。
+Register Tiling 之前的优化靠**减少 HBM 访问**（Tiling → SMEM）。Register Tiling 之后的优化靠**减少 SMEM 访问**（寄存器复用 + 外积结构）。更进一步的优化靠**减少寄存器到 Tensor Core 的距离**（WMMA → CUTLASS → SASS 汇编）。
 
-**"高级"不一定更快。** Vectorized 和 Double Buffer 在特定规模下可能反而变慢。优化手段必须匹配具体的瓶颈——如果当前瓶颈不在你要优化的环节，额外的复杂性只会增加开销。
-
-**手写 50% cuBLAS 是什么水平？** 了不起但还不够。剩下的 50% 需要 Bank Conflict 消除（+~10%）、SASS 级指令调度（+~15-20%）、Warp 级 Sub-Tiling（+~10%）、以及 Auto-Tuning（+~5%）。CUTLASS 作为开源框架覆盖了前三项——14_CUTLASS 会接着这个故事讲下去。
+每一级优化都在做同一件事：让数据尽可能**靠近 ALU**，被**尽可能多次复用**。

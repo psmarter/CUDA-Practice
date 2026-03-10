@@ -11,6 +11,7 @@ out/
 *.a
 *.so
 *.dll
+Reference/
 
 # IDE 文件
 .vs/

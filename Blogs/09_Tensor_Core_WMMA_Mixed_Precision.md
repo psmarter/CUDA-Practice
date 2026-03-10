@@ -1,59 +1,48 @@
 ---
-title: "09_Tensor_Core：WMMA 指令——从 CUDA Core 跳到硬件矩阵引擎"
+title: "09_Tensor_Core：从 CUDA Core 到 Tensor Core——WMMA 让 GEMM 快了 7 倍的硬件秘密"
 date: 2026-03-10 12:30:00
-tags: [CUDA, 高性能计算, Tensor Core, WMMA, 混合精度, FP16, mma_sync]
+tags: [CUDA, 高性能计算, Tensor Core, WMMA, 混合精度, FP16, GEMM, MMA]
 categories: 深度学习系统架构
 ---
 
-> 📖 **前置阅读**：04_GEMM_Optimization（Register Tiling）、07_Quantization（FP16 基础）  
-> 📖 **推荐后续**：14_CUTLASS（工业级 Tensor Core GEMM）
+> 📖 **前置阅读**：04_GEMM_Optimization（CUDA Core GEMM 优化天花板）、07_Quantization（FP16 数据格式）
+> 📖 **推荐后续**：14_CUTLASS（把 WMMA 包装为可组合的模板）
 
-## CUDA Core 的天花板
+04_GEMM_Optimization 用 CUDA Core 把 GEMM 推到 28.79 TFLOPS。这已经是标量 FMA 指令的极限了——每个 CUDA Core 每 cycle 一条 FMA，128 SM × 128 Core/SM × 2 FLOP/FMA × 2520 MHz = 82.6 TFLOPS（理论），实测 35% 利用率不算差。
 
-04_GEMM_Optimization 用 Register Tiling 达到了 28.79 TFLOPS（2048×2048），是 FP32 理论峰值 82.6 TFLOPS 的 34.9%。要逼近 100% 需要 SASS 级调优和 Bank Conflict 消除——复杂度极高，投入产出比很低。
-
-但 RTX 4090 有另一条路：Tensor Core。FP16 Tensor Core 的理论峰值是 165 TFLOPS（无稀疏），是 FP32 CUDA Core 的 2 倍。启用 2:4 结构化稀疏还能再翻倍到 330 TFLOPS。
-
-Tensor Core 不是"更快的浮点单元"——它是一个专门的矩阵乘法硬件单元。一条指令做一个 $16 \times 16 \times 16$ 的矩阵乘加，由一个 Warp 的 32 个线程协作完成。一条指令 = $16 \times 16 \times 16 \times 2 = 8192$ 次浮点运算。对比 CUDA Core 上 Register Tiling 的外积每次做 64 次 FMA——一条 Tensor Core 指令顶 128 条 FMA。
+Tensor Core 换了一种方式计算矩阵乘：不再一条条 FMA 地串行，而是**一个 Warp 整体执行一次 16×16×16 的矩阵乘加**。指令叫 `HMMA`（Half-precision Matrix Multiply-Accumulate），硬件在一条指令周期内完成 $16 \times 16 \times 16 \times 2 = 8192$ 次 FP16 乘加。
 
 ---
 
-## WMMA：Tensor Core 的软件接口
+## WMMA API
 
-NVIDIA 提供了两层 API 来操作 Tensor Core：
+WMMA（Warp Matrix Multiply-Accumulate）是 CUDA 提供的 C++ API，让开发者通过 `fragment` 类型直接操控 Tensor Core 寄存器。
 
-- **WMMA（Warp Matrix Multiply-Accumulate）**：C++ 级别的 fragment API，相对易用
-- **MMA PTX**：PTX 汇编级别，控制力更强，但使用门槛高
-
-本项目使用 WMMA。它的编程模型跟普通 CUDA Kernel 有个根本性区别：你不是"每个线程各算各的"，而是"一个 Warp 的 32 个线程合起来做一次矩阵乘"。这 32 个线程通过 `fragment` 数据结构协作，每个线程持有矩阵的一部分——但具体哪个线程持有哪些元素是硬件决定的、跨架构会变、程序员不应该关心。
-
-### 数据流
+核心流程：
 
 ```mermaid
-graph TD
-    classDef hbm fill:#f9d0c4,stroke:#333;
-    classDef reg fill:#bbf,stroke:#333;
+graph LR
+    classDef mem fill:#f9d0c4,stroke:#333;
+    classDef tc fill:#2ecc71,stroke:#333,color:#fff;
+    classDef out fill:#bbf,stroke:#333;
 
-    subgraph "Global / Shared Memory"
-        GM["A, B 矩阵 (FP16)"]:::hbm
-    end
+    LOAD_A["load_matrix_sync\n加载 A [16×16] FP16"]:::mem
+    LOAD_B["load_matrix_sync\n加载 B [16×16] FP16"]:::mem
+    MMA["mma_sync\nD = A × B + C"]:::tc
+    STORE["store_matrix_sync\n写回 D [16×16] FP32"]:::out
 
-    subgraph "Warp 寄存器堆 (32 线程协作)"
-        FA["fragment A: 16×16 half"]:::reg
-        FB["fragment B: 16×16 half"]:::reg
-        FC["fragment C: 16×16 float 累加器"]:::reg
-    end
-
-    TC(("mma_sync<br/>8192 FLOPs"))
-
-    GM --> |"load_matrix_sync<br/>32 线程协同读入"| FA
-    GM --> |"load_matrix_sync"| FB
-    FA & FB & FC --> TC
-    TC --> |"结果放回"| FC
-    FC --> |"store_matrix_sync"| OUT["输出 C (FP32)"]:::hbm
+    LOAD_A --> MMA
+    LOAD_B --> MMA
+    MMA --> STORE
 ```
 
-`load_matrix_sync` 和 `store_matrix_sync` 是黑盒——你给一个矩阵基地址和 leading dimension，它自动把数据分配到 32 个线程的寄存器里。不要试图探究单个线程持有什么值，因为这个映射跨 GPU 架构会变。
+### 混合精度的数学保证
+
+FP16 的有效精度只有 ~3.3 位十进制数（$\epsilon = 2^{-10}$）。两个 FP16 做乘法后结果直接加到 FP32 累加器上——**乘法损失精度，但不会在累加中雪崩**。
+
+$$D_{16 \times 16}^{\text{FP32}} = A_{16 \times 16}^{\text{FP16}} \times B_{16 \times 16}^{\text{FP16}} + C_{16 \times 16}^{\text{FP32}}$$
+
+这也是训练中 Loss Scaling 能工作的数学基础：激活值和梯度用 FP16 存储和传输（省带宽），乘加结果用 FP32 累加（保精度）。
 
 ### 核心代码
 
@@ -61,110 +50,85 @@ graph TD
 #include <mma.h>
 using namespace nvcuda;
 
-wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
-wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;
+const int WMMA_M = 16, WMMA_N = 16, WMMA_K = 16;
+
+wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half,
+               wmma::row_major> a_frag;
+wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half,
+               wmma::col_major> b_frag;
+wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
 
 wmma::fill_fragment(c_frag, 0.0f);
 
-for (int i = 0; i < K; i += 16) {
-    wmma::load_matrix_sync(a_frag, A + row * K + i, K);
-    wmma::load_matrix_sync(b_frag, B + i * N + col, N);
+for (int k = 0; k < K; k += WMMA_K) {
+    wmma::load_matrix_sync(a_frag, A + row * K + k, K);
+    wmma::load_matrix_sync(b_frag, B + k * N + col, N);
     wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
 }
-
-wmma::store_matrix_sync(C + row * N + col, c_frag, N,
+wmma::store_matrix_sync(D + row * N + col, c_frag, N,
                         wmma::mem_row_major);
 ```
 
-几个值得注意的点：
-
-- `matrix_a` 设为 `row_major`，`matrix_b` 设为 `col_major`——这是由矩阵乘的行列乘积结构决定的，A 按行读、B 按列读效率最高。
-- 累加器 `c_frag` 声明为 `float`（FP32），输入 fragment 是 `half`（FP16）。这就是混合精度——乘法在 FP16 域做，结果立即由 FP32 累加器接住。
-- `mma_sync` 没有显式的 `__syncthreads()`——这是 Warp 级操作，32 个线程天然同步。
+`fragment` 是编译器映射到 Tensor Core 寄存器的不透明容器——不能直接 index，不能 printf，只能通过 `load/store/mma_sync` 操作。32 个线程协作持有一个 16×16 的 fragment，每个线程分摊其中一部分元素。
 
 ---
 
-## 混合精度的意义
+## 为什么 Naive WMMA 只有 30T 而 cuBLAS 有 157T
 
-FP16 的动态范围很窄（最大值 ~65504）。如果累加器也用 FP16，在连续累加 K 维度时极容易溢出或大数吃小数。
+WMMA Kernel 的代码直接从 Global Memory load → mma → store，没有 Shared Memory Tiling、没有 Double Buffering、没有异步加载。每次 `load_matrix_sync` 都走 HBM，加载延迟完全暴露。
 
-混合精度的设计：
+cuBLAS 和 CUTLASS 的 Tensor Core Kernel 加了：
 
-$$D_{\text{FP32}} = A_{\text{FP16}} \times B_{\text{FP16}} + C_{\text{FP32}}$$
+- **Shared Memory Stage**：先批量搬到 SMEM，再从 SMEM 喂 Tensor Core
+- **Double Buffer**：加载 k+1 的数据同时计算 k 的 `mma_sync`
+- **异步拷贝**：`cp.async` 绕过寄存器直接搬入 SMEM
 
-输入用 FP16 省带宽（数据量减半），乘法结果立即进入 FP32 累加器。这不是简单的 cast——Tensor Core 硬件内部就是分成乘法器（FP16）和累加器（FP32）两个物理组件的。
-
-实际使用中精度损失很小。推理场景下大多可以忽略；训练场景需要配合 Loss Scaling（PyTorch 的 `torch.cuda.amp` 自动处理），防止小梯度在 FP16 下溢出。
+差距不在 Tensor Core 指令本身——`mma_sync` 的硬件吞吐已经很高。差距在 **数据喂入速度跟不上计算速度**。
 
 ---
 
 ## 实测数据
 
-测试环境：2× RTX 4090 (sm_89)，nvcc -O3，C++17。
+> **测试环境**：NVIDIA GeForce RTX 4090 × 2（sm_89），Linux，nvcc -O3
+> **理论峰值**：FP32 ~82.6 TFLOPS，FP16 TC ~165 TFLOPS（无稀疏）
 
-### WMMA GEMM（$2048 \times 2048$，100 次平均）
+### WMMA GEMM（2048 × 2048，100 次平均）
 
-| 版本 | Kernel 时间 | 吞吐 | vs 理论峰值 |
-|:---|:---|:---|:---|
-| Naive WMMA | 0.56 ms | **30.50 TFLOPS** | 18.5% (vs 165T FP16 TC) |
+| 版本 | Kernel | 算力 (TFLOPS) | vs FP32 理论 |
+|:---|:---:|:---:|:---:|
+| **Naive WMMA** | **0.56 ms** | **30.50** | 18.5% |
 
-30.5 TFLOPS 比 CUDA Core 的 Register Tiling（28.79 TFLOPS at FP32）只高了一点点。但注意前提：WMMA 版是 Naive 的——没有做任何 Tiling 优化，等价于 01_Basics 里那个 Naive GEMM 的 Tensor Core 版本。
+30.50 TFLOPS vs FP16 TC 峰值 165 TFLOPS = 18.5%。vs cuBLAS TC 的 157 TFLOPS（14_CUTLASS 实测）= 19.4%。差距 5 倍多——全部来自访存优化缺失。
 
-Naive CUDA Core GEMM 在 01_Basics 里只有 5225 GFLOPS。同样是 Naive 实现，Tensor Core 比 CUDA Core 快了 5.8 倍。这说明 Tensor Core 的指令效率优势是碾压级的——即使不做任何软件优化。
+### 混合精度对比（1024 × 1024，100 次平均）
 
-### 混合精度 vs FP32 CUDA Core（$1024 \times 1024$，100 次平均）
-
-| 版本 | Kernel 时间 | 吞吐 | vs FP32 |
-|:---|:---|:---|:---|
-| FP32 CUDA Core (Naive) | 0.39 ms | 5.45 TFLOPS | 1× |
-| WMMA 混合精度 | 0.05 ms | **39.36 TFLOPS** | **7.21×** |
+| 版本 | Kernel | 算力 | 加速比 |
+|:---|:---:|:---:|:---:|
+| FP32 CUDA Core | 0.394 ms | 5.45 TFLOPS | 1× |
+| **FP16 WMMA** | **0.055 ms** | **39.36 TFLOPS** | **7.21×** |
 
 ```mermaid
 xychart-beta
-  title "1024×1024 GEMM 吞吐对比 (TFLOPS)"
-  x-axis ["FP32 CUDA Core", "WMMA FP16→FP32"]
-  y-axis "TFLOPS" 0 --> 50
+  title "1024×1024 GEMM: CUDA Core vs Tensor Core (TFLOPS)"
+  x-axis ["FP32 CUDA Core", "FP16 WMMA"]
+  y-axis "TFLOPS" 0 --> 45
   bar [5.45, 39.36]
 ```
 
-7.21 倍的提速。这个比值超过了 FP16 vs FP32 的理论吞吐比（2×），原因在于 Tensor Core 的指令效率。一个 Warp 做 8192 FLOP 只需一条指令，CUDA Core 需要 128 条 FMA 指令排队通过调度器。指令发射速率本身就是瓶颈——Tensor Core 把这个瓶颈消灭了。
+7.21× 的加速由两部分贡献：
 
-### 为什么离理论峰值还远
+$$\underbrace{2\times}_{\text{FP16 带宽翻倍}} \times \underbrace{\sim 3.6\times}_{\text{TC 硬件加速}} = 7.2\times$$
 
-39.36 TFLOPS vs 165 TFLOPS 理论峰值 = 23.9%。差距来自四个地方：
+### 跨章性能全景
 
-1. **没有 Tiling**：每个 Warp 独立从 Global Memory 加载 fragment，大量冗余读取——跟 01_Basics 的 Naive GEMM 一个毛病
-2. **没用 Shared Memory**：工业级实现先把数据搬到 SRAM，再从 SRAM 加载到 fragment。这里直接从 HBM 读，带宽墙严重
-3. **没有 Double Buffer**：计算和加载没有重叠
-4. **Block 配置未调优**：这里用 256 线程（32×8），CUTLASS 的最优配置通常更大
+| 项目 | 类型 | 算力 |
+|:---|:---|:---:|
+| 01_Basics Naive GEMM | FP32, 无 Tiling | 0.50 TFLOPS |
+| 04_GEMM Register Tiling | FP32, 寄存器 Tiling | 28.79 TFLOPS |
+| 09_WMMA Naive | FP16, Tensor Core | 30.50 TFLOPS |
+| 09_WMMA Mixed Precision | FP16→FP32, Tensor Core | 39.36 TFLOPS |
+| 12_cuBLAS SGEMM | FP32, 库调用 | 49.91 TFLOPS |
+| 14_CUTLASS SIMT | FP32, 模板 | 55.35 TFLOPS |
+| 14_cuBLAS Tensor Core | FP16→FP32, 库调用 | **157.07 TFLOPS** |
 
-CUTLASS 解决了上述所有问题——14_CUTLASS 会展示它如何用模板元编程把 Tensor Core GEMM 推到理论峰值的 96%。
-
----
-
-## 和之前各章的 GEMM 数据放一起看
-
-| 章节 | 版本 | 规模 | 吞吐 |
-|:---|:---|:---|:---|
-| 01_Basics | Naive FP32 | 1024² | 5.2 TFLOPS |
-| 01_Basics | Tiled FP32 | 1024² | 6.9 TFLOPS |
-| 04_GEMM | Register Tiled FP32 | 1024² | 14.1 TFLOPS |
-| 04_GEMM | Register Tiled FP32 | 2048² | 28.8 TFLOPS |
-| **09_TC** | **Naive WMMA FP16** | **2048²** | **30.5 TFLOPS** |
-| **09_TC** | **WMMA Mixed** | **1024²** | **39.4 TFLOPS** |
-| (cuBLAS) | cublasSgemm FP32 | 2048² | 57.5 TFLOPS |
-
-Naive WMMA 在不做任何优化的情况下就超过了精心调优的 FP32 Register Tiling。这就是从"软件优化"到"硬件换代"的跨越。
-
-但 cuBLAS 的 57.5 TFLOPS（FP32 CUDA Core）仍然远高于 Naive WMMA 的 30.5 TFLOPS——因为 cuBLAS 做了我们没做的所有优化。给 WMMA 也加上这些优化（CUTLASS），FP16 Tensor Core 可以突破 100+ TFLOPS。14_CUTLASS 会接着讲这个故事。
-
----
-
-## 小结
-
-**Tensor Core 是 GEMM 性能的分水岭。** CUDA Core 的 FP32 GEMM 精心优化后也只能达到 ~35% 峰值利用率，而 Tensor Core 的 Naive 版就达到了类似水平。优化后可以逼近 70-80%。
-
-**混合精度不是精度妥协，是硬件设计的本意。** FP16 输入 + FP32 累加是 Tensor Core 的原生模式。乘法器和累加器在硬件上就是两个不同精度的组件。
-
-**Naive WMMA 的 30.5 TFLOPS 只是起点。** 就像 01_Basics 的 Naive GEMM 到 04_GEMM_Optimization 的 Register Tiling，Tensor Core 也有自己的优化阶梯。CUTLASS 就站在这个阶梯的终点。
+Naive WMMA（30.5T）和 Register Tiling FP32（28.8T）几乎持平——不加访存优化，Tensor Core 的硬件优势被内存瓶颈完全抵消。这也是为什么 CUTLASS 和 FlashAttention 的多级流水线设计是不可省略的工程复杂度。

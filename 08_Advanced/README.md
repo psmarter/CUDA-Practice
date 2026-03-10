@@ -20,7 +20,7 @@
 
 默认情况下，单流（Stream 0）内的命令是严格串行执行的。H2D（显存复制）、Kernel Compute 和 D2H 依次排队，导致 PCIe 总线与 GPU 计算单元在多数时间处于闲置状态。
 
-多流技术将大块数据均分为 $N$ 份，每份分配给独立的异步流。利用现代 GPU 独立的 Copy Engin e和 Kernel Engine，实现 **Compute** 与 **Transfer** 相互掩盖：
+多流技术将大块数据均分为 $N$ 份，每份分配给独立的异步流。利用现代 GPU 独立的 Copy Engine 和 Kernel Engine，实现 **Compute** 与 **Transfer** 相互掩盖：
 
 $$T_{\text{async}} \approx \text{MemCopy}_{H2D\_segment} + \max(T_{H2D\_segment}, T_{compute}, T_{D2H\_segment}) \times N + \text{MemCopy}_{D2H\_segment}$$
 
@@ -38,9 +38,10 @@ $$T_{\text{async}} \approx \text{MemCopy}_{H2D\_segment} + \max(T_{H2D\_segment}
 
 ```mermaid
 gantt
-    dateFormat  s
+    dateFormat X
+    axisFormat %S s
+    tickInterval 1second
     title 单流串行 vs 4-Stream 并发时序对比
-    axisFormat %S
     
     section 单流 (串行)
     H2D (Chunk 1-4)     :a1, 0, 4s
@@ -68,7 +69,7 @@ gantt
     D2H (Chunk 4)       :e3, after e2, 1s
 ```
 
-*说明：蓝色段为 PCIe 传输，黄色段为计算。多流使得 GPU 和 PCIe 控制器在极高密度的重叠区满载。*
+*说明：单流串行下 H2D、Kernel、D2H 依次排队，总耗时为三段之和。多流并发时，不同 Stream 的传输与计算在时间上交叠，GPU 和 PCIe 控制器在极高密度的重叠区满载运行。*
 
 ### PyTorch C++ Extension 编译与调用链
 
