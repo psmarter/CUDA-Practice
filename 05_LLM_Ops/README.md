@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**实际应用算子（L3）**阶段，系统覆盖大语言模型（LLM）推理和训练中的所有高频核心算子。这些算子在工业级 LLM 服务（如 vLLM、TensorRT-LLM）中占据计算时间的绝大多数比例。
+本子项目属于 CUDA-Practice 学习体系的 **实际应用算子（L3）** 阶段，系统覆盖大语言模型（LLM）推理和训练中的所有高频核心算子。这些算子在工业级 LLM 服务（如 vLLM、TensorRT-LLM）中占据计算时间的绝大多数比例。
 
 | 文件 | Kernel 列表 | 应用场景 |
 |------|------------|---------|
@@ -32,7 +32,7 @@ LayerNorm 对 Hidden Dimension 进行归一化：
 
 $$y_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} \cdot \gamma_i + \beta_i, \quad \mu = \frac{1}{H}\sum_{i=0}^{H-1} x_i, \quad \sigma^2 = \frac{1}{H}\sum_{i=0}^{H-1}(x_i - \mu)^2$$
 
-**Welford 在线算法**通过以下递推在单次遍历中同时计算均值和方差（消除第二次 DRAM 遍历）：
+**Welford 在线算法** 通过以下递推在单次遍历中同时计算均值和方差（消除第二次 DRAM 遍历）：
 
 $$\delta = x_t - \mu_{t-1}, \quad \mu_t = \mu_{t-1} + \frac{\delta}{t}, \quad M_t = M_{t-1} + \delta \cdot (x_t - \mu_t)$$
 

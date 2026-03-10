@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**性能深度优化（L2-L3）**阶段。通用矩阵乘法（GEMM）是深度学习中最核心的算子，也是 GPU 优化技术的典型靶场。从 Shared Memory Tiling 到 Register Tiling，每一层优化都针对特定的硬件瓶颈。
+本子项目属于 CUDA-Practice 学习体系的 **性能深度优化（L2-L3）** 阶段。通用矩阵乘法（GEMM）是深度学习中最核心的算子，也是 GPU 优化技术的典型靶场。从 Shared Memory Tiling 到 Register Tiling，每一层优化都针对特定的硬件瓶颈。
 
 三个源文件构成完整的优化演进链：
 

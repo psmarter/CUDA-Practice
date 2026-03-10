@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**工程架构优化与诊断（L3-L4）**阶段。在优化 CUDA 算子时，仅凭直觉和 `std::chrono` 计时是远远不够的。必须建立量化的性能物理边界（Roofline Model），理解硬件掩盖延迟的机制（Occupancy），并熟练使用 NVIDIA 官方的微架构探针（Nsight Compute / Nsight Systems）。
+本子项目属于 CUDA-Practice 学习体系的 **工程架构优化与诊断（L3-L4）** 阶段。在优化 CUDA 算子时，仅凭直觉和 `std::chrono` 计时是远远不够的。必须建立量化的性能物理边界（Roofline Model），理解硬件掩盖延迟的机制（Occupancy），并熟练使用 NVIDIA 官方的微架构探针（Nsight Compute / Nsight Systems）。
 
 本模块提供了三套性能诊断的底层分析视角：
 
@@ -18,10 +18,12 @@
 
 ### 1. Roofline Model（屋顶模型）
 
-定义**算术强度（Arithmetic Intensity, $I$）**为算法执行的浮点运算次数（FLOPs）与交换的内存字节数（Bytes）之比：
+定义 **算术强度（Arithmetic Intensity, $I$）** 为算法执行的浮点运算次数（FLOPs）与交换的内存字节数（Bytes）之比：
+
 $$I = \frac{\text{FLOPs}}{\text{Bytes}} \quad (\text{FLOPS/Byte})$$
 
 假设 GPU 的理论峰值算力为 $P_{\text{peak}}$（FLOPS），理论峰值带宽为 $B_{\text{peak}}$（GB/s），则实际可达到的最大性能 $P$ 受双重制约：
+
 $$P = \min(P_{\text{peak}}, I \times B_{\text{peak}})$$
 
 **机器拐点（Ridge Point）**：$I_{\text{ridge}} = \frac{P_{\text{peak}}}{B_{\text{peak}}}$
@@ -65,7 +67,7 @@ graph TD
 
 1. **`sm__throughput.avg`**：算子计算吞吐通常极低（如 < 10%）。
 2. **`dram__throughput.avg`**：显存带宽吞吐也不高，这是为什么？
-3. **`l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld`**（每个全局内存加载请求命中的 L1 sector 扇区数）：该指标暴涨至 **32**（完美合并访存应为近乎 1）。这**直接指明了** 32 线程读了 32 个分散地址，浪费了 96% 的事务载量。
+3. **`l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld`**（每个全局内存加载请求命中的 L1 sector 扇区数）：该指标暴涨至 **32**（完美合并访存应为近乎 1）。这 **直接指明了** 32 线程读了 32 个分散地址，浪费了 96% 的事务载量。
 
 ---
 
