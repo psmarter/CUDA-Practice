@@ -78,27 +78,27 @@ graph TD
 ### Thrust 优雅并行化（来自 `thrust_algorithms.cu`）
 
 ```cuda
-// 1. 定义仿函数 Functor (必须带 __device__ 标识才能在 GPU 执行)
+// 1. 定义仿函数 Functor (标识 __host__ __device__ 使其在 CPU/GPU 双端可用)
 struct saxpy_functor {
     const float a;
     saxpy_functor(float _a) : a(_a) {}
-    
-    // x和y同时传入
-    __device__ float operator()(const float& x, const float& y) const {
+    __host__ __device__
+    float operator()(const float& x, const float& y) const {
         return a * x + y;
     }
 };
 
 // 2. 内存分配与隐式 H2D 拷贝
-thrust::device_vector<float> d_X = h_X; // 重载了 =, 内部自动调用 cudaMemcpy
-thrust::device_vector<float> d_Y = h_Y;
+thrust::device_vector<float> d_x = h_x; // 重载了 =, 内部自动调用 cudaMemcpy
+thrust::device_vector<float> d_y = h_y;
+thrust::device_vector<float> d_out(d_x.size()); // 独立输出缓冲区
 
 // 3. 一行代码实现融合算术启动 (内部自动选择最佳 Block/Grid 配置)
 thrust::transform(
-    d_X.begin(), d_X.end(),   // 输入 1 的范围
-    d_Y.begin(),              // 输入 2 的起始点
-    d_Y.begin(),              // 输出的起始点
-    saxpy_functor(2.0f)       // 传入仿函数实例
+    d_x.begin(), d_x.end(),   // 输入 1 的范围
+    d_y.begin(),              // 输入 2 的起始点
+    d_out.begin(),            // 输出的起始点（独立缓冲区，不覆盖 d_y）
+    saxpy_functor(a)          // 传入仿函数实例
 );
 ```
 

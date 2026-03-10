@@ -8,8 +8,8 @@
 
 | 文件 | Kernel 列表 | 核心技术 | 测试规模 |
 |------|------------|----------|---------|
-| `01_wmma_gemm/wmma_gemm.cu` | `wmma_gemm` | `<mma.h>` 命名空间、Fragment 存取 | 2048×2048×2048 |
-| `02_mixed_precision/mixed_precision.cu` | `wmma_mixed_precision_gemm`<br>`naive_fp32_gemm` | FP16 输入 + FP32 累加防溢出 | 1024×1024×1024 |
+| `01_wmma_gemm/wmma_gemm.cu` | `wmma_gemm_naive` | `<mma.h>` 命名空间、Fragment 存取 | 2048×2048×2048 |
+| `02_mixed_precision/mixed_precision.cu` | `wmma_mixed_gemm_kernel`<br>`gemm_fp32_kernel` | FP16 输入 + FP32 累加防溢出 | 1024×1024×1024 |
 
 ---
 
@@ -78,7 +78,7 @@ graph TD
 ```cpp
 // 声明 16x16x16 的寄存器碎片，指明数据类型和主序(Row/Col Major)
 wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
-wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
+wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
 
 // 累加器声明为 float (FP32)，防溢出
 wmma::fragment<wmma::accumulator, 16, 16, 16, float> c_frag;

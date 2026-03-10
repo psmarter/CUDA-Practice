@@ -80,30 +80,29 @@ graph TD
 ```cpp
 #include <cutlass/gemm/device/gemm.h>
 
-// 1. 定义极其复杂的 Tiling 策略作为模版参数
-using GemmType = cutlass::gemm::device::Gemm<
-    float,                          // ElementA 类型
-    cutlass::layout::ColumnMajor,   // LayoutA 行列主序
-    float,                          // ElementB 类型
-    cutlass::layout::ColumnMajor,   // LayoutB 行列主序
-    float,                          // ElementOutput 类型
-    cutlass::layout::RowMajor,      // LayoutC 行列主序
-    float,                          // ElementAccumulator (内部累加)
-    cutlass::arch::OpClassSimt,     // 算术类：SIMT(CUDA Core) 或 TensorOp
-    cutlass::arch::Sm89,            // 目标架构 (RTX 4090)
-    cutlass::gemm::GemmShape<128, 128, 8>,  // Threadblock 级别的分块 (M,N,K)
-    cutlass::gemm::GemmShape<32, 64, 8>,    // Warp 级别的分块
-    cutlass::gemm::GemmShape<1, 1, 1>,      // Instruction/Thread 级别分块
-    cutlass::epilogue::thread::LinearCombination<float, 1, float, float> // 终曲: alpha*AB + beta*C
+// 1. 定义 CUTLASS GEMM 类型——RowMajor 布局，float 精度，SIMT 算术类
+using Gemm = cutlass::gemm::device::Gemm<
+    float,                               // ElementA
+    cutlass::layout::RowMajor,           // LayoutA（行主序，与 C/C++ 数组一致）
+    float,                               // ElementB
+    cutlass::layout::RowMajor,           // LayoutB
+    float,                               // ElementC
+    cutlass::layout::RowMajor,           // LayoutC
+    float,                               // ElementAccumulator (内部累加)
+    cutlass::arch::OpClassSimt,          // 算术类：SIMT(CUDA Core)
+    cutlass::arch::Sm80                  // 目标架构 (Ampere 及以上)
 >;
 
 // 2. 准备初始化参数包
-GemmType::Arguments args({M, N, K}, 
-                         {A, lda}, {B, ldb}, {C, ldc}, {D, ldd}, 
-                         {alpha, beta});
+typename Gemm::Arguments args(
+    {M, N, K},                   // 问题规模
+    {d_A, K}, {d_B, N},          // A(M×K) 和 B(K×N) 的指针与 leading dimension
+    {d_C, N}, {d_C, N},          // C/D 的指针与 leading dimension
+    {alpha, beta}                // 缩放系数 alpha*AB + beta*C
+);
 
 // 3. 构建并执行 (CUTLASS 会自动展开宏大复杂的底层代码)
-GemmType gemm_op;
+Gemm gemm_op;
 cutlass::Status status = gemm_op(args);
 ```
 

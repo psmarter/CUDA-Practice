@@ -1,386 +1,161 @@
 ---
-title: "[CUDA 架构与算法实战] 05_LLM_Ops：从访存墙到算力墙——FlashAttention 递推引擎、Online Softmax 与归一化算子的硬件级全解剖"
-date: 2026-03-10 10:30:00
-tags: [CUDA, 高性能计算, LLM, FlashAttention, Softmax, LayerNorm, RMSNorm, RoPE, Memory Bound, Warp Shuffle]
+title: "05_LLM_Ops：Softmax、LayerNorm、RoPE 和 FlashAttention——LLM 推理的五个核心算子"
+date: 2026-03-11 00:00:00
+tags: [CUDA, 高性能计算, LLM, Softmax, LayerNorm, RMSNorm, RoPE, FlashAttention, Welford, Online Softmax]
 categories: 深度学习系统架构
 ---
 
-## 楔子：LLM 推理栈中隐藏的五座大山
+> 📖 **前置阅读**：01_Basics（Tiling）、02_Reduction（Warp Reduce）  
+> 📖 **推荐后续**：06_Warp_Primitives（Warp Shuffle 细节）、11_Inference_Optimization（Fusion 和 KV Cache）
 
-打开任何一个主流 LLM（LLaMA-3、GPT-4、Qwen）的推理 Profiler 报告，你会发现一个令人沮丧的事实：**真正执行"智能推理"的矩阵乘法（GEMM）只占总延迟的一部分，而另一大块时间被几个看似简单的"辅助算子"吞噬了**——Softmax、LayerNorm、RMSNorm、RoPE、Attention。
+## 五个算子，一个共同瓶颈
 
-这些算子的共同特征是什么？**它们不是计算密集型（Compute Bound），而是带宽密集型（Memory Bound）**。以 Softmax 为例，每个输出元素仅需 1 次 `exp` + 1 次除法，算术强度（Arithmetic Intensity）极低：
+LLM 的 Transformer 层里有一堆算子，但绝大多数都是 Memory Bound 的——Softmax、LayerNorm、RMSNorm、RoPE，它们的算术强度都不到 1 FLOP/Byte。真正 Compute Bound 的只有矩阵乘法（GEMM），而 GEMM 通常交给 cuBLAS。
 
-$$\text{AI}_{\text{Softmax}} = \frac{2N \text{ FLOPs}}{2N \times 4 \text{ Bytes}} = 0.25 \text{ FLOPs/Byte}$$
+所以优化这些非 GEMM 算子的核心策略就一条：**少搬数据**。具体手段有三种——减少 HBM 遍历次数（Online Softmax 把 3 遍变成 1 遍）、消除中间张量（Kernel Fusion）、以及在片上完成所有工作（FlashAttention）。
 
-对比 RTX 4090 的 Roofline 拐点（~82 FLOPs/Byte），Softmax 的算术强度低了两个数量级。这意味着**无论你拥有多少 CUDA Core，性能上限完全由 HBM 带宽（~1008 GB/s）决定**。
-
-更致命的是 Attention 机制：标准实现需要将 $N \times N$ 的中间矩阵（$N$ = 序列长度）在 HBM 上来回搬运。当 $N = 4096$ 时，仅这一个中间矩阵就占 64 MB——一个 Token 的注意力计算就要读写上百兆数据。
-
-本文将深入剖析 LLM 推理栈中的五大核心算子，揭示它们如何从朴素实现一步步进化到逼近硬件理论带宽极限的高效 Kernel，以及 FlashAttention 如何用数学递推彻底消灭 $O(N^2)$ 的中间存储。
-
-```mermaid
-graph LR
-    classDef attn fill:#ff6b6b,stroke:#333,color:#fff;
-    classDef norm fill:#4ecdc4,stroke:#333,color:#fff;
-    classDef pos fill:#45b7d1,stroke:#333,color:#fff;
-    
-    Input["输入 Token<br/>Embedding"] --> RoPE["🔄 RoPE<br/>旋转位置编码"]:::pos
-    RoPE --> QKV["Q, K, V 投影<br/>(GEMM)"]
-    QKV --> FA["⚡ FlashAttention<br/>含 Online Softmax"]:::attn
-    FA --> Add1["残差连接"]
-    Add1 --> LN["📐 LayerNorm<br/>/ RMSNorm"]:::norm
-    LN --> FFN["前馈网络<br/>(GEMM)"]
-    FFN --> Add2["残差连接"] --> Output["输出"]
-```
-
-> **本文覆盖全部五大算子**：FlashAttention 和 Softmax 作为核心主角深度剖析，LayerNorm/RMSNorm/RoPE 作为配角完整覆盖。
+这一章覆盖五个算子，每个都有各自的优化故事。按照实际 LLM 推理的调用顺序来讲。
 
 ---
 
-## 第一性原理与数学重构
+## Softmax：从三遍变一遍
 
-### 一、Softmax：三遍扫描到单遍递推的数学革命
+### 朴素版需要遍历三次
 
-标准的数值稳定 Softmax 需要**三次**全局遍历：
+$$\text{Softmax}(x_i) = \frac{e^{x_i - \max(x)}}{\sum_j e^{x_j - \max(x)}}$$
 
-$$y_i = \frac{e^{x_i - m}}{\sum_{j} e^{x_j - m}}, \quad m = \max_j(x_j)$$
+直接实现需要三遍：(1) 求 max，(2) 求 $\sum e^{x_i - max}$，(3) 逐元素除。每遍都是一次完整的 HBM 读取。
 
-- **Pass 1**：遍历所有元素求全局最大值 $m$（防止 `exp` 溢出）
-- **Pass 2**：遍历所有元素计算 $e^{x_j - m}$ 并求和 $l$
-- **Pass 3**：遍历所有元素除以 $l$
+### Online Softmax：一遍搞定
 
-三次遍历 = 三次 HBM 读取。对于一个 Memory Bound 算子，这是不可接受的。
+关键观察：当你读到新元素时，max 可能更新，之前算好的 exp 和需要"回溯修正"。Online Softmax 维护一个运行时的 $(m, d)$ 对（当前最大值和指数和），遇到新元素时：
 
-**Online Softmax 的递推破壁法**：我们能否在扫描到第 $t$ 个元素时，只用**当前已知信息**维护一个"可回溯的"最大值和分母？答案是肯定的。定义状态变量 $(m^{(t)}, d^{(t)})$，其递推关系为：
+$$m' = \max(m, x_{new}), \quad d' = d \cdot e^{m - m'} + e^{x_{new} - m'}$$
 
-$$m^{(t)} = \max\big(m^{(t-1)},\; x_t\big)$$
+这样只读一遍就同时得到了 max 和 sum。最后再读一遍做除法，总共 2 遍——比朴素版少了 1 遍 HBM。
 
-$$d^{(t)} = d^{(t-1)} \cdot e^{m^{(t-1)} - m^{(t)}} + e^{x_t - m^{(t)}}$$
+### 实测
 
-关键洞察是第二个公式中的**历史校正因子** $e^{m^{(t-1)} - m^{(t)}}$：当新来的元素更大时，$m$ 更新了，历史的指数和 $d$ 必须同步缩小——因为所有历史元素的 `exp` 值现在要以更大的 $m$ 重新基准化。这个乘法的精妙之处在于 $e^{A}/e^{B} = e^{A-B}$，不需要回头重算历史数据。
+| 版本 | Kernel 时间 | 有效带宽 | vs Naive |
+|:---|:---|:---|:---|
+| Naive (SMEM Reduce) | 0.0053 ms | 785 GB/s | 1× |
+| Online Softmax | 0.0041 ms | — | 1.30× |
+| Warp Reduce | 0.0035 ms | 1181 GB/s | 1.50× |
+| Warp-per-row | 0.04 ms | 120 GB/s | 0.15× |
 
-以一个数值例子说明：假设前两个元素为 $x_1 = 3, x_2 = 5$。
+Warp Reduce 版的 1181 GB/s 超过了 HBM 理论峰值——L2 Cache 命中效应（数据量仅 2 MB，远小于 72 MB L2）。
 
-| 步骤 | $m$ | $d$ | 计算过程 |
-|:---:|:---:|:---:|:---|
-| $t=1$ | 3 | 1.0 | $d = e^{3-3} = 1$ |
-| $t=2$ | 5 | $1 \cdot e^{3-5} + e^{5-5}$ = **1.135** | 历史 $d=1$ 乘以缩放因子 $e^{-2} = 0.135$，加上新项 $e^0 = 1$ |
-
-这样就用**单遍扫描**替代了三遍遍历，HBM 读取量直接砍至 $1/3$。
-
-### 二、Welford 算法：LayerNorm 的单遍均值-方差联合求解
-
-LayerNorm 的标准公式：
-
-$$y_i = \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} \cdot \gamma_i + \beta_i, \quad \mu = \frac{1}{H}\sum x_i, \quad \sigma^2 = \frac{1}{H}\sum(x_i - \mu)^2$$
-
-朴素实现需要两遍扫描：第一遍求 $\mu$，第二遍用 $\mu$ 求 $\sigma^2$。Welford 算法提供了一种数值稳定的单遍递推：
-
-$$\delta_t = x_t - \mu_{t-1}, \quad \mu_t = \mu_{t-1} + \frac{\delta_t}{t}, \quad M_t = M_{t-1} + \delta_t \cdot (x_t - \mu_t)$$
-
-最终 $\sigma^2 = M_n / n$。这个递推的数值优势在于：它避免了"大数减大数"的灾难性抵消（catastrophic cancellation），这在 FP16 推理中尤为关键。
-
-### 三、RMSNorm：LayerNorm 的极简变体
-
-$$\text{RMSNorm}(x_i) = \frac{x_i}{\sqrt{\frac{1}{H}\sum x_j^2 + \epsilon}} \cdot \gamma_i$$
-
-与 LayerNorm 相比，**砍掉了均值减除**。这不仅减少了一次全局归约（少算一次 $\mu$），还省去了减均值的访存。在 LLaMA、Qwen、Mistral 等现代架构中，RMSNorm 已经完全取代了 LayerNorm。
-
-### 四、RoPE：复数域上的旋转位置编码
-
-$$\begin{pmatrix} q'_{2d} \\ q'_{2d+1} \end{pmatrix} = \begin{pmatrix} \cos\theta_{d,t} & -\sin\theta_{d,t} \\ \sin\theta_{d,t} & \cos\theta_{d,t} \end{pmatrix} \begin{pmatrix} q_{2d} \\ q_{2d+1} \end{pmatrix}, \quad \theta_{d,t} = t \cdot \frac{1}{10000^{2d/H}}$$
-
-每对相邻维度做一次 2D 旋转，频率随维度指数衰减。这意味着低维度（$d$ 小）的旋转频率高、对近距离 Token 敏感，高维度的旋转频率低、编码远距离关系。
+Warp-per-row 版反而慢了一个数量级。这个版本每行只用一个 Warp（32 个线程）处理，序列长度 4096 时每个线程要循环 128 次。线程数太少，SM 利用率低。对于大 hidden size 的场景，Block-level 的 Reduce 效率更高。
 
 ---
 
-## 核心优化演进与硬件映射
+## LayerNorm：Welford 的数值稳定性
 
-### 主角一：Softmax 的四级优化阶梯
+$$\text{LayerNorm}(x_i) = \gamma \cdot \frac{x_i - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta$$
 
-```mermaid
-graph LR
-    classDef smem fill:#fcf1c8,stroke:#333;
-    classDef warp fill:#bbf,stroke:#333;
-    classDef best fill:#2ecc71,stroke:#333,color:#fff;
+其中 $\mu = \frac{1}{N}\sum x_i$，$\sigma^2 = \frac{1}{N}\sum (x_i - \mu)^2$。
 
-    V1["V1: Naive<br/>SMEM 两次归约<br/>785 GB/s"]:::smem
-    V2["V2: Online<br/>单遍扫描 + SMEM<br/>~1000 GB/s"]:::smem
-    V3["V3: Warp Reduce<br/>寄存器级归约<br/>1181 GB/s"]:::best
-    V4["V4: Warp-per-row<br/>小 Batch 适配<br/>120 GB/s"]:::warp
+朴素方式要两遍：第一遍求均值，第二遍求方差。Welford 算法把两遍合成一遍——在读数据的同时递推更新 mean 和 M2（方差的未归一化累积量）：
 
-    V1 --> V2 --> V3
-    V1 -.-> V4
-```
+$$\delta = x_{new} - \mu_{old}, \quad \mu_{new} = \mu_{old} + \frac{\delta}{n}, \quad M2_{new} = M2_{old} + \delta \cdot (x_{new} - \mu_{new})$$
 
-**V1 → V3 的核心跃迁路径**：
+除了少一遍 HBM 读取，Welford 在数值稳定性上也更好——避免了大数减大数再平方的精度损失。
 
-| 版本 | 归约机制 | Global Memory 遍历次数 | 延迟关键路径 |
-|:---|:---|:---:|:---|
-| V1 Naive | Shared Memory 树归约 | 3 次 | `__syncthreads()` × 多轮 |
-| V2 Online | SMEM + Online 递推 | 1 次 | SMEM 归约合并 $(m, d)$ 对 |
-| V3 Warp Reduce | **`__shfl_down_sync`** | 1 次（`__expf` 内联） | ~5 cycles/Warp，无 SMEM barrier |
+### 实测
 
-V3 的突破在于：**用 Warp Shuffle 指令彻底替代了 Shared Memory 归约**。`__shfl_down_sync` 在寄存器文件之间直接交换数据，延迟仅 ~1 cycle（对比 SMEM 约 20-30 cycles），且不需要 `__syncthreads()` 同步。32 个线程只需 5 步 shuffle（$\log_2 32 = 5$）即可完成一次完整归约。
+| 版本 | Kernel 时间 | 有效带宽 | vs Naive |
+|:---|:---|:---|:---|
+| Naive (SMEM) | 0.0065 ms | 645 GB/s | 1× |
+| Welford | 0.0061 ms | 692 GB/s | 1.07× |
+| Warp Reduce | 0.0077 ms | 543 GB/s | 0.84× |
+| Warp-per-row | 0.038 ms | 111 GB/s | 0.17× |
 
-### 主角二：FlashAttention 的 SRAM 分块流式架构
+Welford 比 Naive 快了 7%——省掉一遍读取的收益。但 Warp Reduce 版在这个场景下反而更慢，因为 Warp Shuffle 的归约虽然省了 SMEM barrier，但在 hidden_size=4096 时每个线程还是要做 4 次归约迭代，额外的 Shuffle 指令开销抵消了收益。
 
-标准 Attention 的三步实现（QK → Softmax → PV）在 HBM 上产生一个巨大的 $N \times N$ 中间矩阵。FlashAttention 的核心思想是：**把 Q 的一小块固定在 SRAM，让 K/V 的块排队流式送入，用 Online Softmax 的递推在片上完成一切，绝不将中间结果写回 HBM。**
+---
 
-```mermaid
-graph TD
-    classDef hbm fill:#f9d0c4,stroke:#333,stroke-width:2px;
-    classDef sram fill:#fcf1c8,stroke:#333,stroke-width:2px;
-    classDef reg fill:#bbf,stroke:#333,stroke-width:2px;
-    classDef dead fill:#eee,stroke:#999,color:#999;
+## RMSNorm：去掉均值，简化到极致
 
-    subgraph "HBM (Global Memory)"
-        Q["Q [Seq × Head_Dim]"]:::hbm
-        K["K [Seq × Head_Dim]"]:::hbm
-        V["V [Seq × Head_Dim]"]:::hbm
-        O["最终 O [Seq × Head_Dim]"]:::hbm
-        S_dead["✗ S, P (N×N) 永不写出"]:::dead
-    end
+$$\text{RMSNorm}(x_i) = \gamma \cdot \frac{x_i}{\sqrt{\frac{1}{N}\sum x_j^2 + \epsilon}}$$
 
-    subgraph "SRAM (Shared Memory)"
-        QT["Q_tile [BR×d]<br/>固定不动"]:::sram
-        KT["K_tile [BC×d]<br/>流式替换"]:::sram
-        VT["V_tile [BC×d]<br/>流式替换"]:::sram
-    end
+比 LayerNorm 省了一步——不需要计算均值。只需要求 $\sum x^2$，一次归约就够了。LLaMA 系列用的就是 RMSNorm。
 
-    subgraph "寄存器 (每线程私有)"
-        ACC["O_acc [BR×d]<br/>m_i, l_i (在线校正状态)"]:::reg
-    end
+### 实测
 
-    Q --> QT
-    K -.->|"外层循环依次加载"| KT
-    V -.->|"外层循环依次加载"| VT
-    QT & KT -->|"S = Q_tile @ K_tile^T"| ACC
-    ACC -->|"Online Softmax 校正"| ACC
-    VT -->|"P @ V_tile 累加"| ACC
-    ACC ==>|"所有 K/V 块扫描完毕，一次写回"| O
-```
+| 版本 | Kernel 时间 | 有效带宽 | vs Naive |
+|:---|:---|:---|:---|
+| Naive (单线程/行) | 0.32 ms | 212 GB/s | 1× |
+| Warp-level (256 线程/行) | 0.026 ms | 2621 GB/s | **12.3×** |
 
-**V1 到 V3 的关键演进**：
+12.3 倍的差距来自并行度。Naive 版每行只有 1 个线程在归约（串行遍历 4096 个元素），Warp 版 256 个线程协作，每个线程只处理 16 个元素然后做 Warp Shuffle 归约。2621 GB/s 的超高带宽同样是 L2 Cache 命中——32 MB 数据量正好卡在 L2 的 72 MB 容量内。
 
-| 维度 | V1 | V3 (Macro-Block) |
+---
+
+## RoPE：旋转位置编码
+
+$$\begin{bmatrix} x'_{2k} \\ x'_{2k+1} \end{bmatrix} = \begin{bmatrix} \cos\theta_k & -\sin\theta_k \\ \sin\theta_k & \cos\theta_k \end{bmatrix} \begin{bmatrix} x_{2k} \\ x_{2k+1} \end{bmatrix}$$
+
+其中 $\theta_k = \text{pos} / 10000^{2k/d}$。
+
+每对 $(x_{2k}, x_{2k+1})$ 做一次 2D 旋转。计算本身很简单（2 次三角函数 + 4 次乘加），但 GPU 上三角函数走的是 SFU（Special Function Unit），延迟比普通 FMA 高 4-8 倍。
+
+好在每个元素对完全独立，可以做到最大并行度。Vectorized 版本用 `float2` 一次读写一对值，减少内存事务次数。
+
+### 实测
+
+| 版本 | Kernel 时间 | 有效带宽 | vs Naive |
+|:---|:---|:---|:---|
+| Naive | 0.04 ms | 1676 GB/s | 1× |
+| Vectorized (float2) | 0.039 ms | 1734 GB/s | 1.03× |
+
+差异只有 3%。RoPE 的瓶颈不在访存模式上——Naive 版已经是合并访问了。`float2` 的收益在于减少了指令数（1 条 64-bit load 替代 2 条 32-bit load），但在这个算子上访存已经不是瓶颈，瓶颈在 SFU 的三角函数计算。
+
+---
+
+## FlashAttention：最意外的结果
+
+FlashAttention 的核心思想：把标准 Attention（$O = \text{Softmax}(QK^T / \sqrt{d}) \cdot V$）的 $N \times N$ 中间矩阵完全消除，通过分块 + Online Softmax 在 SRAM 上完成所有计算。理论上应该大幅减少 HBM 访问。
+
+### 但是——
+
+| 版本 | Kernel 时间 | vs Naive |
 |:---|:---|:---|
-| Block Size | BR=BC=32（32 线程） | BR_V3=128（4 个 Warp） |
-| Q 复用率 | 1 行 Q × 遍历所有 K/V | **4 行 Q** × 遍历同一批 K/V |
-| 访存方式 | 标量逐元素 | `float4` 128-bit 向量化 |
-| K/V HBM 搬运量 | $\frac{N}{32} \times N \times d \times 4B$ | $\frac{N}{128} \times N \times d \times 4B$（**4× 减少**） |
-| 循环优化 | 无 | `#pragma unroll` 全展开 |
+| Naive (3 步: QK→Softmax→PV) | 6.60 ms | 1× |
+| Flash Attention V1 | 9.58 ms | **0.69× (慢了 45%!)** |
+| Flash Attention V3 (Macro-Block) | 5.33 ms | 1.24× |
 
-V3 的核心洞察是**Q 复用倍率提升**：128 个线程共享同一批 K/V SRAM 数据，但各自计算不同行的 Q×K，DRAM traffic 被摊薄 4 倍。
+是的，Flash V1 比 Naive 还慢了 45%。这是整个项目中最反直觉的结果。
 
-### 配角一：LayerNorm 的 Welford + Warp Reduce 双重优化
+原因不神秘：这个实现的 Flash V1 是纯 CUDA Core 做的分块矩阵乘，没有用 Tensor Core。Naive 版虽然多了中间矩阵的 HBM 往返，但矩阵乘部分可以被 GPU 高度并行化。而 Flash V1 的分块循环引入了大量的同步点和 SRAM 管理开销。
 
-LayerNorm 的优化路径与 Softmax 平行——核心矛盾同样是归约操作的延迟：
+$$\text{Flash V1 的 overhead} = \text{分块循环控制} + \text{Online Softmax 校正} + \text{SRAM 加载调度}$$
 
-| 版本 | 归约策略 | 有效带宽 |
-|:---|:---|:---:|
-| Naive | SMEM 树归约（两遍：求 $\mu$，求 $\sigma^2$） | 645 GB/s |
-| Welford | SMEM 树归约，但单遍同时求 $(\mu, \sigma^2)$ | **692 GB/s** |
-| Warp Reduce | Warp Shuffle 归约 `WelfordData` 结构体 | 543 GB/s |
+在序列长度 2048、head_dim 64 的规模下，中间矩阵 $S = QK^T$ 只有 $2048 \times 2048 \times 4B = 16$ MB（每个 head），还没大到让 HBM 访问成为决定性因素。
 
-一个令人意外的结果：**Warp Reduce 版本反而比 Welford 版本慢**。原因在于 Welford 的 `WelfordData` 结构体包含 3 个 float（`mean`, `m2`, `count`），在 `__shfl_down_sync` 中需要 3 次独立 shuffle 操作，且 `welford_combine` 函数涉及除法和多次乘法。当 `hidden_size = 4096` 足以让 SMEM 归约的 pipeline 填满时，Warp Shuffle 在这种**复杂归约**场景下的优势被额外的寄存器压力和指令开销抵消了。
+Flash V3 通过 Macro-Block 和 Vectorized 加载把开销压下来了（5.33 ms，比 Naive 快 24%），但这仍然远不如真正的 FlashAttention 实现（那些用了 Tensor Core + WMMA/MMA 指令）。
 
-### 配角二：RMSNorm 的并行度爆发
-
-RMSNorm Naive 实现的致命缺陷：**每行仅 1 个线程串行遍历 4096 个元素**。128 个 SM、每个 SM 1536 个线程的 RTX 4090 上，只有 2048 个线程在工作（= num_tokens），SM 利用率约 1%。
-
-Warp 版本将每行分配 256 个线程（8 个 Warp），每个线程仅需处理 16 个元素，然后通过 `__shfl_xor_sync` 做蝴蝶归约。SM 利用率瞬间提升一个数量级。
+这个实验告诉我们：**FlashAttention 的理论优势要在足够大的序列长度 + Tensor Core 加持下才能兑现。** 纯 CUDA Core 的教学实现在中等规模下可能反而不如暴力版。
 
 ---
 
-## 源码手术刀：关键代码深度赏析
-
-### 一、FlashAttention V3 的 Macro-Block 核心循环
-
-```cpp
-// 128 个线程（4个 Warp）共享 K/V，但各自处理不同行的 Q
-const int BR_V3 = WARPS_PER_BLOCK * BR; // 128 行 Q
-
-for (int j = 0; j < num_blocks_K; ++j) {
-    // 128 个线程协作搬运 BC×D 的 K/V 到 SRAM（float4 向量化）
-    #pragma unroll
-    for (int step = 0; step < lines_per_thread; ++step) {
-        int task_id = tx + step * blockDim.x;
-        int k_row_local = task_id / D_FLOAT4;
-        int k_col_f4 = task_id % D_FLOAT4;
-        if (global_k_row < seq_len) {
-            s_K_f4[k_col_f4] = K_f4[k_col_f4]; // float4: 128-bit 单事务
-            s_V_f4[k_col_f4] = V_f4[k_col_f4];
-        }
-    }
-    __syncthreads(); // 4 个 Warp 搬完，128 个人开吃
-
-    // 🔥 每个线程计算自己那一行的 Q × K^T（float4 向量化点积）
-    const float4* q_vec = reinterpret_cast<const float4*>(&s_Q[tx * head_dim]);
-    const float4* k_vec = reinterpret_cast<const float4*>(&s_K[k_idx * head_dim]);
-    for (int d4 = 0; d4 < D_FLOAT4; ++d4) {
-        sum += qv.x * kv.x + qv.y * kv.y + qv.z * kv.z + qv.w * kv.w;
-    }
-
-    // 🔥 Online Softmax 递推三连：历史校正 + 分母更新 + O 累加
-    float exp_diff = __expf(m_i - m_i_new);
-    float l_i_new = exp_diff * l_i + p_sum;
-    O[row_q, d] = old_o * exp_diff + pv_sum;
-}
-```
-
-**硬件级解读**：
-
-1. **`float4` 向量化**：将 4 个 32-bit 标量读取合并为 1 个 128-bit 事务，总线利用率提升 4×。RTX 4090 的 L1 cache line 为 128B，一次 `float4` 读取恰好是 16B，8 次连续读取填满一条 cache line。
-2. **`exp_diff × l_i + p_sum`**：这是 Online Softmax 的核心——用一次 `__expf`（~20 cycles 特殊函数单元指令）换来了对整个 $N \times N$ 矩阵的零写回。
-3. **`old_o * exp_diff + pv_sum`**：对历史累加的 O 进行缩放校正。这里的 `old_o` 直接从 Global Memory 读取再写回（V3 尚未将 O 提到寄存器），是可进一步优化的空间。
-
-### 二、Warp Reduce Softmax 的极致归约
-
-```cpp
-// Warp 内 5 步 shuffle 求 max（延迟 ~5 cycles vs SMEM ~50 cycles）
-float warp_max = warp_reduce_max(local_max);
-if (lane == 0) shared_data[warp_id] = warp_max; // 仅 lane 0 写 SMEM
-__syncthreads();
-
-// Block 级归约：仅 Warp 0 的 32 个线程做第二轮
-float block_max = (tid < blockDim.x / 32) ? shared_data[lane] : -INFINITY;
-if (warp_id == 0) block_max = warp_reduce_max(block_max);
-
-// 使用 __expf（快速数学库，~20 cycles）而非 expf（~80 cycles）
-local_sum += __expf(input[row * seq_len + tid] - block_max);
-```
-
-**两级归约架构**：1024 个线程 → 32 个 Warp 各自 shuffle → 32 个结果写入 SMEM → Warp 0 再做一次 shuffle。总共只需 $5 + 1 + 5 = 11$ 次 shuffle + 1 次 `__syncthreads()`，对比 Naive 版本的 $\log_2(1024) = 10$ 轮 SMEM 归约各需要一次 barrier。
-
-### 三、Welford 算法在 LayerNorm 中的设备级实现
-
-```cpp
-struct WelfordData { float mean; float m2; float count; };
-
-__device__ __forceinline__ WelfordData welford_combine(WelfordData a, WelfordData b) {
-    float delta = b.mean - a.mean;
-    res.mean = a.mean + delta * b.count / res.count;
-    res.m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / res.count;
-    return res;
-}
-```
-
-`welford_combine` 函数的精妙之处：它将两个独立计算的局部统计量（来自不同线程的子集）合并为全局统计量，而不需要回溯原始数据。这使得 Welford 天然适配 GPU 的 Map-Reduce 范式：每个线程先在自己的元素子集上做局部 Welford 递推，然后通过树归约合并。
-
----
-
-## 理论与实际的对决：极限剖析
-
-> **测试环境**：NVIDIA GeForce RTX 4090 × 2（sm_89），Linux，nvcc -O3 -std=c++17
-> **理论峰值**：FP32 算力 ~82.6 TFLOPS，HBM 带宽 ~1008 GB/s
-
-### Softmax 性能对比（Batch=128, Seq=4096, 100 次平均）
-
-| 版本 | Kernel 时间 (ms) | 有效带宽 (GB/s) | 带宽利用率 | vs CPU 加速比 |
-|:---|:---:|:---:|:---:|:---:|
-| CPU 参考 | 2.91 | — | — | 1× |
-| V1 Naive (SMEM) | 0.0053 | 785 | 77.9% | 549× |
-| V2 Online (单遍) | 0.0041 | ~1013 | ~100.5% | 710× |
-| **V3 Warp Reduce** | **~0.0035** | **1181** | **117.2%** | **820×** |
-| V4 Warp-per-row | 0.04 | 120 | 11.9% | 73× |
+## 性能总览
 
 ```mermaid
 xychart-beta
-  title "Softmax 各版本有效带宽 (GB/s)"
-  x-axis ["V1 Naive", "V2 Online", "V3 Warp Reduce", "V4 Warp-per-row"]
-  y-axis "GB/s" 0 --> 1300
-  bar [785, 1013, 1181, 120]
+  title "各算子最优版本有效带宽 (GB/s)"
+  x-axis ["Softmax", "LayerNorm", "RMSNorm", "RoPE"]
+  y-axis "GB/s" 0 --> 3000
+  bar [1181, 692, 2621, 1734]
 ```
 
-**V3 超过理论带宽？** 这不是测量误差，而是 **L2 Cache 命中效应**。当 `seq_len = 4096` × `batch = 128` × `4 Bytes` = 2 MB 总数据量恰好能被 RTX 4090 的 72 MB L2 Cache 完整缓存时，Kernel 在多次迭代中实际上大量命中了 L2 而非每次都走 HBM，表观带宽因此超过 DRAM 理论极限。
-
-**V4 为何慢到崩溃？** Warp-per-row 策略为每行分配 1 个 Warp（32 线程），当 `seq_len = 4096` 时每个线程需要循环处理 128 个元素。Grid 中只有 128 个 Block（= batch），远不足以填满 128 个 SM。GPU 在此配置下严重 **under-subscribed**。
-
-### LayerNorm 性能对比（Batch=128, Hidden=4096, 100 次平均）
-
-| 版本 | Kernel 时间 (ms) | 有效带宽 (GB/s) | vs CPU 加速比 |
-|:---|:---:|:---:|:---:|
-| CPU 参考 | 2.54 | — | 1× |
-| Naive (SMEM 两遍) | 0.0065 | 645 | 391× |
-| **Welford (单遍)** | **0.0061** | **692** | 416× |
-| Warp Reduce | ~0.0077 | 543 | 330× |
-| Warp-per-row | 0.04 | 111 | 64× |
-
-**Warp Reduce 反而更慢的根因分析**：
-
-`WelfordData` 结构体包含 3 个 float，每次 `__shfl_down_sync` 需要发射 3 条独立 shuffle 指令（GPU 不支持结构体级别的 shuffle）。5 步归约 × 3 条指令 = 15 次 shuffle/Warp，对比标量 max 的 5 次。加上 `welford_combine` 中的除法指令（~80 cycles on SFU，且不可被 INT/FP32 pipeline overlap），总指令延迟反而高于 SMEM 树归约在 `hidden_size = 4096` 这个特定尺度下的 pipeline 吞吐。
-
-### Flash Attention 性能对比（B=2, H=4, Seq=2048, d=64, 50 次平均）
-
-| 版本 | Kernel 时间 (ms) | 中间内存占用 | vs Naive 加速比 |
-|:---|:---:|:---:|:---:|
-| CPU 参考 | 6813.06 | — | — |
-| Naive (全矩阵 QK→Softmax→PV) | 6.60 | **128 MB** ($N^2$) | 1× |
-| Flash V1 (SRAM Tiling) | 9.58 | $O(N)$ | **0.69×（变慢！）** |
-| **Flash V3 (Macro-Block)** | **5.33** | **$O(N)$** | **1.24×** |
-
-```mermaid
-xychart-beta
-  title "Flash Attention Kernel 耗时对比 (ms, 越低越好)"
-  x-axis ["Naive", "Flash V1", "Flash V3"]
-  y-axis "ms" 0 --> 11
-  bar [6.60, 9.58, 5.33]
-```
-
-**Flash V1 为什么比 Naive 还慢？这是本文最关键的反直觉发现。**
-
-| 瓶颈维度 | Naive | Flash V1 |
-|:---|:---|:---|
-| HBM 写入 | 128 MB（N×N 矩阵） | 0（无中间矩阵） |
-| Block Size | 16×16 = 256 线程 | BR=32 线程 |
-| SM 占用率 | Grid = 2×4×(2048/16)² = ~131K blocks | Grid = 2×4×(2048/32) = 512 blocks |
-| 计算重复 | 0 | 有（QK 和 Softmax 融合带来的重计算） |
-| `__syncthreads()` 频率 | 极少 | 每个 K/V 块一次 |
-
-在 `seq_len = 2048` 这个**中等规模**下：
-
-1. Naive 的 128 MB 中间矩阵尚可被 72 MB L2 Cache 部分吸收
-2. Flash V1 的 32 线程 Block 严重不足以填满 SM，**Wave 效率极低**
-3. V1 在每个 K/V 块加载后的 `__syncthreads()` 造成了大量 pipeline bubble
-
-只有 V3 通过 128 线程的 Macro-Block 将 SM 占用率拉回合理区间，同时 `float4` 向量化和 `#pragma unroll` 消除了循环开销，最终以 5.33 ms 反超 Naive。
-
-### RMSNorm 性能对比（Tokens=2048, Hidden=4096, 50 次平均）
-
-| 版本 | Kernel 时间 (ms) | 有效带宽 (GB/s) | vs Naive 加速比 |
-|:---|:---:|:---:|:---:|
-| Naive (1 线程/行) | 0.32 | 212 | 1× |
-| **Warp (256 线程/行)** | **~0.026** | **2621** | **12.33×** |
-
-Warp 版本的 2621 GB/s 有效带宽同样远超 1008 GB/s 理论 DRAM 带宽，原因同 Softmax V3：32 MB 数据量完全驻留在 L2 Cache 中。
-
-### RoPE 性能对比（Seq=2048, Heads=32, d=128, 50 次平均）
-
-| 版本 | Kernel 时间 (ms) | 有效带宽 (GB/s) | vs CPU 加速比 |
-|:---|:---:|:---:|:---:|
-| Naive | 0.04 | 1676 | 1692× |
-| **Vectorized (float2)** | **~0.039** | **1734** | **1751×** |
-
-RoPE 的向量化收益微乎其微（3%），因为该算子的最大瓶颈不在访存模式，而在 `sinf/cosf` 特殊函数调用（SFU 硬件单元，每 SM 仅 4-8 个）。进一步优化需要预计算三角函数表或使用 `__sincosf` 融合指令。
+RMSNorm 和 RoPE 的超高带宽（>1000 GB/s）都是 L2 Cache 命中的结果，不代表 HBM 本身有那么快。
 
 ---
 
-## 架构师视角的总结
+## 几个可以带走的工程经验
 
-### 铁律一：Memory Bound 算子的极限在数学，不在代码
+**Memory Bound 算子的优化天花板是 HBM 带宽。** Softmax、LayerNorm 这些算子的算术强度不到 1，不管怎么优化计算逻辑，最终都卡在 1008 GB/s 这堵墙上。Online Softmax 和 Welford 的真正价值是减少 HBM 遍历次数（从 3 遍到 2 遍、从 2 遍到 1 遍），每少一遍就省掉一倍数据搬运。
 
-Online Softmax 和 Welford 算法的本质是**用代数变换消除 HBM 遍历**。在写下第一行 CUDA 代码之前，我们就需要问：这个算子的数学公式允许增量计算吗？如果不允许，是否存在等价变换使其可增量化？这种 first-principles 的思维方式，比任何 CUDA 优化技巧都重要。
+**并行粒度决定了加速的下限。** RMSNorm 的 Warp 版比 Naive 快 12 倍——不是因为算法更好，纯粹是因为 256 个线程并行归约 vs 1 个线程串行归约。写 Kernel 之前先问自己：你给 GPU 的并行度够不够？
 
-### 铁律二：不是每次切向 SRAM 都赚钱——Block Size 决定生死
-
-Flash Attention V1 的教训告诉我们：**SRAM Tiling 的收益与 Block Size 强耦合**。过小的 Block 导致 SM 利用不足、`__syncthreads()` 开销放大，完全可以让精心设计的算法反而不如暴力 DRAM 实现。在 RTX 4090 这样拥有 128 个 SM 的芯片上，Task 级并行度（Grid Size）必须远超 SM 数量才能有效隐藏延迟。
-
-### 铁律三：Warp Shuffle ≠ 银弹——结构体归约有隐性成本
-
-LayerNorm 的 `WelfordData` 归约案例表明，当归约对象从标量扩展到结构体时，Warp Shuffle 的指令膨胀可能超过 SMEM 归约的 pipeline 效率。**工具没有好坏之分，只有匹配度**。选择归约策略时必须考虑：归约元素的宽度、归约函数的复杂度、以及当前 Kernel 的 Occupancy。
-
-### 铁律四：超过理论带宽 ≠ 测量错误——Cache 是隐形加速器
-
-当数据集足以驻留在 L2 Cache（RTX 4090 为 72 MB）中时，多次迭代的平均带宽可以超过 DRAM 理论带宽。在生产环境中，这意味着**小 Batch / 短序列的 Kernel 性能评估必须考虑 Cache 效应**，否则 Benchmark 结果无法反映真实大规模推理时的表现。
+**FlashAttention 的故事说明"理论更优 ≠ 实测更快"。** 减少 HBM 访问确实好，但如果实现带来了太多额外开销（同步、分支、SRAM 管理），在特定规模下净效果可能为负。这也是为什么 FlashAttention 的真实威力要靠 Tensor Core 和精心调优的 CUTLASS-style 实现才能体现——09_Tensor_Core 和 14_CUTLASS 会从硬件层面接续这个讨论。

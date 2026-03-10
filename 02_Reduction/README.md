@@ -11,8 +11,8 @@
 | 文件 | Kernel 列表 | 核心技术 | 优化层级 |
 |------|------------|----------|---------|
 | `01_reduce_sum/reduce_sum.cu` | `simple_reduce_sum`、`convergent_reduce_sum`、`shared_reduce_sum` | Divergence 分析、Shared Memory 归约 | 入门 |
-| `02_reduce_optimized/reduce_optimized.cu` | `coarsened_reduce_sum`、`coarsened_reduce_max` + `segmented_reduce` | Thread Coarsening、`atomicAdd`、Warp Shuffle | 进阶 |
-| `03_dot_product/dot_product.cu` | `dot_product_simple`、`dot_product_coarsened`、`dot_product_fma` | FMA 指令、规约常见变体 | 进阶 |
+| `02_reduce_optimized/reduce_optimized.cu` | `segmented_reduce_sum`、`coarsened_reduce_sum`、`coarsened_reduce_max` | Thread Coarsening、`atomicAdd`、Warp Shuffle | 进阶 |
+| `03_dot_product/dot_product.cu` | `shared_dot_product`、`coarsened_dot_product`、`fma_dot_product` | FMA 指令、规约常见变体 | 进阶 |
 
 ---
 

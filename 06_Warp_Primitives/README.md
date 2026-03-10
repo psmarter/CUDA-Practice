@@ -8,9 +8,9 @@
 
 | 文件 | Kernel 列表 | 核心技术 | 测试规模 |
 |------|------------|----------|---------|
-| `01_warp_shuffle/warp_shuffle.cu` | `warp_broadcast`、`xor_shuffle`、`updown_shuffle`、`warp_reduce_sum` | 四种 Shuffle 变体演示 | 32 M 元素，128 MB |
+| `01_warp_shuffle/warp_shuffle.cu` | `kernel_warp_broadcast`、`kernel_warp_xor_shuffle`、`kernel_warp_up_down_shuffle`、`test_kernel_warp_reduce_sum` | 四种 Shuffle 变体演示 | 32 M 元素，128 MB |
 | `02_warp_reduce/warp_reduce.cu` | `block_reduce_sum`、`block_reduce_max` | 多 Warp Block 归约 | 32 M 元素，128 MB |
-| `03_warp_scan/warp_scan.cu` | `block_inclusive_scan`、`block_exclusive_scan` | Warp Scan 拼接 Block Scan | 32 M 元素，128 MB |
+| `03_warp_scan/warp_scan.cu` | `block_scan_inclusive`、`block_scan_exclusive` | Warp Scan 拼接 Block Scan | 32 M 元素，128 MB |
 
 ---
 
@@ -75,32 +75,33 @@ $$y^{(d)}_i = y^{(d-1)}_i + y^{(d-1)}_{i-2^{d-1}}, \quad i \ge 2^{d-1}$$
 
 ## 四、关键源码逐行解剖
 
-### Block Reduce 多 Warp 协作（来自 `warp_reduce.cu`）
+### Block Reduce 多 Warp 协作（来自 `warp_reduce.cu` 的 `block_reduce_sum`）
 
 ```cpp
-// 第一阶段：每个 Warp 内部用 __shfl_down_sync 归约
-float val = input[tid];
-for (int offset = 16; offset > 0; offset >>= 1)
-    val += __shfl_down_sync(0xffffffff, val, offset);
+// 第一阶段：每个 Warp 内部调用 kernel_warp_reduce_sum 归约
+// （内部使用 __shfl_xor_sync 蝴蝶网络实现 5 轮归约）
+float sum = (tid < n) ? input[tid] : 0.0f;
+sum = kernel_warp_reduce_sum(sum);
 
 // 每个 Warp 的 Lane 0 将本 Warp 结果写入 Shared Memory
-__shared__ float s_warp_sums[32]; // 最多 32 个 Warp/Block
-int lane = threadIdx.x % 32;
+__shared__ float shared_warp_sums[32]; // 最多 32 个 Warp
 int warp_id = threadIdx.x / 32;
-if (lane == 0) s_warp_sums[warp_id] = val;
+int lane_id = threadIdx.x % 32;
+if (lane_id == 0) shared_warp_sums[warp_id] = sum;
 __syncthreads();
 
-// 第二阶段：用单个 Warp 对 s_warp_sums 二次规约
+int num_warps = blockDim.x / 32;
+
+// 第二阶段：用单个 Warp 对 shared_warp_sums 二次规约
 if (warp_id == 0) {
-    val = (lane < blockDim.x / 32) ? s_warp_sums[lane] : 0.0f;
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xffffffff, val, offset);
+    sum = (lane_id < num_warps) ? shared_warp_sums[lane_id] : 0.0f;
+    sum = kernel_warp_reduce_sum(sum);
+    // Lane 0 将本 Block 结果写入 output[blockIdx.x]
+    if (lane_id == 0) output[blockIdx.x] = sum;
 }
-// Lane 0 用 atomicAdd 跨 Block 汇总
-if (threadIdx.x == 0) atomicAdd(output, val);
 ```
 
-**为何仍需 Shared Memory**：Shuffle 只能在同一 Warp 内通信；跨 Warp 的数据交换必须借助 `__shared__` 作为中转站。这是 Warp Primitive 的能力边界。
+**为何仍需 Shared Memory**：Shuffle 只能在同一 Warp 内通信；跨 Warp 的数据交换必须借助 `__shared__` 作为中转站。这是 Warp Primitive 的能力边界。注意输出采用 per-Block 写出（`output[blockIdx.x]`），最终汇总在 Host 端完成。
 
 ---
 

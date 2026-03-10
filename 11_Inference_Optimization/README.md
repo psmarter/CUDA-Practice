@@ -8,8 +8,8 @@
 
 | 文件 | 核心技术 | 优化目标 | 工业界应用 |
 |------|----------|---------|-----------|
-| `02_kernel_fusion/kernel_fusion.cu` | **算子融合 (Kernel Fusion)** | 削减内存往返开销 (Memory Round-trip) | Fused MLP, Fused Attention |
 | `01_kv_cache/kv_cache.cu` | **PagedAttention (分页 KV Cache)** | 消除内存内碎片，提升并发容量 | vLLM 核心基石 |
+| `02_kernel_fusion/kernel_fusion.cu` | **算子融合 (Kernel Fusion)** | 削减内存往返开销 (Memory Round-trip) | Fused MLP, Fused Attention |
 | `03_dynamic_batching/dynamic_batching.cu` | **Continuous Batching (连续批处理)** | 消除 Padding 填空，释放显存带宽 | Orca (TGI 基础) |
 
 ---
@@ -85,27 +85,33 @@ graph TD
 
 ## 四、关键源码逐行解剖
 
-### Continuous Batching 前向访问核心（来自 `dynamic_batching.cu`）
+### Continuous Batching 前向访问核心（来自 `dynamic_batching.cu` 的 `batched_attention_varlen`）
 
 ```cuda
-// varlen_attention_kernel
-// q_data 被打包为了一个 1D Tensor: [Total_Tokens, Num_Heads, Head_Dim]
-// cu_seqlens 记录了偏移: [0, len0, len0+len1, ...]
+// query: [batch_size, num_heads, head_dim]
+// key/value: [total_tokens, num_heads, head_dim] Packed Tensor
+// seq_starts: [batch_size + 1] 每个序列在 packed 数组中的起始 token 偏移
 
-int token_idx = blockIdx.x * blockDim.x + threadIdx.x; // 并发处理所有真实 Token
-if (token_idx >= total_tokens) return;
+// 一个 Block 处理一个 (batch, head) 对
+int batch_idx = blockIdx.x / num_heads;
+int head_idx = blockIdx.x % num_heads;
+int tid = threadIdx.x; // 每个线程处理 head_dim 中的一个维度
 
-// 1. 二分查找 / 线性查找 当前 Token 属于哪个 Request
-int batch_idx = 0;
-while (batch_idx < batch_size && token_idx >= cu_seqlens[batch_idx + 1]) {
-    batch_idx++;
+// 从 seq_starts 获取当前序列在 packed array 中的有效范围
+int start_token_idx = seq_starts[batch_idx];
+int end_token_idx = seq_starts[batch_idx + 1];
+
+float q_val = query[batch_idx * num_heads * head_dim + head_idx * head_dim + tid];
+float acc = 0.0f;
+
+// 仅遍历有效 token，彻底无 Padding 浪费
+for (int token_idx = start_token_idx; token_idx < end_token_idx; ++token_idx) {
+    int kv_idx = token_idx * (num_heads * head_dim) + head_idx * head_dim + tid;
+    float k_val = key[kv_idx];
+    float v_val = value[kv_idx];
+    acc += (q_val * k_val) * v_val;
 }
-
-// 2. 计算在当前 Request 内的局部位置 (用于 Positional Encoding/Mask)
-int seq_idx = token_idx - cu_seqlens[batch_idx];
-
-// 3. 执行核心计算 (彻底无需处理任何 Padding 废数据)
-float q_val = q_data[(token_idx * num_heads + head_idx) * head_dim + dim_idx];
+output[batch_idx * num_heads * head_dim + head_idx * head_dim + tid] = acc;
 ```
 
 ---

@@ -82,32 +82,34 @@ graph TD
 ### NCCL 核心通信管线构建（来自 `nccl_allreduce.cu`）
 
 ```cuda
-// 1. 生成全局唯一的 NCCL 通信 ID，分发给所有进程/线程
+// 1. 生成全局唯一的 NCCL 通信 ID
 ncclUniqueId id;
-ncclGetUniqueId(&id);
+NCCLCHECK(ncclGetUniqueId(&id));
 
-// 2. 将计算任务分派给不同的宿主 CPU 线程 (模拟多卡多进程)
+// 2. 分组初始化：为每个设备分配显存并初始化 NCCL Communicator
+NCCLCHECK(ncclGroupStart());
 for (int i = 0; i < nDev; ++i) {
     cudaSetDevice(i); // 极度重要！绑定上下文
-    
-    // 初始化通信子 (Communicator)
-    ncclCommInitRank(&comms[i], nDev, id, i);
+    cudaMalloc((void**)&d_sendbuffs[i], size_bytes);
+    cudaMalloc((void**)&d_recvbuffs[i], size_bytes);
+    cudaStreamCreate(&streams[i]);
+    NCCLCHECK(ncclCommInitRank(&comms[i], nDev, id, i));
 }
+NCCLCHECK(ncclGroupEnd());
 
 // 3. 发起集合通信 (Group 机制确保无死锁)
-ncclGroupStart();
+NCCLCHECK(ncclGroupStart());
 for (int i = 0; i < nDev; ++i) {
     cudaSetDevice(i);
-    // 异步调用 AllReduce，指定操作符为 ncclSum (求和)
-    ncclAllReduce((const void*)sendbuff[i], 
-                  (void*)recvbuff[i], 
-                  size, 
-                  ncclFloat, 
-                  ncclSum,    // 核心操作：加法
-                  comms[i], 
-                  streams[i]); // 挂载在独立的 CUDA Stream 上掩盖延迟
+    NCCLCHECK(ncclAllReduce((const void*)d_sendbuffs[i], 
+                             (void*)d_recvbuffs[i], 
+                             num_elements, 
+                             ncclFloat, 
+                             ncclSum,      // 核心操作：加法
+                             comms[i], 
+                             streams[i])); // 挂载在独立的 CUDA Stream 上掩盖延迟
 }
-ncclGroupEnd();
+NCCLCHECK(ncclGroupEnd());
 
 // 4. 等待所有卡通信/计算落盘
 for (int i = 0; i < nDev; ++i) {

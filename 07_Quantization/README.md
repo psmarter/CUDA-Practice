@@ -8,9 +8,9 @@
 
 | 文件 | Kernel 列表 | 核心技术 | 适用场景 |
 |------|------------|----------|---------|
-| `03_quant_dequant/quant_dequant.cu` | `quantize_per_tensor`<br>`quantize_per_channel`<br>`fp32_to_fp16_cast` | 对称/非对称量化、Per-Channel 缩放 | 权重预处理与加载 |
-| `01_fp16_gemm/fp16_gemm.cu` | `naive_fp16_gemm`<br>`tiled_fp16_gemm`<br>`vectorized_fp16_gemm` | `half` 数据类型、`__half2` 向量化 | 通用推理加速 |
-| `02_int8_gemm/int8_gemm.cu` | `naive_int8_gemm`<br>`dp4a_int8_gemm`<br>`vectorized_dp4a_gemm` | `__dp4a` 硬件指令、四位一体点积 | 极致吞吐量推理 |
+| `01_fp16_gemm/fp16_gemm.cu` | `kernel_naive_fp16_gemm`<br>`kernel_tiled_fp16_gemm`<br>`kernel_vectorized_fp16_gemm` | `half` 数据类型、`__half2` 向量化 | 通用推理加速 |
+| `02_int8_gemm/int8_gemm.cu` | `naive_int8_gemm`<br>`dp4a_int8_gemm`<br>`vectorized_int8_gemm` | `__dp4a` 硬件指令、四位一体点积 | 极致吞吐量推理 |
+| `03_quant_dequant/quant_dequant.cu` | `quantize_per_tensor`、`dequantize_per_tensor`<br>`quantize_per_channel`<br>`fp32_to_fp16`、`fp16_to_fp32` | 对称/非对称量化、Per-Channel 缩放 | 权重预处理与加载 |
 
 ---
 
@@ -83,24 +83,41 @@ graph TD
 
 ## 四、关键源码逐行解剖
 
-### Vectorized dp4a 核函数（来自 `int8_gemm.cu`）
+### Vectorized dp4a 核函数（来自 `int8_gemm.cu` 的 `vectorized_int8_gemm`）
 
 ```cuda
-// 使用 int4 (等价于 4 个 32-bit 整形，共 16 个 INT8) 彻底榨干显存位宽
-int4 a_vec = reinterpret_cast<const int4*>(A)[row * (K / 4) + k];
-int4 b_vec = reinterpret_cast<const int4*>(B)[...];
+CInt col = (blockIdx.x * blockDim.x + threadIdx.x) * 4; // 每个线程处理 4 列
+int32_t sum0 = 0, sum1 = 0, sum2 = 0, sum3 = 0;
 
-// a_vec.x 包含 4 个 INT8 元素，直接送入 dp4a
-sum = __dp4a(a_vec.x, b_vec.x, sum);
-sum = __dp4a(a_vec.y, b_vec.y, sum);
-sum = __dp4a(a_vec.z, b_vec.z, sum);
-sum = __dp4a(a_vec.w, b_vec.w, sum);
+for (int i = 0; i < N; i += 4) {
+    // A 按行一次读取 4 个 INT8 (打包为 1 个 int32_t)
+    int32_t a_val = *reinterpret_cast<const int32_t*>(&A[row * N + i]);
+    
+    // B 的 4 行各读取 4 字节 (横向向量化)，再按列 unpack 重组
+    int32_t b_row0_pack = *reinterpret_cast<const int32_t*>(&B[(i + 0) * K + col]);
+    int32_t b_row1_pack = *reinterpret_cast<const int32_t*>(&B[(i + 1) * K + col]);
+    // ... b_row2_pack, b_row3_pack 同理
+    
+    // 提取每列对应的 4 个 INT8 并重新打包为 int32_t
+    // 例如 col0_val = [b_row0[col+0], b_row1[col+0], b_row2[col+0], b_row3[col+0]]
+    int32_t col0_val = ((r3_c0 & 0xFF) << 24) | ((r2_c0 & 0xFF) << 16)
+                     | ((r1_c0 & 0xFF) << 8)  | (r0_c0 & 0xFF);
+    // col1_val, col2_val, col3_val 同理
+    
+    // 4 次 dp4a 分别累加到 4 个输出列
+    sum0 = compat_dp4a(a_val, col0_val, sum0);
+    sum1 = compat_dp4a(a_val, col1_val, sum1);
+    sum2 = compat_dp4a(a_val, col2_val, sum2);
+    sum3 = compat_dp4a(a_val, col3_val, sum3);
+}
+// 存回 4 个 int32_t (即一个 int4) 到 C
+*reinterpret_cast<int4*>(&C[row * K + col]) = make_int4(sum0, sum1, sum2, sum3);
 ```
 
 **极致压榨策略**：
 
-1. **显存端**：一次 `reinterpret_cast<int4>` 发起 128-bit（16 字节）连续全局内存读取，填满事务合并红利。
-2. **计算端**：连续 4 次 `__dp4a` 每轮消耗 16 组 INT8 乘加运算，不存在指令解码间隔。由此达到算力天花板。
+1. **显存端**：A 的 `reinterpret_cast<int32_t>` 将 4 个 INT8 打包为一次 32-bit 读取；B 按行读取后在寄存器中按列 unpack 重组，最终写出时用 `int4`（128-bit）一次性写回 4 列结果。
+2. **计算端**：每轮迭代产生 4 次 `compat_dp4a`（内部调用 `__dp4a`），每次消耗 4 对 INT8 乘加运算，4 列并行处理使指令流水线持续满载。
 
 ---
 

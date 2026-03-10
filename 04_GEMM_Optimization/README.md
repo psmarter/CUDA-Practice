@@ -8,7 +8,7 @@
 
 | 文件 | Kernel 列表 | 核心技术 | 测试规模 |
 |------|------------|----------|---------|
-| `01_tiled_gemm/tiled_gemm.cu` | `tiled_gemm`、`coarse_gemm`、`register_tiled` | Shared Tiling → 1D 粗化 → 2D 寄存器分块 | 1024×1024 |
+| `01_tiled_gemm/tiled_gemm.cu` | `tiled_gemm`、`coarse_gemm`、`register_tiled_gemm` | Shared Tiling → 1D 粗化 → 2D 寄存器分块 | 1024×1024 |
 | `02_advanced_gemm/advanced_gemm.cu` | `vectorized_gemm`、`double_buffer_gemm` | `float4` 向量化、双缓冲流水线 | 1024×1024 |
 | `03_register_tiling/register_tiling.cu` | `register_tiling_gemm` vs `cublasSgemm` | 极致寄存器复用（8×8 子块）| 2048×2048 |
 
@@ -70,29 +70,36 @@ graph TD
 
 ## 四、关键源码逐行解剖
 
-### 2D Register Tiling 核心内层循环（来自 `tiled_gemm.cu`）
+### 2D Register Tiling 核心内层循环（来自 `tiled_gemm.cu` 的 `register_tiled_gemm`）
 
 ```cpp
-// Thread Tile 缓冲区：c[TM][TN] = c[8][8]，全部驻留在寄存器池
-float c[COARSE_Y][COARSE_X] = {0};
+// Thread Tile 缓冲区：values[COARSE_Y][COARSE_X] = values[4][4]，全部驻留在寄存器池
+float values[COARSE_Y][COARSE_X] = {0.0f};
 
-for (int tile = 0; tile < K; tile += TILE_SIZE) {
-    // 协作加载：仅一次 Shared Memory 写入
-    s_A[ty][tx] = A[row * K + tile + tx];
-    s_B[ty][tx] = B[(tile + ty) * N + col];
+for (int i = 0; i < cdiv(N, TILE_SIZE); ++i) {
+    // 协作加载：多行/多列一次性搬入 Shared Memory
+    for (int j = 0; j < COARSE_Y; ++j) {
+        CInt a_row = row + j * TILE_SIZE;
+        shared_A[j * TILE_SIZE + threadIdx.y][threadIdx.x] = (a_row < M && tiled_col < N) ? A[a_row * N + tiled_col] : 0.0f;
+    }
+    for (int j = 0; j < COARSE_X; ++j) {
+        CInt b_col = col + j * TILE_SIZE;
+        shared_B[threadIdx.y][j * TILE_SIZE + threadIdx.x] = (b_col < K && tiled_row < N) ? B[tiled_row * K + b_col] : 0.0f;
+    }
     __syncthreads();
 
-    // 内层 8×8 FMA 矩阵外积展开（全部命中 Shared Memory）
-    for (int k = 0; k < TILE_SIZE; ++k) {
-        for (int i = 0; i < COARSE_Y; ++i)       // 8×
-            for (int j = 0; j < COARSE_X; ++j)   // ×8 = 64 次 FMA
-                c[i][j] += s_A[ty + i * ...][k] * s_B[k][tx + j * ...];
+    // 内层 COARSE_Y×COARSE_X FMA 矩阵外积展开（全部命中 Shared Memory）
+    for (int t = 0; t < TILE_SIZE; ++t) {
+        for (int j = 0; j < COARSE_Y; ++j)
+            for (int k = 0; k < COARSE_X; ++k)
+                values[j][k] = fmaf(shared_A[j * TILE_SIZE + threadIdx.y][t],
+                                    shared_B[t][k * TILE_SIZE + threadIdx.x], values[j][k]);
     }
     __syncthreads();
 }
 ```
 
-**关键点**：`#pragma unroll` 让编译器将双重循环完全展开为 64 条连续 `fma` 指令，消除分支和循环计数器开销，使 SM 的指令发射槽保持满载。
+**关键点**：编译器在 `#pragma unroll` 的辅助下，将双重循环完全展开为连续 `fma` 指令，消除分支和循环计数器开销。注意此处 `COARSE_X = COARSE_Y = 4`（共 16 次 FMA/tile 步），而 `03_register_tiling` 中的极致版本将 TM=TN=8（共 64 次 FMA/tile 步），复用比更高。
 
 ---
 

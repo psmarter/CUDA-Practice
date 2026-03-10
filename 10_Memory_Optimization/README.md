@@ -9,8 +9,8 @@
 | 文件 | Kernel / 功能 | 优化目标 | 适用的内存层级 |
 |------|--------------|---------|-------------|
 | `01_coalesced_access/coalesced_access.cu` | `coalesced_access`、`strided_access`<br>`aos_access` vs `soa_access` | 消除事务合并失败、结构体内存布局改造 | **Global Memory** (HBM) |
-| `02_bank_conflict/bank_conflict.cu` | `bank_conflict_test`<br>`padded_shared_access` | 打破 Shared Memory 的串行访问降级 | **Shared Memory** (L1) |
-| `03_async_copy/async_copy.cu` | `sync_copy`、`async_pipeline` | 消除数据搬运时的计算单元闲置等待 | **Global ↔ Shared** |
+| `02_bank_conflict/bank_conflict.cu` | `no_bank_conflict`、`with_bank_conflict`<br>`padded_no_conflict`、`analyze_bank_patterns` | 打破 Shared Memory 的串行访问降级 | **Shared Memory** (L1) |
+| `03_async_copy/async_copy.cu` | `sync_copy_kernel`、`async_copy_kernel`、`pipeline_kernel` | 消除数据搬运时的计算单元闲置等待 | **Global ↔ Shared** |
 
 ---
 
@@ -82,32 +82,48 @@ graph TD
 
 ## 四、关键源码逐行解剖
 
-### Ampere 架构异步流水线核心（来自 `async_copy.cu`）
+### Ampere 架构异步流水线核心（来自 `async_copy.cu` 的 `pipeline_kernel`）
 
 ```cpp
-#include <cuda_pipeline.h>
+#include <cuda/pipeline>
 
-// 分片定义：假设有 3 个流水线阶段(Stages)
-__shared__ float smem[3][BLOCK_SIZE];
+// 分片定义：3 个流水线阶段 (STAGES=3)
+__shared__ float shared[STAGES][ASYNC_TILE];
 
-for (int i = 0; i < num_tiles; ++i) {
-    // 1. 发起从 Global 到 Shared 的异步 DMA 拷贝 (直接塞入阶段索引区)
-    cuda::memcpy_async(smem[i % 3], &global_in[i * BLOCK_SIZE], sizeof(float) * BLOCK_SIZE);
-    
-    // 2. 提交拷贝任务到当前流水线组
-    cuda::pipeline_commit();
+cuda::pipeline<cuda::thread_scope_thread> pipe = cuda::make_pipeline();
 
-    // 3. 等待最老的一个组（i - 2）完成拷贝
-    cuda::pipeline_wait_prior<2>(); // 保证至少有两个组正在飞
-
-    // 4. 对已经就绪的 smem 取数据进行密集计算
-    if (i >= 2) {
-        compute(smem[(i - 2) % 3]);
+// 预热流水线：填充 STAGES-1 个阶段
+for (int s = 0; s < STAGES - 1; ++s) {
+    if (current_tile < total_tiles) {
+        int gid = current_tile * items_per_block + tid;
+        pipe.producer_acquire();
+        if (gid < n) {
+            cuda::memcpy_async(&shared[s][tid], &input[gid], sizeof(float), pipe);
+        }
+        pipe.producer_commit();
+        current_tile += total_blocks;
     }
+}
+
+// 主循环：加载与计算交替进行
+for (; compute_tile < total_tiles; compute_tile += total_blocks) {
+    // 发起下一个 tile 的异步加载
+    pipe.producer_acquire();
+    cuda::memcpy_async(&shared[load_stage][tid], &input[gid], sizeof(float), pipe);
+    pipe.producer_commit();
+    
+    // 等待当前计算阶段的数据就绪
+    pipe.consumer_wait();
+    block.sync();
+    
+    // 对已就绪的 shared 数据执行计算
+    output[compute_gid] = shared[compute_stage][tid] * 2.0f;
+    
+    pipe.consumer_release();
 }
 ```
 
-**底层发生了什么**：调用 `memcpy_async` 对应着底层的 `cp.async` 汇编指令，它将绕过极其珍贵且有限的 L1 寄存器堆，直接利用 L2 -> Shared 旁路。同时，计算单元（执行 `compute`）和存储控制单元（执行 `cp.async`）实现了真正的硬件级物理重叠。
+**底层发生了什么**：`cuda::memcpy_async` 对应底层的 `cp.async` 汇编指令，绕过寄存器堆直接利用 L2 → Shared 旁路。源码通过 `cuda::pipeline` 的 `producer_acquire/commit` 和 `consumer_wait/release` 四步协议管理多阶段流水线，使计算单元和存储控制单元实现真正的硬件级物理重叠。
 
 ---
 
@@ -136,7 +152,7 @@ for (int i = 0; i < num_tiles; ++i) {
 
 **分析**：人为构造的跨步 32 访问触发了最严重的 32-way Bank Conflict（所有 32 个线程的请求同时挤入 Bank 0），带宽相比无冲突下降了近 20%。仅仅通过在代码中加入 `+1` 的空间 Padding，带宽重回 826 GB/s，轻松白捡 10% 以上的性能提升。
 
-### 3. Asnyc Copy 异步隐藏（`async_copy`，256 MB，100 次平均）
+### 3. Async Copy 异步隐藏（`async_copy`，256 MB，100 次平均）
 
 | Pipeline 等级 | Kernel 时间 | GPU 有效读写带宽 |
 |-------------|------------|----------------|

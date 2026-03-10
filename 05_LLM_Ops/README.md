@@ -8,9 +8,9 @@
 |------|------------|---------|
 | `01_softmax/softmax.cu` | `naive_softmax`、`online_softmax`、`warp_reduce_softmax`、`warp_per_row_softmax` | 注意力权重归一化 |
 | `02_layernorm/layernorm.cu` | `naive_layernorm`、`welford_layernorm`、`warp_reduce_layernorm`、`warp_per_row_layernorm` | Transformer 层归一化 |
-| `03_flash_attention/flash_attention.cu` | `naive_attention`、`flash_attention_v1`、`flash_attention_v3` | 注意力计算（内存高效版）|
-| `04_rope/rope.cu` | `naive_rope`、`vectorized_rope` | 旋转位置编码 |
-| `05_rmsnorm/rmsnorm.cu` | `naive_rmsnorm`、`warp_rmsnorm` | Llama 系列归一化 |
+| `03_flash_attention/flash_attention.cu` | `naive_bmm_qk`、`naive_softmax_kernel`、`naive_bmm_pv`、`flash_attention`、`flash_attention_v3` | 注意力计算（内存高效版）|
+| `04_rope/rope.cu` | `rope_naive`、`rope_vectorized` | 旋转位置编码 |
+| `05_rmsnorm/rmsnorm.cu` | `rmsnorm_naive`、`rmsnorm_warp` | Llama 系列归一化 |
 
 ---
 
@@ -144,7 +144,7 @@ output[row * seq_len + tid] = exp_val / sum_val;
 |------|------------|------------|----------------------|
 | CPU 参考 | 6813.06 ms | — | 1× |
 | Naive（全矩阵）| 6.60 ms | 128 MB | — |
-| Flash Attention V1 | 9.58 ms | $\mathcal{O}(N)$ | — |
+| Flash Attention（分块 V1）| 9.58 ms | $\mathcal{O}(N)$ | — |
 | **Flash Attention V3（宏块+向量化）** | **5.33 ms** | **$\mathcal{O}(N)$** | **1279.17×** |
 
 ### 4. RMSNorm（Tokens=2048, Hidden=4096，50 次平均）
@@ -171,7 +171,7 @@ xychart-beta
 
 **关键洞察**：
 
-- **Flash Attention V1 反比 Naive 慢**：V1 实现中分块粒度较小（BR=BC=32），重计算和分块协调的开销在短序列下超过了内存节省带来的收益；V3 通过宏块扩大和向量化解决了此问题，以 5.33ms 超过 Naive 的 6.60ms。
+- **Flash Attention 分块 V1 反比 Naive 慢**：V1 实现中分块粒度较小（BR=BC=32），重计算和分块协调的开销在短序列下超过了内存节省带来的收益；V3 通过宏块扩大和向量化解决了此问题，以 5.33ms 超过 Naive 的 6.60ms。
 - **RMSNorm Warp vs Naive 12.33×**：Naive 每行仅 1 条线程，大量 SM 计算单元空转；Warp 版每行 256 线程并行归约，SM 利用率提升超过一个数量级。
 
 ---

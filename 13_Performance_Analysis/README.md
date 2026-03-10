@@ -8,8 +8,8 @@
 
 | 文件 | 核心分析模型 | 解决的问题 | 适用场景 |
 |------|-------------|-----------|---------|
-| `02_roofline/roofline.cu` | **Roofline 理论模型** | "我的算子还能再快吗？瓶颈在算还是存？" | 算子理论上限评估、优化方向定调 |
 | `01_occupancy/occupancy.cu` | **Occupancy 占用率陷阱** | "为什么要满载 SM？满载真的最快吗？" | Block/Grid 维度设计、寄存器溢出排查 |
+| `02_roofline/roofline.cu` | **Roofline 理论模型** | "我的算子还能再快吗？瓶颈在算还是存？" | 算子理论上限评估、优化方向定调 |
 | `03_nsight_profiling/nsight_profiling.cu` | **Nsight 工具链实战** | "为什么跑不满理论带宽？L1 Cache 命中了多少？" | 寻找具体性能 Bug（如非合并访存） |
 
 ---
@@ -71,33 +71,43 @@ graph TD
 
 ## 四、关键源码逐行解剖
 
-### Occupancy 极限反直觉验证（来自 `occupancy.cu`）
+### Occupancy 可配置 Kernel 与 ILP 验证（来自 `occupancy.cu`）
 
 ```cpp
-// 测试配置 3: 低 Occupancy + 终极指令级并行 (ILP)
-// Block 内仅 64 个线程, 但每个线程吃力地卷 16 个数据 (展开循环)
-__global__ void ilp_bound_kernel(const float* in, float* out, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    // 巨大的局部寄存器占用，保证编译器不会生成循环而直接生成 16 组内存流水
-    float reg[16];
+// 模板参数化的 Kernel：通过 BLOCK_SIZE 和 ITEMS_PER_THREAD 调控 Occupancy 与 ILP
+// 以 <64, 16> 实例化时，Block 仅 64 线程（低 Occupancy），但每线程处理 16 个元素（高 ILP）
+template<int BLOCK_SIZE, int ITEMS_PER_THREAD>
+__global__ void configurable_kernel(CPFloat input, PFloat output, CInt n) {
+    float items[ITEMS_PER_THREAD];
+    
+    int base_idx = blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD;
     
     #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        if (idx + i * stride < N)
-            reg[i] = in[idx + i * stride]; // 异步发出 16 把装载枪
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int idx = base_idx + i * BLOCK_SIZE + threadIdx.x;
+        if (idx < n) {
+            items[i] = input[idx];
+        } else {
+            items[i] = 0.0f;
+        }
     }
-
+    
     #pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        if (idx + i * stride < N)
-            out[idx + i * stride] = reg[i] * 2.0f;
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        items[i] *= 2.0f;
+    }
+    
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int idx = base_idx + i * BLOCK_SIZE + threadIdx.x;
+        if (idx < n) {
+            output[idx] = items[i];
+        }
     }
 }
 ```
 
-这段看似让 SM 严重挨饿（线程极少，占用率极低）的代码，实际上由于单个线程内堆叠了密集的无图依赖访存（ILP），完美掩盖了延迟。
+当以 `configurable_kernel<64, 16>` 实例化时，看似让 SM 严重挨饿（仅 64 线程/Block，占用率极低），但由于 `ITEMS_PER_THREAD=16` 导致单个线程内堆叠了 16 组无数据依赖的独立内存访问（ILP），`#pragma unroll` 使编译器将循环完全展开为连续的载入/存储指令流，完美掩盖了内存延迟。
 
 ---
 

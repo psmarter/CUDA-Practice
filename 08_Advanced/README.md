@@ -8,8 +8,8 @@
 
 | 文件 | 核心技术 | 优化目标 | 适用场景 |
 |------|----------|---------|---------|
-| `02_multi_stream/multi_stream.cu` | **Multi-Stream 并发** | 掩盖 H2D/D2H PCIe 传输延迟 | 数据流水线、音视频处理 |
 | `01_cuda_graphs/cuda_graphs.cu` | **CUDA Graphs 计算图** | 消除 CPU 端繁重的 Kernel 启动开销 | 极短耗时 Kernel 密集循环（如 GNN、小模型推断） |
+| `02_multi_stream/multi_stream.cu` | **Multi-Stream 并发** | 掩盖 H2D/D2H PCIe 传输延迟 | 数据流水线、音视频处理 |
 | `03_pytorch_extension/pytorch_extension.cu` | **C++ / pybind11 扩展** | 打通框架层，消除 Python 解释器墙 | 自定义算子接入 PyTorch（如 Swish 激活） |
 
 ---
@@ -87,20 +87,28 @@ graph TD
 
 ```cpp
 // 关键前提：必须分配 Pinned Memory（锁页内存），使 DMA 控制器能不经 CPU 强制搬运
-cudaHostAlloc((void**)&h_A, bytes, cudaHostAllocDefault);
+cudaMallocHost((void**)&h_A, size_io);
+cudaMallocHost((void**)&h_B, size_io);
 
-// 循环分发给不同 Stream
-for (int i = 0; i < NUM_STREAMS; ++i) {
-    int offset = i * streamSize;
-    
-    // 异步拷贝 H2D (传入具体流 stream[i])
-    cudaMemcpyAsync(&d_A[offset], &h_A[offset], streamBytes, cudaMemcpyHostToDevice, streams[i]);
-    
-    // 异步 Kernel 启动 (指定 stream[i])
-    compute_kernel<<<grid, block, 0, streams[i]>>>(&d_A[offset], &d_out[offset], streamSize);
-    
-    // 异步拷贝 D2H
-    cudaMemcpyAsync(&h_out[offset], &d_out[offset], streamBytes, cudaMemcpyDeviceToHost, streams[i]);
+CInt chunk_size = cdiv(n, num_streams);
+
+// 循环分发给不同 Stream：切块数据，交错发射 Async 拷贝和 Kernel
+for (int i = 0; i < num_streams; ++i) {
+    CInt offset = i * chunk_size;
+    CInt current_chunk = min(chunk_size, n - offset);
+    CSize current_bytes = current_chunk * FSIZE;
+
+    if (current_chunk > 0) {
+        // 异步拷贝 H2D：A 和 B 两路输入 (传入具体流 streams[i])
+        cudaMemcpyAsync(d_A + offset, h_A + offset, current_bytes, cudaMemcpyHostToDevice, streams[i]);
+        cudaMemcpyAsync(d_B + offset, h_B + offset, current_bytes, cudaMemcpyHostToDevice, streams[i]);
+        
+        // 异步 Kernel 启动 (指定 streams[i])：A * sin(B) + B * cos(A)
+        kernel<<<grid, block, 0, streams[i]>>>(d_A + offset, d_B + offset, d_C + offset, current_chunk);
+        
+        // 异步拷贝 D2H
+        cudaMemcpyAsync(h_C + offset, d_C + offset, current_bytes, cudaMemcpyDeviceToHost, streams[i]);
+    }
 }
 
 // 最后等待系统静默

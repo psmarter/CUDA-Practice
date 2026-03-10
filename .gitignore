@@ -17,6 +17,7 @@ out/
 .vscode/
 *.user
 *.suo
+.idea/
 
 # CUDA 编译产物
 *.cubin
