@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**经典算子与并发（L2）**阶段。前缀和（Prefix Sum / Scan）是比归约更复杂的并行原语：它不仅要折叠数据，还必须保存每一个中间状态。前缀和是流压缩（Stream Compaction）、基数排序（Radix Sort）、稀疏矩阵运算的基础组件。
+本子项目属于 CUDA-Practice 学习体系的 **经典算子与并发（L2）** 阶段。前缀和（Prefix Sum / Scan）是比归约更复杂的并行原语：它不仅要折叠数据，还必须保存每一个中间状态。前缀和是流压缩（Stream Compaction）、基数排序（Radix Sort）、稀疏矩阵运算的基础组件。
 
 本模块探讨两种截然不同的并行设计哲学，以及如何将单 Block 算法推广到超大规模：
 
@@ -15,7 +15,7 @@
 
 ## 二、原理推导与数学表达
 
-**前缀和（Inclusive Scan）**的数学定义：
+**前缀和（Inclusive Scan）** 的数学定义：
 
 $$y_i = \sum_{j=0}^{i} x_j \quad \text{（Inclusive，包含自身）}$$
 
@@ -138,7 +138,7 @@ __syncthreads(); // ③ 确保写入完成，下一轮 stride 才可继续
 | **GPU 三遍分段扫描** | **0.0221 ms** | **378.77 GB/s** | **80.69×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "前缀和不同规模 Kernel 耗时（ms，越低越好）"
   x-axis ["KS(1K)", "BK(1K)", "Coarse(4K)", "Seg(4K)", "Seg(1M)"]
   y-axis "时间 (ms)" 0 --> 0.025

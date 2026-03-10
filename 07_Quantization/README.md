@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**部署与量化推理（L3）**阶段。随着大模型参数量激增，FP32 计算已成为显存容量和带宽的绝对瓶颈。量化技术（Quantization）通过将高精度浮点数压缩为低精度格式（FP16/INT8），以极小的精度损失换取显著提升的吞吐量和内存效率。
+本子项目属于 CUDA-Practice 学习体系的 **部署与量化推理（L3）** 阶段。随着大模型参数量激增，FP32 计算已成为显存容量和带宽的绝对瓶颈。量化技术（Quantization）通过将高精度浮点数压缩为低精度格式（FP16/INT8），以极小的精度损失换取显著提升的吞吐量和内存效率。
 
 三个源文件涵盖了量化的核心链路：
 
@@ -21,7 +21,9 @@
 将 FP32 数据无符号地映射到 INT8 空间 $[-127, 127]$：
 
 $$s = \frac{127}{\max(|X|)}$$
+
 $$X_{int8} = \text{round}(s \cdot X_{fp32})$$
+
 $$X_{dequantized} = \frac{X_{int8}}{s}$$
 
 - **Per-Tensor**：整个张量共享一个 Scale $s$，计算最快但受异常点（Outliers）影响极大。
@@ -155,7 +157,7 @@ for (int i = 0; i < N; i += 4) {
 | **Vectorized `dp4a` (int4)** | **0.19 ms** | **11.31 TOPS** | **2.14×** |
 
 ```mermaid
-xychart
+xychart-beta
   title "不同精度 GEMM 耗时对比 (ms，越低越好，1024 规模)"
   x-axis ["Naive FP32", "Naive INT8", "Tiled FP16", "dp4a INT8", "Vec FP16", "Vec dp4a"]
   y-axis "时间 (ms)" 0 --> 0.45

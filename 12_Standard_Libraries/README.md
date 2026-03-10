@@ -2,7 +2,7 @@
 
 ## 一、全景导览与学习目标
 
-本子项目属于 CUDA-Practice 学习体系的**成熟生态与工程实践（L2-L3）**阶段。在实际工业界项目中，"不要重复造轮子"是第一准则。NVIDIA 提供了由顶尖架构师用 PTX/SASS 汇编级优化的标准库群，它们的性能不仅远超大多数手写 CUDA Kernel，还能自动适配每一代新架构的底层细节。
+本子项目属于 CUDA-Practice 学习体系的 **成熟生态与工程实践（L2-L3）** 阶段。在实际工业界项目中，"不要重复造轮子"是第一准则。NVIDIA 提供了由顶尖架构师用 PTX/SASS 汇编级优化的标准库群，它们的性能不仅远超大多数手写 CUDA Kernel，还能自动适配每一代新架构的底层细节。
 
 本模块选取了科学计算与数据处理中最核心的三把利器：
 
@@ -138,7 +138,7 @@ thrust::transform(
 | `transform` (SAXPY) | 29.20 ms (for 循环) | 0.13 ms | **222×** | 849.73 GB/s |
 
 ```mermaid
-xychart
+xychart-beta
   title "千万规模操作 CPU (STL) vs GPU (Thrust) 耗时对比 (对数比例感知)"
   x-axis ["Sort (CPU)", "Sort (GPU)", "Reduce (CPU)", "Reduce (GPU)"]
   y-axis "耗时 (ms)" 0 --> 2200
