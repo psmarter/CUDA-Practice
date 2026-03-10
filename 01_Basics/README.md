@@ -22,7 +22,7 @@
 
 $$\mathbf{C}_i = \mathbf{A}_i + \mathbf{B}_i, \quad \forall i \in [0, N-1]$$
 
-GPU 端带宽利用率是唯一关键指标。理论有效带宽 = $\frac{3 \cdot N \cdot \text{sizeof(float)}}{\text{kernel\textunderscore{}time}}$（读 A、读 B、写 C 三次 DRAM 访问）。
+GPU 端带宽利用率是唯一关键指标。理论有效带宽 = $\frac{3 \cdot N \cdot \text{sizeof(float)}}{\text{kernel\_time}}$（读 A、读 B、写 C 三次 DRAM 访问）。
 
 ### 2. 朴素矩阵乘法（Naive GEMM）
 
@@ -80,7 +80,7 @@ graph TD
 |------|---------|--------------|
 | Grid | `((K+31)/32, (M+31)/32)` | 将整个 $C$ 矩阵切分为 $32 \times 32$ 的块 |
 | Block | `dim3(32, 32)`，1024 线程 | 计算 $C$ 的一个 $32 \times 32$ 子矩阵 |
-| Thread `(tx,ty)` | 唯一编号 | **加载阶段**：加载 `tile_a[ty][tx]` 和 `tile_b[ty][tx]`；**计算阶段**：累加 $\sum_i \text{tile\textunderscore{}a}[ty][i] \cdot \text{tile\textunderscore{}b}[i][tx]$ |
+| Thread `(tx,ty)` | 唯一编号 | **加载阶段**：加载 `tile_a[ty][tx]` 和 `tile_b[ty][tx]`；**计算阶段**：累加 $\sum_i \text{tile\_a}[ty][i] \cdot \text{tile\_b}[i][tx]$ |
 
 ---
 
@@ -146,7 +146,7 @@ xychart-beta
 
 **分析**：
 
-- Tiled GEMM 相比 Naive 快约 **1.32×**（0.41 ms → 0.31 ms），对应 Shared Memory 减少了 32× 的 Global Memory 读取次数（$\text{TILE\textunderscore{}WIDTH} = 32$）。
+- Tiled GEMM 相比 Naive 快约 **1.32×**（0.41 ms → 0.31 ms），对应 Shared Memory 减少了 32× 的 Global Memory 读取次数（$\text{TILE\_WIDTH} = 32$）。
 - 6.89 TFLOPS 的实际性能约为 RTX 4090 FP32 理论峰值（82.6 TFLOPS）的 **8.3%**——瓶颈仍主要在内存访问而非算术运算，这为后续 Register Tiling（`04_GEMM_Optimization`）的引入埋下伏笔。
 
 ---
