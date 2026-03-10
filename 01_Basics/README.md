@@ -22,7 +22,7 @@
 
 $$\mathbf{C}_i = \mathbf{A}_i + \mathbf{B}_i, \quad \forall i \in [0, N-1]$$
 
-GPU 端带宽利用率是唯一关键指标。理论有效带宽 = $\frac{3 \cdot N \cdot \text{sizeof(float)}}{\text{kernel\_time}}$（读 A、读 B、写 C 三次 DRAM 访问）。
+GPU 端带宽利用率是唯一关键指标。理论有效带宽 = $\frac{3 \cdot N \cdot \text{sizeof(float)}}{\text{kernel-time}}$（读 A、读 B、写 C 三次 DRAM 访问）。
 
 ### 2. 朴素矩阵乘法（Naive GEMM）
 
