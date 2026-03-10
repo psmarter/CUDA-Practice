@@ -22,7 +22,7 @@
 
 多流技术将大块数据均分为 $N$ 份，每份分配给独立的异步流。利用现代 GPU 独立的 Copy Engine 和 Kernel Engine，实现 **Compute** 与 **Transfer** 相互掩盖：
 
-$$T_{\text{async}} \approx \text{MemCopy}_{\text{H2D\textunderscore{}segment}} + \max(T_{\text{H2D\textunderscore{}segment}}, T_{\text{compute}}, T_{\text{D2H\textunderscore{}segment}}) \times N + \text{MemCopy}_{\text{D2H\textunderscore{}segment}}$$
+$$T_{\text{async}} \approx \text{MemCopy}_{\text{H2D\_segment}} + \max(T_{\text{H2D\_segment}}, T_{\text{compute}}, T_{\text{D2H\_segment}}) \times N + \text{MemCopy}_{\text{D2H\_segment}}$$
 
 ### 2. CUDA Graphs 发射降维
 
