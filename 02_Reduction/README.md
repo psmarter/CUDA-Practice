@@ -34,7 +34,7 @@ $$V^{(d+1)}_i = V^{(d)}_i \oplus V^{(d)}_{i + 2^d}, \quad \text{stride} = 2^D, 2
 
 3. **Thread Coarsening（粗化版）**：每线程在进入并行归约前，串行地在寄存器中预累加 `COARSE_FACTOR×2 = 8` 个元素。数学上等价于：
 
-   $$\text{local\_sum} = \sum_{j=0}^{2 \cdot \text{COARSE} - 1} x_{tid + j \cdot \text{BLOCK\_SIZE}}$$
+   $$\text{local\textunderscore{}sum} = \sum_{j=0}^{2 \cdot \text{COARSE} - 1} x_{tid + j \cdot \text{BLOCK\textunderscore{}SIZE}}$$
 
    大幅削减了启动的 Block 总数和 `__syncthreads()` 调用次数。
 

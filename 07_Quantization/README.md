@@ -21,7 +21,9 @@
 将 FP32 数据无符号地映射到 INT8 空间 $[-127, 127]$：
 
 $$s = \frac{127}{\max(|X|)}$$
+
 $$X_{int8} = \text{round}(s \cdot X_{fp32})$$
+
 $$X_{dequantized} = \frac{X_{int8}}{s}$$
 
 - **Per-Tensor**：整个张量共享一个 Scale $s$，计算最快但受异常点（Outliers）影响极大。
