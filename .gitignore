@@ -12,6 +12,7 @@ out/
 *.so
 *.dll
 Reference/
+CLAUDE.md
 
 # IDE 文件
 .vs/
@@ -19,6 +20,7 @@ Reference/
 *.user
 *.suo
 .idea/
+.claude/
 
 # CUDA 编译产物
 *.cubin
