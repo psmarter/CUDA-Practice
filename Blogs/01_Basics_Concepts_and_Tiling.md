@@ -1,107 +1,42 @@
 ---
-title: "01_Basics：从 Vector Add 到 Tiled GEMM——GPU 编程的第一课，关于带宽和数据复用"
+title: "01_Basics：从 Vector Add 到 Tiled GEMM——带宽墙与数据复用"
 date: 2026-03-10 22:00:00
-tags: [CUDA, 高性能计算, Shared Memory, Tiling, Memory Bound, Coalesced Access]
+tags: [CUDA, 高性能计算, Shared Memory, Tiling, Memory Bound, Roofline, GEMM]
 categories: 深度学习系统架构
 ---
 
-> 📖 **推荐后续**：04_GEMM_Optimization（寄存器 Tiling 进阶）、10_Memory_Optimization（合并访存与 Bank Conflict 详述）
+## 本文目标
 
-## 为什么所有的教程都从向量加法开始？
+读完本文，你将能够：
 
-几乎所有的 GPU 编程教程第一课都是向量加法 `$C[i] = A[i] + B[i]$`。这不是因为它在算法层面上有什么深度，恰恰相反，因为它纯粹是搬砖——而这正好暴露了 GPU 编程最初也是最底层的痛点。
+- 理解 GPU 的带宽墙：为什么算力 82.6 TFLOPS 的 RTX 4090 在 Vector Add 上只能发挥不到 0.1% 的计算能力
+- 用 Roofline 模型判断一个 Kernel 是 Memory Bound 还是 Compute Bound
+- 理解 Shared Memory Tiling 如何将 GEMM 的全局访存量降低 $T$ 倍
+- 实现一个 Tiled GEMM 并理解两次 `__syncthreads()` 的必要性
 
-想象一下一块 RTX 4090，FP32 理论算力高达 82.6 TFLOPS（每秒 82.6 万亿次浮点运算）。但它的显存总线带宽只有约 1008 GB/s。简单算笔账：算力配不上带宽。为了让计算核心不至于饿着肚子等数据，你每从显存里抠出 1 个字节，就必须给它安排大约 82 次运算（这被称为 Roofline 模型的性能拐点，即 $\frac{82.6 \text{ TFLOPS}}{1008 \text{ GB/s}} \approx 81.9 \text{ FLOP/Byte}$）。
+## 对应代码路径
 
-而在向量加法里，核心代码 `C[idx] = A[idx] + B[idx]` 的开销极其透明：每个元素我们需要读 `A`，读 `B`，算完写回 `C`，总共搬运了 $3 \times 4 = 12$ 个字节。但这庞大的 12 字节只能换来区区 1 次加法（1 FLOP）。
-由此得到它的算术强度（Arithmetic Intensity）：
-$$I = \frac{\text{1 FLOP}}{\text{12 Bytes}} \approx 0.083 \text{ FLOP/Byte}$$
+> **硬件环境**：NVIDIA RTX 4090 (Ada Lovelace, sm_89)
+> 128 SMs | FP32 82.6 TFLOPS | HBM 1008 GB/s | L2 72 MB | Roofline 拐点 81.9 FLOP/Byte
 
-这意味着什么？意味着它的性能天花板被显存带宽死死卡住。无论 4090 的算力再涨十倍还是八倍，这种纯粹的 Memory Bound（访存瓶颈）算子的执行时间都不会有什么变化——因为瓶颈根本不在计算。
-
-所以，这第一课我们要讨论的问题不仅是并行，更是**如何突破显存带来的带宽墙**。
-
----
-
-## Tiling：把 $O(N^3)$ 的冗余访存砍下来
-
-面对朴素的矩阵乘法，情况有了一线生机。
-
-计算目标非常明确：
-$$C_{i,j} = \sum_{k=0}^{N-1} A_{i,k} \cdot B_{k,j}$$
-
-在 Naive 版本的实现中，每个线程独立计算 $C$ 的一个元素。为了算这单单一个点，它必须去缓慢的 Global Memory（显存）里老老实实地取出 $A$ 的一整行（$N$ 个 float）和 $B$ 的一整列（$N$ 个 float）。
-当 $N = 1024$ 时，整个矩阵乘法算下来，总访问量大约是 8 GB。这其中充满了没必要的重复劳动：相邻两个线程在计算 $C_{i,j}$ 和 $C_{i,j+1}$ 时，明明都需要同一行 $A_{i,:}$，但它们谁也不理谁，各自去显存里取了一遍。
-
-既然如此，Tiling（分块）策略的思路非常自然：**别各自去取了，咱们凑点钱建个片上缓存。**
-
-我们将 $K$ 维度的大循环按照步长 $T$ 切成了若干个小段：
-$$C_{i,j} = \sum_{t=0}^{\lceil N/T \rceil - 1} \left( \sum_{k=0}^{T-1} A_{i,\; t \cdot T + k} \cdot B_{t \cdot T + k,\; j} \right)$$
-
-每一小段计算只需要一个 $T \times T$ 的子块数据。我们将这组子块先批量加载到距离计算单元极近的 Shared Memory（也就是片上 SRAM）中，让一个 Block 内的 $T^2$ 个线程共同复用它。
-
-我们来重算一下以 $N = 1024, T = 32$ 为例的访存成本：
-
-- **Naive GEMM**：每个线程各独立扫过一遍所需的行与列，各自读 $2 \times 1024$ 次全局显存，共 $1024^2$ 个线程独立进行。这相当于产生了一次总读取量达到 $= 2 \times 1024^3 \times 4$ 字节 $\approx 8$ GB 的海啸级请求。
-- **Tiled GEMM**：我们将 $1024 \times 1024$ 的全图划分为一个个 $32 \times 32$ 的小战区。在每个 Tile 阶段，整个 Block（$32 \times 32$ 个线程）协作发力，合伙加载 $2 \times 32^2$ 个 float 到共享 SRAM 中。每位线程在此阶段只负责搬运 2 个数字（比上面的 $2 \times 1024$ 次舒服太多）。完成这个点乘累加共需要 $1024/32=32$ 个 Tile 阶段，全图有 $(1024/32)^2 = 1024$ 个独立的 Block 同时开工。最终全图的总读取量 $= 1024 \times 32 \times (2 \times 32^2 \times 4) \text{ 字节} = 256$ MB。
-
-看到了吗？全局访存量从 8 GB 直接锐减到了 256 MB，缩小了整整 32 倍——而这个 32 倍的红利恰好就等于我们设定的 Tile 尺寸 $T$。这就是 GPU 中“用一小块片上面积的开销，换取计算体积数十倍提升”的艺术。
+| 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
+|--------|-------------|----------|----------|
+| `01_Basics/01_vector_add/vector_add.cu` | `vector_add` | Grid-Stride Loop，合并访存 | N = 67,108,864 (64M) |
+| `01_Basics/02_matrix_mul_naive/matrix_mul_naive.cu` | `matrix_mul_naive` | 2D Grid，每线程一个输出元素 | M=N=K=1024 |
+| `01_Basics/03_matrix_mul_tiled/matrix_mul_tiled.cu` | `matrix_mul_tiled` | Shared Memory Tiling，`__syncthreads()` | M=N=K=1024 |
 
 ---
 
-## 建立存储层级地图
+## 三个实现分别做了什么
 
-我们刚刚提到了 Shared Memory 和 Global Memory，在正式看代码之前，我们需要对 RTX 4090 的各级存储延迟有个量化直觉：
+### 1. Vector Add：带宽压榨的基准
 
-| 存储层级 | 硬件位置 | 容量 | 响应延迟 | 预估带宽量级 |
-| :--- | :--- | :--- | :--- | :--- |
-| 寄存器 (Registers) | 紧贴 ALU | 每线程最多 255 个 32-bit | ~1 cycle | 数十 TB/s |
-| 共享内存 (Shared Memory) | 片上 SRAM | 每 SM 约 48–100 KB | ~20-30 cycles | 数 TB/s |
-| L1 数据缓存 (L1 Cache) | 片上 SRAM（与 Shared Memory 共用物理池） | 每 SM 128 KB（可配置分割） | ~30-40 cycles | 数 TB/s |
-| L2 缓存 (L2 Cache) | GPU 芯片内 | 72 MB (4090特色) | ~200 cycles | ~6 TB/s |
-| 全局显存 (Global Memory) | 板载 HBM/GDDR | 24 GB | ~400+ cycles | 1008 GB/s |
+`vector_add` 是最简单的 CUDA Kernel。每个线程计算一个元素 $C_i = A_i + B_i$，线程间没有任何数据依赖。
 
-Tiling 做的事，本质上就是把需要重用的数据手工从那几百个 cycle 的最慢层级（Global Memory）里捞出来，寄存在几十个 cycle 的较快层级（Shared Memory）中。
-
-> **L1 Cache 与 Shared Memory 的区别**：两者共享同一块片上 SRAM 物理资源（RTX 4090 每 SM 共 128 KB），但用途截然不同。Shared Memory 由程序员显式管理（`__shared__` 声明），用于线程间通信和数据复用；L1 Cache 由硬件自动管理，缓存 Global Memory 的最近访问数据。正是因为 Shared Memory 是程序员控制的，它比 L1 Cache 更适合做有规律的数据预取——Tiling 的本质正是把本该由 L1 随机缓存的数据，改由 Shared Memory 有计划地预取，将随机性转化为确定性。
-
-```mermaid
-graph TD
-    classDef gm fill:#f9d0c4,stroke:#333,stroke-width:2px;
-    classDef sm fill:#fcf1c8,stroke:#333,stroke-width:2px;
-    classDef reg fill:#bbf,stroke:#333,stroke-width:2px;
-
-    subgraph "全局显存 (GDDR6X)"
-        A[Matrix A]:::gm
-        B[Matrix B]:::gm
-        C[Matrix C]:::gm
-    end
-
-    subgraph "片上 SRAM (Shared Memory)"
-        SA["tile_a 32×32 (4 KB)"]:::sm
-        SB["tile_b 32×32 (4 KB)"]:::sm
-    end
-
-    subgraph "线程寄存器"
-        R["累加器 value"]:::reg
-    end
-
-    A -- "1024 线程协作加载" --> SA
-    B -- "1024 线程协作加载" --> SB
-    SA -- "低延迟读取" --> R
-    SB --> R
-    R -- "完工后一次写回" --> C
-```
-
----
-
-## 核心代码解剖
-
-### Vector Add：无脑合并访存
-
-既然是纯搬砖，那搬砖的手法就很重要了：
+它的价值不在于算法复杂度，而在于建立一个**纯 Memory Bound 的性能基准**——能否把显存带宽压榨到硬件极限，是衡量 CUDA 工程基本功的第一道标尺。
 
 ```cpp
+// 来源：01_Basics/01_vector_add/vector_add.cu : L5-L10
 __global__ void vector_add(const float* A, const float* B, float* C, const int n) {
     int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx < n) {
@@ -110,15 +45,18 @@ __global__ void vector_add(const float* A, const float* B, float* C, const int n
 }
 ```
 
-代码确实短得不能再短，但 GPU 能跑得飞快靠的是底层的**合并访存（Coalesced Access）**机制：
-`idx` 的分配保证了同一个 Warp（32 个执行同步的线程分组）里发出的访存地址刚好是绝对连续的 128 个字节（32 个 float 的长度）。这就好比 32 个人排好队去仓库拿货，显存控制器可以非常舒服地“一揽子”打个大包发车。仅需 1 个 128-byte 的事务（Transaction），就能同时满足 32 个线程的需求，完美避免了昂贵的零碎读取开销。而边界判断语句 `if (idx < n)` 也绝不会在绝大多数 Warp 里引起控制流发散（Warp Divergence），因为它只会在最后一个没排满的边缘 Block 里发生。
+Kernel 配置使用 256 线程/Block。`idx` 的分配保证同一 Warp（32 个线程）的访存地址连续，硬件可以将 32 个 4-byte 请求合并为一个 128-byte 事务（Coalesced Access）。边界判断 `if (idx < n)` 只在最后一个未满的 Block 中触发，不会引起 Warp Divergence。
 
-### Naive GEMM：不是死于非对称，而是死于运费
+### 2. Naive GEMM：逐元素独立计算
 
-为了看清 Tiling 到底精妙在哪，我们得先看看最直白暴力的 Naive GEMM 解法长什么样：
+`matrix_mul_naive` 直接映射矩阵乘法定义。每个线程负责 $C$ 矩阵的一个输出元素，沿 $K$ 维度遍历做内积：
+
+$$C_{i,j} = \sum_{k=0}^{N-1} A_{i,k} \cdot B_{k,j}$$
 
 ```cpp
-__global__ void matrix_mul_naive(const float* A, const float* B, float* C, int m, int n, int k){
+// 来源：01_Basics/02_matrix_mul_naive/matrix_mul_naive.cu : L8-L18
+__global__ void matrix_mul_naive(const float* A, const float* B, float* C,
+                                  Int m, Int n, Int k) {
     int row = blockDim.y * blockIdx.y + threadIdx.y;
     int col = blockDim.x * blockIdx.x + threadIdx.x;
     if (row < m && col < k) {
@@ -131,134 +69,250 @@ __global__ void matrix_mul_naive(const float* A, const float* B, float* C, int m
 }
 ```
 
-很多人对朴素 GEMM 性能差的直觉是：“肯定是因为没有合并访存”。**这是个常见的误区。**
-仔细分析一下内存访问模式：在一个常用的 2D Block 划分里，线程编号的本质是连续的 `threadIdx.x` 构成同一个 Warp。这意味着 Warp 内的 32 个线程拥有相同的 `row` 和连续递增的 `col`。
+Block 配置为 `dim3(16, 16)`（256 线程）。每个线程需要从 Global Memory 读取 $A$ 的一行（$N$ 个 float）和 $B$ 的一列（$N$ 个 float）。
 
-- 读取 `A[row * n + i]`：这 32 个线程读的是同一个内存地址，硬件会自动触发极其高效的**广播（Broadcast）**机制。
-- 读取 `B[i * k + col]`：这 32 个线程读的是连续的内存地址，完美触发**合并访存（Coalesced Access）**。
+### 3. Tiled GEMM：Shared Memory 数据复用
 
-事实令人惊讶：Naive GEMM 的访存模式其实很优秀。那为什么它还是比 Tiled 版慢得多？
-因为它死于**运费太贵**。
-哪怕硬件再聪明，对于矩阵 `C` 每个元素的计算，你依然实打实地去 Global Memory 跑腿拿了 $2N$ 个数据。整个矩阵算完，总访存量高达 $O(N^3)$。当 $N=1024$ 时，你把这块数据大风刮一般地硬生生搬运了近 **8 GB**。即使都是极其舒服的高效读取，但卡车往返次数太多，总和依然是一个天文数字的延迟。
+`matrix_mul_tiled` 的核心改进是：将 Block 内线程协作加载数据到 Shared Memory（片上 SRAM），在片上完成乘加计算，避免每个线程独立访问 Global Memory。
 
-这恰恰证明了**数据复用**的压倒性地位。访存模式再完美，也救不了重复搬砖带来的物理极限。只有把它拉进 Shared Memory，把复用率提上去，才是真出路。
+Block 配置为 `dim3(32, 32)`（1024 线程，`TILE_WIDTH = 32`）。
 
-### Tiled GEMM：两次不得不等
+---
 
-我们把视线拉回 Tiled 版矩阵乘法的内层循环。这段代码最能说明控制流和数据流的焦灼感：
+## Baseline 与瓶颈分析
+
+### Vector Add 的带宽墙
+
+Vector Add 每个元素读 $A$、读 $B$、写 $C$，搬运 $3 \times 4 = 12$ 字节，但只做 1 次加法。算术强度：
+
+$$I = \frac{1 \text{ FLOP}}{12 \text{ Bytes}} \approx 0.083 \text{ FLOP/Byte} \quad [\text{理论}]$$
+
+RTX 4090 的 Roofline 拐点是 $82.6 \text{ TFLOPS} / 1008 \text{ GB/s} \approx 81.9 \text{ FLOP/Byte}$ [理论]。$0.083$ 距拐点差了近 **1000 倍**，意味着计算单元 99.9% 的时间在等待数据。这是一个典型的 Memory Bound 算子——无论算力如何提升，性能天花板由带宽决定：
+
+$$P_{\max} = 0.083 \times 1008 \text{ GB/s} \approx 83.7 \text{ GFLOPS} \quad [\text{理论}]$$
+
+### Naive GEMM 的访存冗余
+
+Naive GEMM 的访存模式本身是高效的：
+
+- 读 `A[row * n + i]`：Warp 内 32 个线程共享同一 `row`，读取同一地址，触发硬件**广播**
+- 读 `B[i * k + col]`：Warp 内 32 个线程的 `col` 连续递增，触发**合并访存**
+
+访存模式没问题，问题在于**访存总量**。每个线程读取 $2N$ 个 float 来计算一个输出元素，$N^2$ 个线程总共产生 $2N^3$ 次 float 读取。$N=1024$ 时：
+
+$$\text{总访存量} = 2 \times 1024^3 \times 4 \text{ B} \approx 8 \text{ GB} \quad [\text{理论}]$$
+
+相邻线程需要 $A$ 的同一行、$B$ 的相邻列，存在大量重复读取。
+
+---
+
+## 优化思路：Tiling 如何降低访存量
+
+### 核心思想
+
+将 $K$ 维度的大循环按步长 $T$ 切分。每步先由 Block 内所有线程协作加载一个 $T \times T$ 的 $A$ 子块和 $B$ 子块到 Shared Memory，然后在片上完成这一段的乘加。
+
+$$C_{i,j} = \sum_{t=0}^{\lceil N/T \rceil - 1} \sum_{k=0}^{T-1} A_{i,\; tT + k} \cdot B_{tT + k,\; j}$$
+
+### 访存量对比
+
+以 $N = 1024, T = 32$ 为例：
+
+| 版本 | 每 Block 每 Tile 读取量 | Tile 总数 | Block 总数 | 全局总读取量 |
+|------|----------------------|-----------|-----------|-------------|
+| Naive | $2 \times 32 \times 1024 \times 4$ B（每线程独立读整行/列）| 1 | 4096 | ~8 GB [理论] |
+| Tiled | $2 \times 32^2 \times 4$ B（协作加载 tile） | 32 | 1024 | ~256 MB [理论] |
+
+全局访存量降低为 $1/T = 1/32$。
+
+### 存储层级
+
+Tiling 的本质是手工管理数据在存储层级间的搬运：
+
+| 存储层级 | 硬件位置 | 容量 | 延迟 | 带宽量级 |
+|----------|----------|------|------|----------|
+| 寄存器 | ALU 旁 | 每线程 255 × 32-bit | ~1 cycle | 数十 TB/s |
+| Shared Memory | 片上 SRAM | 每 SM 48-100 KB | ~20-30 cycles | 数 TB/s |
+| L2 Cache | 芯片内 | 72 MB | ~200 cycles | ~6 TB/s |
+| Global Memory | 板载 GDDR6X | 24 GB | ~400+ cycles | 1008 GB/s |
+
+Shared Memory 由程序员通过 `__shared__` 显式管理，而 L1/L2 Cache 由硬件自动管理。Tiling 将本该从 Global Memory（~400 cycles）反复读取的数据，预取到 Shared Memory（~20 cycles），将随机缓存命中转化为确定性复用。
+
+---
+
+## 关键代码解释
+
+### Tiled GEMM 的 Shared Memory 装填与同步
 
 ```cpp
+// 来源：01_Basics/03_matrix_mul_tiled/matrix_mul_tiled.cu : L21-L47
 for (int tile = 0; tile < num_tiles; ++tile) {
-    // 1. 协作将数据搬进高速的片上缓存
+    // 协作加载：每线程加载 tile_a 和 tile_b 各一个元素
     int mCol = tile * TILE_WIDTH + tx;
-    if (row < m && mCol < n) tile_a[ty][tx] = a[row * n + mCol];
-    else tile_a[ty][tx] = 0.0f; // 边缘越界补全
+    if (row < m && mCol < n)
+        tile_a[ty][tx] = a[row * n + mCol];
+    else
+        tile_a[ty][tx] = 0.0f;   // 边缘越界补零
 
     int nRow = tile * TILE_WIDTH + ty;
-    if (nRow < n && col < k) tile_b[ty][tx] = b[nRow * k + col];
-    else tile_b[ty][tx] = 0.0f;
+    if (nRow < n && col < k)
+        tile_b[ty][tx] = b[nRow * k + col];
+    else
+        tile_b[ty][tx] = 0.0f;
 
-    __syncthreads(); // ❶ 第一道屏障
+    __syncthreads();  // 屏障 1：确保所有线程加载完毕
 
-    // 2. 纯 SRAM 的乘加狂欢
-    for (int i = 0; i < TILE_WIDTH; ++i) {
+    // 内层循环：纯 Shared Memory 读取，无 Global Memory 访问
+    for (int i = 0; i < TILE_WIDTH; ++i)
         value += tile_a[ty][i] * tile_b[i][tx];
-    }
 
-    __syncthreads(); // ❷ 第二道屏障
+    __syncthreads();  // 屏障 2：确保所有线程计算完毕再加载下一 tile
 }
 ```
 
-请千万注意那两道 `__syncthreads()` 同步指令，它们在物理层面是不可省略的：
+### Block / Thread 映射
 
-- **第一道屏障**保护的是刚才从显存发起的异步加载。如果不等大家齐心协力把所有数据写进 SRAM 就急着开始算，跑得快的线程可能会读到毫无意义的脏数据。
-- **第二道屏障**保护的则是下一次的覆盖。如果有人算得快早早就进入了下一轮大循环，它会直接拿新数据把 SRAM 冲掉，导致算得慢的线程丢掉了这轮本该用的旧数据。这就是典型的 RAW / WAW 数据冒险。
+| 层级 | 配置 | 职责 |
+|------|------|------|
+| Grid | `((K+31)/32, (M+31)/32)` | 覆盖整个 $C$ 矩阵 |
+| Block | `dim3(32, 32)`, 1024 线程 | 计算 $C$ 的一个 $32 \times 32$ 子块 |
+| Thread `(tx, ty)` | — | 加载 `tile_a[ty][tx]` 和 `tile_b[ty][tx]`；累加 $\sum_i \text{tile\_a}[ty][i] \times \text{tile\_b}[i][tx]$ |
 
-用一张极为典型的时序图来看看如果缺少这两道屏障会发生什么灾难：
+### 两次 `__syncthreads()` 的必要性
 
 ```mermaid
 sequenceDiagram
-    participant T0 as 跑得快的线程
-    participant T511 as 跑得慢的线程
+    participant T0 as 线程 0（快）
+    participant T511 as 线程 511（慢）
     participant SRAM as Shared Memory
 
-    Note over T0,T511: 进入加载循环 tile = t
-
+    Note over T0,T511: Tile t：加载阶段
     T0->>SRAM: 写入 tile_a, tile_b 完毕
-    T511->>SRAM: 还在缓慢从 Global Memory 读取...
-
-    Note over T0,T511: ❶ __syncthreads()：必须等最慢的写完再往下走！
+    T511->>SRAM: 仍在从 Global Memory 读取...
+    Note over T0,T511: 屏障 1：等所有线程加载完毕再计算
 
     T0->>T0: value += tile_a × tile_b
     T511->>T511: value += tile_a × tile_b
+    Note over T0,T511: 屏障 2：等所有线程计算完毕再加载下一 tile
 
-    Note over T0,T511: ❷ __syncthreads()：必须等最慢的算完再换下一块！
+    Note over T0,T511: Tile t+1：覆写 SRAM
+```
 
-    Note over T0,T511: 准备覆写 SRAM 进入 tile = t+1
+- **屏障 1** 防止读未就绪数据：快线程开始计算时，慢线程可能尚未完成加载
+- **屏障 2** 防止数据竞争：快线程进入下一 tile 覆写 SRAM 时，慢线程可能还在用当前 tile 的数据
+
+省去任一屏障都会导致**不可确定性重现**的计算错误。
+
+### 数据流总览
+
+```mermaid
+graph TD
+    classDef gm fill:#f9d0c4,stroke:#333,stroke-width:2px;
+    classDef sm fill:#fcf1c8,stroke:#333,stroke-width:2px;
+    classDef reg fill:#bbf,stroke:#333,stroke-width:2px;
+
+    subgraph "Global Memory (GDDR6X)"
+        A[Matrix A]:::gm
+        B[Matrix B]:::gm
+        C[Matrix C]:::gm
+    end
+
+    subgraph "Shared Memory (片上 SRAM)"
+        SA["tile_a 32x32 (4 KB)"]:::sm
+        SB["tile_b 32x32 (4 KB)"]:::sm
+    end
+
+    subgraph "寄存器"
+        R["累加器 value"]:::reg
+    end
+
+    A -- "1024 线程协作加载" --> SA
+    B -- "1024 线程协作加载" --> SB
+    SA -- "低延迟读取 (~20 cycles)" --> R
+    SB --> R
+    R -- "完成后一次写回" --> C
 ```
 
 ---
 
-## 真实性能实测：理论 vs 现实
+## 结果与边界
 
-所有的优化逻辑最终都要上刑场见真章。以下实测数字全部来自一块 RTX 4090（sm_89）的真实日志，使用 C++17 标准和 nvcc -O3 编译。
+### Vector Add 性能（N = 67,108,864，100 次迭代取平均）
 
-### 搬砖巅峰：Vector Add（规模 64M 元素，100 次迭代）
+> 数据来源：`Results/01_Basics.md` 原始日志
 
-| 执行版本 | Kernel 时耗 | 等效有效带宽 | vs 单核 CPU 加速 |
-| :--- | :--- | :--- | :--- |
-| CPU 参考 | 156.45 ms | — | 1× |
-| **GPU (256线程/Block)** | **0.86 ms** | **932.81 GB/s** | **181×** |
+| 版本 | Kernel 耗时 | 有效带宽 | vs CPU | 数据性质 |
+|------|------------|---------|--------|----------|
+| CPU 串行 | 156.45 ms | — | 1x | [实测] |
+| **GPU Vector Add** | **0.86 ms** | **932.81 GB/s** | **181x** | [实测] |
 
-总搬运量 = $3 \times 67,108,864 \times 4\text{B} = 768$ MB。
-在 0.86 ms 的耗时下，我们实现了约 **932.8 GB/s** 的有效带宽传输，跑到了 4090 理论峰值（~1008 GB/s）的 `92.5%`。多出来的零头不过是 Kernel 下发的极小固定开销，我们确确实实把硬件总线压迫到了极限。
+总搬运量 = $3 \times 67{,}108{,}864 \times 4 \text{ B} = 768 \text{ MB}$ [理论]。
+有效带宽 932.81 GB/s 达到 RTX 4090 理论峰值 1008 GB/s 的 **92.5%** [实测/理论]，说明该 Kernel 已接近显存带宽物理极限。
 
-### 阶梯进化：GEMM（规模 1024×1024，10 次迭代）
+### GEMM 性能（1024 x 1024，10 次迭代取平均）
 
-| 执行版本 | Kernel 时耗 | 计算吞吐率 | vs 单核 CPU |
-| :--- | :--- | :--- | :--- |
-| CPU 纯串行 | 2090.49 ms | 1.03 GFLOPS | 1× |
-| **GPU Naive 版** | **0.41 ms** | **5225.65 GFLOPS** | **5087×** |
-| **GPU Tiled 版** | **0.31 ms** | **6893.42 GFLOPS** | **6696×** |
+> 数据来源：`Results/01_Basics.md` 原始日志
+
+| 版本 | Kernel 耗时 | 计算吞吐 | vs CPU | vs Naive | 数据性质 |
+|------|------------|---------|--------|----------|----------|
+| CPU 串行 | 2090.49 ms | 1.03 GFLOPS | 1x | — | [实测] |
+| GPU Naive | 0.41 ms | 5.23 TFLOPS | 5087x | 1.00x | [实测] |
+| **GPU Tiled** | **0.31 ms** | **6.89 TFLOPS** | **6696x** | **1.32x** | [实测] |
 
 ```mermaid
 xychart-beta
-  title "矩阵乘法吞吐性能攀升 (GFLOPS, 越高越好)"
-  x-axis ["CPU 基准", "GPU Naive 版", "GPU Tiled 加速版"]
-  y-axis "计算吞吐率 (GFLOPS)" 0 --> 7500
-  bar [1.03, 5225.65, 6893.42]
+  title "GEMM 计算吞吐 (TFLOPS, 1024x1024)"
+  x-axis ["CPU", "Naive GPU", "Tiled GPU"]
+  y-axis "TFLOPS" 0 --> 8
+  bar [0.001, 5.23, 6.89]
 ```
 
-你也许会问：既然上面严密推导了 Tiled 版省掉了 32 倍的冗余内存访问，为什么在最终的测试成绩里，相较于 Naive 版只带来了约 1.3 倍左右（从 5225 到 6893 GFLOPS）的吞吐提升比例呢？
+### 为什么 Tiled 只比 Naive 快 1.32x 而非 32x
 
-这并非你算错了，而是你无形中享受了现代微架构设计带来的隐性福利。RTX 4090 拥有极为极其奢侈的 **72 MB Huge L2 Cache** 缓存池，而我们在测试中使用的 $1024 \times 1024$ 浮点矩阵 $A, B, C$ 加在总共也就只有 12 MB 左右的体量。
-这意味着什么？意味着在 Naive 版本那看似“大水漫灌”、本该被 HBM 慢速拒之门外的海量反复请求中，其实除了第一次是实打实地去 Global Memory 读取外，其余针对同一行或列的绝大多数重复二次访问，都被这 72 MB 的 L2 Cache 给截胡并妥妥接盘了（这是典型的受益于 **L2 Cache 命中的溢出效应**），并没有真的千军万马挤上了慢吞吞的 HBM 独木桥。
+理论上 Tiling 降低了 32 倍全局访存量，但实测只有 1.32 倍提升。原因在于测试规模：
 
-然而即使在这个前提下，因为 Tiled 版成功避免了连 L2 到 SM（Streaming Multiprocessor）这段路程的物理竞争瓶颈，其依然能逆流而上，硬生生把这块原本就已被榨干的芯片极限性能再次拔高近三成之巨。这正是极致软硬结合的魅力所在。
+$1024 \times 1024$ 的三个矩阵 $A, B, C$ 合计仅 12 MB，远小于 RTX 4090 的 72 MB L2 Cache。Naive 版本中大量"重复"的 Global Memory 请求实际被 L2 Cache 拦截，并未真正到达 HBM。Naive 版本在这个规模下已经享受了硬件缓存的隐性收益。
+
+Tiled 版本的优势在于绕过了 L2→SM 这段路径的竞争，将数据直接放到距计算单元更近的 Shared Memory 中，因此仍然获得了 32% 的提升。在更大矩阵规模（超出 L2 容量）下，Tiling 的收益会更加显著。
+
+### 距离硬件峰值还有多远
+
+6.89 TFLOPS 仅为 RTX 4090 FP32 峰值 82.6 TFLOPS 的 **8.3%** [实测/理论]。
+
+这是因为 Tiled GEMM 的内层循环每次从 Shared Memory 读取 2 个 float（8 字节），执行 1 次 FMA（2 FLOPs），算术强度仍然只有：
+
+$$I_{\text{SMEM}} = \frac{2 \text{ FLOPs}}{8 \text{ Bytes}} = 0.25 \text{ FLOP/Byte} \quad [\text{理论}]$$
+
+这比 Vector Add 的 0.083 有了 3 倍提升，但距离拐点 81.9 仍差两个数量级。突破这个瓶颈需要将数据进一步提升到寄存器级别——每个线程持有多个输出元素，在寄存器中完成大量乘加，这就是 [04_GEMM_Optimization](04_GEMM_Optimization_Register_Tiling.md) 要解决的 Register Tiling 问题。
 
 ---
 
-## 几个绝对不能忽视的事实
+## 常见误区
 
-- **带宽高高在上。** 写 Kernel 前记得先按一遍计算器：你的算子在这个数据量下，一字节能做几次浮点运算？如果凑不到 4090 那约 82 FLOP/B 的 Roofline 拐点，那么费尽心机优化计算指令也是徒劳的——唯一出路就是老老实实优化显存带宽的利用率。
-- **Tiling 的本质：用面积挤压体积。** 这也是本章最核心的内容。通过开辟一个极小的 $32 \times 32$ 的缓存块（占据少量的面积），我们就能以近乎免费的代价，在片上完成海量的点乘累加运算（占据时间维度的计算体积）。
-- **6893 GFLOPS 只是个微不足道的开始。** Tiled 版跑出了将近 6.9 TFLOPS 的不俗成绩，但这距离 4090 理论上的 82.6 TFLOPS 峰值还有多远？粗算一下，只发挥了绝对算力不到 **8.4%**。
+1. **误区**：Naive GEMM 慢是因为访存没有合并。
+   **实际**：Naive GEMM 的访存模式是高效的——读 $A$ 时 Warp 内广播，读 $B$ 时连续地址合并。真正的瓶颈是总访存量 $O(N^3)$，即使每次都是高效合并读取，往返次数过多仍然导致高延迟。
 
-这意味着，即使我们千辛万苦利用共享内存跳过了最费时的 Global Memory，但 Shared Memory 的自身带宽依然是不够的。我们来严谨地推导一下此时的算术强度：
+2. **误区**：Tiling 降低了 32 倍访存，应该带来接近 32 倍的加速。
+   **实际**：在小规模矩阵（12 MB < 72 MB L2）下，Naive 版本已经享受了 L2 Cache 的隐性收益。只有当数据规模超出 L2 容量时，Tiling 的全局访存降低才能完全转化为性能提升。
 
-对于 Tiled GEMM 的最内层循环：
+3. **误区**：Vector Add 的加速比（181x）说明 GPU 比 CPU 快 181 倍。
+   **实际**：Kernel 加速比 181x 没有计入 H2D/D2H 数据传输时间（49.48 ms + 25.91 ms）。含传输的端到端加速比仅 **2.05x** [实测]。GPU 的优势在计算密集或可以隐藏传输开销（Pipeline / Overlap）的场景下才能真正发挥。
 
-```cpp
-for (int i = 0; i < TILE_WIDTH; ++i) {
-    value += tile_a[ty][i] * tile_b[i][tx];
-}
-```
+4. **误区**：Tiled GEMM 只需要一次 `__syncthreads()`。
+   **实际**：需要两次。第一次保证加载完成后再计算，第二次保证计算完成后再覆写 SRAM。省去第二次屏障会导致快线程提前覆写慢线程正在使用的数据，引发不可确定性的计算错误。
 
-每一次循环，线程需要从 SRAM 读取 1 个 `tile_a` 元素和 1 个 `tile_b` 元素，总共 $2 \times 4 = 8$ 字节的数据。
-它执行的运算是一次 FMA（Fused Multiply-Add，乘加指令），等价于 2 次浮点操作（FLOPs）。
-因此，这里的实际算术强度为：
-$$I = \frac{\text{2 FLOPs}}{\text{8 Bytes}} = 0.25 \text{ FLOP/Byte}$$
+---
 
-比起最初 Vector Add 的 $0.083$，这里确实有了长足进步。但记得我们刚才怎么说 4090 的 Roofline 拐点吗？拐点在 ~82 FLOP/Byte！$0.25$ 距离 $82$ 依然差了两个数量级，所以计算单元依然处在半饱半饥的等待中——每天被迫干等从 Shared Memory 慢吞吞搬过来的浮点数。
+## 系列导航
 
-要想逼近真正的算力巅峰，唯一的途径是让算术强度继续成倍跃升，让一块数据被读取后，能被翻来覆去地用来狂练无数次加法运算。我们必须让数据离运算更近一步——打入寄存器内部（寄存器是唯一带宽能匹配满算力的层级）。我们将在 04 期的 `GEMM Optimizations` 中接着讲更狂暴的魔法。
+### 前置阅读
+
+本篇为系列第一篇，无前置依赖。
+
+### 推荐后续
+
+| 文章 | 关系 |
+|------|------|
+| [02_Reduction：并行归约的三次进化](02_Reduction_Tree_Algo_and_Coarsening.md) | 归约算法中的 Shared Memory 同步与 Warp Divergence 消除 |
+| [04_GEMM_Optimization：寄存器外积的极限](04_GEMM_Optimization_Register_Tiling.md) | 用 Register Tiling 将算术强度从 0.25 提升到远超拐点，逼近 cuBLAS 50% |
+| [10_Memory_Optimization：合并访存与 Bank Conflict](10_Memory_Optimization_Coalescing_BankConflict.md) | 深入合并访存规则、Bank Conflict 与 Async Copy Pipeline |

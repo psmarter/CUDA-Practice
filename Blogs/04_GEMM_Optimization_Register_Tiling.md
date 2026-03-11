@@ -1,272 +1,275 @@
 ---
-title: "04_GEMM_Optimization：从 SMEM 缓存到寄存器外积——逼近纯计算极限"
-date: 2026-03-10 10:00:00
+title: "04_GEMM 优化：从 Shared Memory Tiling 到寄存器外积——逼近计算瓶颈"
+date: 2026-03-11 10:00:00
 tags: [CUDA, 高性能计算, GEMM, Register Tiling, Shared Memory, 外积, Thread Coarsening, cuBLAS]
 categories: 深度学习系统架构
 ---
 
-> 📖 **前置阅读**：[01_Basics_Concepts_and_Tiling](01_Basics_Concepts_and_Tiling.md)（Tiling 基础与算术强度）
-> 📖 **推荐后续**：[09_Tensor_Core](09_Tensor_Core.md)（WMMA 硬件加速矩阵乘法）、[14_CUTLASS](14_CUTLASS.md)（模板元编程构建生产级 GEMM）
+## 本文目标
 
-在前面的基础篇章中，我们花大力气把朴素的 GEMM 升级成了基于 Shared Memory 的 Tiled GEMM。通过让多个线程协作加载数据到共享内存（SMEM），我们将 Global Memory 的访存量降低了数十倍。性能也确实从 Naive 的 0.5 TFLOPS 跃升了不少。
+读完本文，你将能够：
 
-但如果你仔细审视测试数据，在 1024×1024 规模下，Tiled GEMM 跑到 **6.57 TFLOPS** 就上不去了——这大概只有 RTX 4090 单精度理论峰值（82.6 TFLOPS）的 8%。
+- 解释 Tiled GEMM 仍然 Memory Bound 的根因：每次 FMA 从 SMEM 读 2 个 float，算术强度仅 0.25 FLOP/Byte [理论]
+- 推导 Register Tiling 如何将局部算术强度从 0.25 提升到 1.0 FLOP/Byte（以 $T_M = T_N = 4$ 为例）[理论]
+- 实现一个 $8 \times 8$ 寄存器分块 GEMM，在 2048×2048 规模达到 28.79 TFLOPS，达到 cuBLAS 的 50.1% [实测]
+- 分析手写 Kernel 与 cuBLAS 之间 50% 差距的工程根因（Bank Conflict、流水线气泡、SASS 级调优）
 
-**为什么 Tiled GEMM 还是这么慢？瓶颈究竟卡在了哪里？**
+## 对应代码路径
 
-核心原因在于我们在上一关解决的只是 **Global Memory 到 Shared Memory 的通信瓶颈**。但是，在 Tiled GEMM 最底层的内侧计算循环中，每个线程为了计算一个 `C[row][col]` 元素，每次在做核心的乘加指令（FMA：Fused Multiply-Add）之前，都必须从 Shared Memory 读出两个 `float`（一个 $A$，一个 $B$）。
+> **硬件环境**：NVIDIA RTX 4090 (Ada Lovelace, sm_89)
+> 128 SMs | FP32 82.6 TFLOPS | HBM 1008 GB/s | L2 72 MB | Roofline 拐点 81.9 FLOP/Byte
 
-对于一块算力怪兽级的 GPU 来说，**即便是 Shared Memory（L1 Cache），它的带宽（RTX 4090 约为数十 TB/s）相对于其恐怖的 FP32 算力依然是不够看的**。
+| 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
+|--------|-------------|----------|----------|
+| `04_GEMM_Optimization/01_tiled_gemm/tiled_gemm.cu` | `tiled_gemm` | Shared Memory Tiling | 1024×1024 |
+| `04_GEMM_Optimization/01_tiled_gemm/tiled_gemm.cu` | `coarse_gemm` | 1D 线程粗化 | 1024×1024 |
+| `04_GEMM_Optimization/01_tiled_gemm/tiled_gemm.cu` | `register_tiled_gemm` | 2D 寄存器分块（TM=TN=4） | 1024×1024 |
+| `04_GEMM_Optimization/02_advanced_gemm/advanced_gemm.cu` | `vectorized_gemm` | float4 向量化加载 | 1024×1024 |
+| `04_GEMM_Optimization/02_advanced_gemm/advanced_gemm.cu` | `double_buffer_gemm` | 双缓冲流水线 | 1024×1024 |
+| `04_GEMM_Optimization/03_register_tiling/register_tiling.cu` | `register_tiling_gemm` | 极致寄存器分块（BM=BN=128, TM=TN=8） | 2048×2048 |
 
-这种“读一次就算一次”的访存模式，让算术强度（FLOP/Byte）死死卡在了一个低水平：
-$$\text{算术强度} = \frac{2 \text{ FLOPs (一次乘加)}}{2 \times 4 \text{ Bytes (读取 A 和 B)}} = 0.25 \text{ FLOP/Byte}$$
+> Kernel 名称与源码中 `__global__` 函数签名完全一致。
 
-而 RTX 4090 达到巅峰算力所需的 Roofline 拐点约为 85 FLOP/Byte。显然，我们将瓶颈从 Global Memory 转移到了 Shared Memory，但程序依然是**内存受限（Memory Bound）**的。
+## Baseline
 
-如果要向硬件天花板不断逼近，我们必须将数据推向距离 ALU 最近的地方，让数据在那里被疯狂复用。这是所有做 CUDA 优化的工程师必须跨过的分水岭：**寄存器级分块（Register Tiling）**。
+**问题陈述**：在 Blog 01 中，Tiled GEMM 通过 Shared Memory 缓存大幅减少了 Global Memory 访问。但在 1024×1024 规模下，Tiled GEMM 仅达到 6.56 TFLOPS，不到 RTX 4090 FP32 峰值（82.6 TFLOPS）的 8%。瓶颈从 Global Memory 转移到了 Shared Memory。
 
----
+**Baseline 实现**：`tiled_gemm`，位于 `04_GEMM_Optimization/01_tiled_gemm/tiled_gemm.cu`。
+每个线程计算输出矩阵的一个元素，沿 K 维度迭代时，每次 FMA 前从 Shared Memory 读取 A 和 B 各一个 float。
 
-## 演进一：一维线程粗化 (Thread Coarsening)
+| 指标 | 值 | 数据来源 |
+|------|----|----------|
+| Kernel 耗时 | 0.3273 ms | [实测] Results/04_GEMM_Optimization.md |
+| 计算吞吐 | 6.56 TFLOPS | [实测] 由 Kernel 耗时与 FLOPs 计算 |
+| 硬件利用率 | 7.9% | [理论] 6.56 / 82.6 |
 
-既然瓶颈是“从 SMEM 读取数据的次数太多”，最符合直觉的破局思路就是**让一个线程一次多干点活**，在业界这被称为线程粗化（Thread Coarsening）。
+## 瓶颈分析
 
-在 `01_tiled_gemm/tiled_gemm.cu` 的 `coarse_gemm` 版本中，我们进行了一个轻量级的一维粗化试验（设定 `COARSE_FACTOR = 4`）：让每个线程不再只负责计算 $1 \times 1$ 的 $C$ 元素，而是负责计算同一行上连续的 $1 \times 4$ 个 $C$ 元素块。
+从 Roofline 模型出发，GEMM 的全局算术强度为：
 
-**收益的数学逻辑在哪里？**
+$$I = \frac{2N^3}{3N^2 \times 4} = \frac{N}{6} = 170.67 \text{ FLOP/Byte} \quad (N = 1024) \quad [\text{理论}]$$
 
-假设一个线程要计算同行连续的四个元素 $C_{i,j}, C_{i,j+1}, C_{i,j+2}, C_{i,j+3}$。
-在沿着 $K$ 维度迭代深入时，这四个元素的计算**都需要用到同一个** $A_{i,k}$ 的值！
+这远超 RTX 4090 拐点 81.9 FLOP/Byte，理论上 GEMM 应该是 **Compute Bound**。但 Tiled GEMM 的实际利用率不到 8%，说明瓶颈不在全局层面，而在 **SMEM 到寄存器的微观访存**。
 
-这就意味着起飞的契机：对于这 4 次 FMA 运算，该线程只需要从 Shared Memory 读 1 次 $A_{i,k}$，以及读 4 次对应的 $B$ 元素。
-访存量从 Naive 的 $4 \times 2 = 8$ 次（读 4 次 A、4 次 B），直接减少到了 $1 + 4 = 5$ 次。
+**内层循环的算术强度**：每次 FMA 需要从 SMEM 读 2 个 float（A 和 B 各一个），执行 2 FLOPs（一次乘加）：
 
-这本质上是一种**寄存器复用（Register Reuse）**：把公共的 $A_{i,k}$ 读到寄存器里缓存起来，供给后面的指令反复使用。
+$$I_{\text{inner}} = \frac{2 \text{ FLOPs}}{2 \times 4 \text{ Bytes}} = 0.25 \text{ FLOP/Byte} \quad [\text{理论}]$$
 
-我们来看实测的数据表现（1024×1024 规模，10次平均）：
+这个值说明：即便数据已经在 Shared Memory 中，"读一次算一次"的访存模式使得 SMEM 带宽成为新的瓶颈。优化方向是将数据进一步下沉到寄存器，通过复用提高局部算术强度。
 
-| 版本 | Kernel 时间 | 计算性能 | 加速比 |
-|:---|:---:|:---:|:---:|
-| Tiled GEMM (Baseline) | 0.327 ms | 6575 GFLOPS | 1.00x |
-| **Coarse GEMM (1D, F=4)** | **0.305 ms** | **7050 GFLOPS** | **1.07x** |
+## 优化思路
 
-1.07x 的提升看起来似乎有些微不足道。这是因为 1D 粗化带来的复用只发生在 A 矩阵身上，B 矩阵依然是 1:1 的读取消耗。就好比你在工位上（线程），原本每次只处理一个文件包，现在让你一次领四个同类文件包，不用反复去架子（SMEM）上跑好几趟了。但这显然只触及了优化潜力的表面。我们需要双向复用。
+### 优化 1：一维线程粗化（Thread Coarsening）
 
----
+**解决的瓶颈**：SMEM 到寄存器的读取次数过多，A 矩阵元素无复用。
+**核心思想**：让每个线程计算同一行上连续 $1 \times 4$ 个 C 元素（`COARSE_FACTOR = 4`），使 $A_{i,k}$ 在寄存器中被 4 次 FMA 复用。
+**预期收益**：A 矩阵的 SMEM 读取量减少为 1/4，总访存从 $4 \times 2 = 8$ 次降到 $1 + 4 = 5$ 次 [理论]。
 
-## 演进二：二维分块的魔法与外积视角 (2D Register Tiling)
+### 优化 2：二维寄存器分块（2D Register Tiling）
 
-既然一行共享 A 能省访存，一列共享 B 也能省访存，那为什么不把线程粗化扩展到二维呢？这就是 **Register Tiling**（寄存器分块）的真面目。
+**解决的瓶颈**：1D 粗化只复用 A，B 矩阵仍然 1:1 读取。
+**核心思想**：让每个线程计算 $T_M \times T_N$ 的二维 C 子块。每次从 SMEM 加载 $T_M$ 个 A 元素和 $T_N$ 个 B 元素到寄存器，通过外积（Outer Product）产生 $T_M \times T_N$ 次 FMA。A 和 B 都被双向复用。
 
-在 `register_tiled_gemm` 版本中，我们赋予每个线程更庞大的责任边界：让它独立负责计算一个 $T_M \times T_N$ 的二维 $C$ 矩阵子块（代码中初步设定 `COARSE_Y = 4`, `COARSE_X = 4`）。
+以 $T_M = T_N = 4$ 为例，局部算术强度提升到：
 
-为了实现二维的寄存器复用，我们必须在思考模式上做一次跃迁：从大家在学校里学的**内积视角（Inner Product）**彻底切换到**外积视角（Outer Product）**。
+$$I_{\text{reg}} = \frac{T_M \times T_N \times 2}{(T_M + T_N) \times 4} = \frac{4 \times 4 \times 2}{(4 + 4) \times 4} = 1.0 \text{ FLOP/Byte} \quad [\text{理论}]$$
 
-### 内积 vs 外积的降维打击
+相比 Baseline 的 0.25 FLOP/Byte 提升了 4 倍。
 
-**内积视角（Naive 和基础 Tiled 的方式）**：
-遍历 $K$ 维度时，计算 $C_{i,j}$ 的逻辑是拿 $A$ 的第 $i$ 行去点乘 $B$ 的第 $j$ 列。不同元素的计算是孤立进行的，复用无从谈起。
+**外积视角**：与内积（逐元素点乘）不同，外积将一个列向量和一个行向量相乘，一次产生整个矩阵面：
 
-**外积视角（Register Tiling 的基石）**：
-与其每次更新一个结果，不如一块一块地推进。每次迭代，一个线程从 Shared Memory 向自家的寄存器中抓取 $A$ 的一个列向量片段（长条，$T_M$ 个元素）和 $B$ 的一个行向量片段（宽条，$T_N$ 个元素）。
-这两个一维的片段相互相乘（做一次代数上的外积），就能直接膨胀、并累加上去一个完整的 $T_M \times T_N$ 的二维 $C$ 矩阵碎片。
+$$\vec{a} \cdot \vec{b}^T = \begin{pmatrix} a_0 \\ a_1 \\ \vdots \\ a_{TM-1} \end{pmatrix} \begin{pmatrix} b_0 & b_1 & \cdots & b_{TN-1} \end{pmatrix} = \begin{pmatrix} a_0 b_0 & a_0 b_1 & \cdots \\ a_1 b_0 & \cdots & \\ \vdots & & a_{TM-1} b_{TN-1} \end{pmatrix}$$
 
-用数学直观感受外积产生的矩阵面：
-$$\text{寄存器外积：} \quad \vec{a} \cdot \vec{b}^T = \begin{pmatrix} a_0 \\ a_1 \\ \vdots \\ a_{TM-1} \end{pmatrix} \begin{pmatrix} b_0 & b_1 & \cdots & b_{TN-1} \end{pmatrix} = \begin{pmatrix} a_0 b_0 & a_0 b_1 & \cdots & a_0 b_{TN-1} \\ a_1 b_0 & \cdots & & a_1 b_{TN-1} \\ \vdots & & & \vdots \\ a_{TM-1} b_0 & \cdots & & a_{TM-1} b_{TN-1} \end{pmatrix}$$
+### 优化 3：float4 向量化加载
 
-**算力爆炸的秘密：算术强度重构**
+**解决的瓶颈**：Global Memory 到 SMEM 的加载阶段，逐个 float 读取浪费指令发射端口。
+**核心思想**：使用 `float4` 将 4 个 32-bit 读取合并为一条 128-bit LDG 指令，降低指令发射压力。
+**实际效果**：本项目的实现因 `if (threadIdx.x % 4 == 0)` 引入 Warp Divergence，导致性能不升反降（反面教材）。
 
-我们定性算一笔账。以本版本这个看似不起眼的 $4 \times 4$ 子块为例：
+### 优化 4：双缓冲流水线（Double Buffering）
 
-- 数据搬运开销（从 SMEM 到寄存器）：读 4 个 $A$ 的分量 + 读 4 个 $B$ 的分量 = 8 个单精度浮点数（32 Bytes）。
-- 算力压榨收益：产生了一个 $4 \times 4$ 桌面的全部组合，一共 $4 \times 4 = 16$ 次 FMA（32 FLOPs）。
+**解决的瓶颈**：标准 Tiling 循环中，加载和计算严格串行——加载 SMEM 时 ALU 空闲，计算时 LSU 空闲。
+**核心思想**：申请两组 SMEM（`shared_A[2][..]`），在计算当前 Tile 的同时预加载下一个 Tile，使加载延迟被计算时间遮蔽。
+**预期收益**：消除加载-计算串行等待的时钟周期浪费 [理论]。
 
-局部算术强度陡然提高到了 $\frac{32}{32} = 1.0$ FLOP/Byte！这是单纯 Tiled 版本的 4 倍！数据一旦跨过独木桥进入了宽敞的寄存器堆，其计算价值就被成倍地压榨。
+### 优化 5：极致寄存器分块（8×8 Thread Tile）
 
-反映在 CUDA 核里的这段外积代码，没有任何多余的动作：
+**解决的瓶颈**：$4 \times 4$ 分块的复用比仍有提升空间。
+**核心思想**：将 Thread Tile 扩大到 $T_M = T_N = 8$，Block Tile 设为 $BM = BN = 128, BK = 8$。每个线程持有 64 个累加器寄存器，每次搬运 16 个元素（8 个 A + 8 个 B）执行 64 次 FMA，复用比达到 $64 / 16 = 4$。
+**预期收益**：在 2048×2048 规模下逼近 Compute Bound [理论]。
+
+## 关键代码解释
+
+### 2D 寄存器分块外积循环
 
 ```cpp
-// 1. 在每线程专属的寄存器堆中，申请 4x4 的二维累加器矩阵阵列
-float values[COARSE_Y][COARSE_X] = {0.0f};
+// 来源：04_GEMM_Optimization/01_tiled_gemm/tiled_gemm.cu : L72-L96
+// register_tiled_gemm 内层核心
 
-// ... 省略数百个线程协同工作，将 global A, B 搬入 Shared Memory 的过程 ...
+float values[COARSE_Y][COARSE_X] = {0.0f};  // [1] TM×TN 累加器，驻留寄存器
 
-// 2. 内层核心计算：沿着 K 维度的 Tile 推进
-for (int t = 0; t < TILE_SIZE; ++t) {
-    // 💡 关键：COARSE_Y(4) 和 COARSE_X(4) 都是编译期常量。
-    // 这几层全常量边界的短循环，会被编译器 #pragma unroll 彻底剥离开，
-    // 直译为毫无分支跳跃开销的纯粹 fmaf 指令雨。
-    for (int j = 0; j < COARSE_Y; ++j) {
-        for (int k = 0; k < COARSE_X; ++k) {
-            values[j][k] = fmaf(shared_A[j * TILE_SIZE + threadIdx.y][t], 
-                                shared_B[t][k * TILE_SIZE + threadIdx.x], 
-                                values[j][k]);
+for (int i = 0; i < cdiv(N, TILE_SIZE); ++i) {
+    // 协作加载 A 和 B 到 Shared Memory（省略）
+    __syncthreads();
+
+    // [2] 沿 K 维度 Tile 内迭代，执行外积累加
+    for (int t = 0; t < TILE_SIZE; ++t) {
+        for (int j = 0; j < COARSE_Y; ++j) {
+            for (int k = 0; k < COARSE_X; ++k) {
+                values[j][k] = fmaf(shared_A[j * TILE_SIZE + threadIdx.y][t],
+                                    shared_B[t][k * TILE_SIZE + threadIdx.x],
+                                    values[j][k]);
+            }
         }
-    }
-}
-```
-
-来看看这个 $4 \times 4$ Register Tiling 打出的 1024 规模下的强力一击：
-
-| 版本 | Kernel 时间 | 计算性能 | 加速比 |
-|:---|:---:|:---:|:---:|
-| Tiled GEMM (Baseline) | 0.327 ms | 6575 GFLOPS | 1.00x |
-| **Register Tiled 2D** | **0.153 ms** | **14055 GFLOPS** | **2.14x** |
-
-没有任何花哨的硬件特权调用，纯靠逻辑上的缓存思维变换，速度直接**翻了一倍不止（2.14x）**！SMEM 的带宽限制被这套复用拳法破局，我们的 GEMM 终于迈出了成为 Compute Bound（计算受限）任务的关键一步。
-
----
-
-## 演进三：压榨极限周期的软件微操 (Advanced Techniques)
-
-当我们成功推迟了访存的宏观瓶颈，流水线（Pipeline）中那些由于指令停顿、内存延迟导致的微小气泡，就会暴露成影响整体性能的沙粒。在 `02_advanced_gemm` 目录中，我们展示了试图去填补这些气泡的经典工程进阶手腕。
-
-### Vectorized 加载 (使用 float4 向量化)
-
-数据从 Global Memory 提款到 Shared Memory，这是开销最大的操作路段。既然我们在内存读取时，索要的地址总是一块连续的浮点数，逐个申请（`float`）是否太浪费控制单元资源了？
-
-答案是将它们打成包裹。利用内置类型 `float4` 进行向量化读取。
-从硬件视角看，使用 `float4` 可以把 4 个 32-bit 的取指请求合并为一个 128-bit 的单条 LDG 内存指令。这极大降低了指令发射端口的压力，并且极其有利于 L2 Cache 和内存控制器的内存事务合并（Coalescing）效率。
-
-然而事实往往是残酷而反直觉的。我们看 1024 规模下的实测数据（对比新基准）：
-
-| 版本 | Kernel 时间 | 评注 |
-|:---|:---:|:---:|
-| Vectorized (float4) | 0.382 ms | 由于实现细节略有回退 |
-
-在这里，性能不升反降。这是一个非常典型的优化踩坑现场。在我们的实现中存在两个问题：
-
-1. **线程发散（Warp Divergence）**：为了打包 float4，代码逻辑采用了 `if (threadIdx.x % 4 == 0)` 让部分线程停工围观，极大破坏了 SIMT 并发。
-2. **强制对齐挑战**：直接 `*reinterpret_cast<const float4*>` 跨越指针，若没有保障前置的系统级内存分配对齐（Alignment），在汇编层面会触发多次零碎抓取来拼装寄存器。
-这个反面教材告诉我们：**高级特性在堆叠时，不能违背底层的物理定律。** 如果破坏了并发度，指令削减的利好将被全盘抵消。
-
-> **正确实现向量化 GEMM 的关键**：向量化的前提是**所有线程访问连续地址且无需条件分支**。正确做法是在分配 `d_A`、`d_B` 时，通过 `cudaMalloc` 确保 16 字节对齐（`cudaMalloc` 默认即对齐），然后让每个线程负责不重叠的连续 4 个元素，以 `float4` 一次读取：
->
-> ```cpp
-> // ✅ 正确的向量化：每线程处理连续 4 列，无分支，地址天然对齐
-> __global__ void vectorized_gemm_correct(const float* A, const float* B, float* C,
->                                          int M, int N, int K) {
->     int row = blockIdx.y * blockDim.y + threadIdx.y;
->     int col = (blockIdx.x * blockDim.x + threadIdx.x) * 4;  // 每线程负责 4 列
->     if (row >= M || col + 3 >= N) return;  // 单次边界检查，无 lane-level 分支
->
->     float4 sum = {0.f, 0.f, 0.f, 0.f};
->     for (int k = 0; k < K; ++k) {
->         float a = A[row * K + k];
->         // 一次读取 4 个连续的 B 元素（128-bit LDG 指令）
->         float4 b = *reinterpret_cast<const float4*>(&B[k * N + col]);
->         sum.x = fmaf(a, b.x, sum.x);
->         sum.y = fmaf(a, b.y, sum.y);
->         sum.z = fmaf(a, b.z, sum.z);
->         sum.w = fmaf(a, b.w, sum.w);
->     }
->     // 一次写入 4 个连续的 C 元素（128-bit STG 指令）
->     *reinterpret_cast<float4*>(&C[row * N + col]) = sum;
-> }
-> ```
->
-> 关键点：`(threadIdx.x) * 4` 使得相邻线程各自负责不重叠的连续 4 列，整个 Warp 的写地址形成 128 字节对齐的完美合并访存。这避免了原始实现中 `if (threadIdx.x % 4 == 0)` 带来的 Warp Divergence。
-
-### 双缓冲流水线 (Double Buffering)
-
-如果说向量化是在削减指令量，那么双缓冲（Double Buffering）就是纯粹关于**时间与空间重叠的魔术**。
-在没有流水线的标准循环里，GPU 行为像是一维海浪的平铺：
-`1. 所有人去取数据进 SMEM` 👉 `__syncthreads()` 同步 👉 `2. 疯狂进行 FMA 计算` 👉 `__syncthreads()` 再次同步 👉 `进入下一次循环块`。
-
-这种“串行”思维的恶果是：**当 GPU 计算核心（ALU）在疯狂咀嚼数据时，负责显存操作的加载状态机（LSU - Load Store Unit）在吃灰；反之，当满载拉取下一块数据时，ALU 只能干瞪眼。**
-
-流水线思想应运而生：我们申请**两组** Shared Memory 数组（`shared_A[2][..]`），使用一个 Toggle 开关（`buffer_index = 1 - buffer_index`）交错运转。
-核心哲学变成了：“**在当前周期计算当下瓦块的同时，向系统预订并发起下一个瓦块的内存提取指令。**”
-
-```cpp
-// 预先发射请求：把第 0 块瓦片先拉进 SMEM[0]
-// ...
-for (int i = 0; i < num_tiles; ++i) {
-    buffer_index = 1 - buffer_index;
-    
-    // 如果还没算完，先发起拉取第 i+1 块的动作，塞进 SMEM[下一个]！
-    // 此时内存请求发出，但不阻塞后面的进行
-    if (i + 1 < num_tiles) {
-        shared_A[buffer_index][...] = ...;
-    }
-    
-    // 立即开始猛烈计算当前手中的第 i 块，就在 SMEM[当前]
-    for (int k = 0; k < TILE_SIZE; ++k) {
-        value = fmaf(... shared_A[1 - buffer_index] ...);
     }
     __syncthreads();
 }
 ```
 
-看一看这招在实战中的威力（相对于不带 Double Buffer 的基准）：
+**要点解读**：
 
-| 版本 | Kernel 时间 | 计算性能 | 加速比 |
-|:---|:---:|:---:|:---:|
-| Vectorized 基准 | 0.382 ms | - | 1.00x |
-| **Double Buffer GEMM** | **0.315 ms** | **6820 GFLOPS** | **1.21x** |
+- `[1]`：`values[COARSE_Y][COARSE_X]`（`COARSE_Y = COARSE_X = 4`）共 16 个 float 全部驻留在寄存器中。编译器在 `#pragma unroll` 辅助下将双重循环完全展开为连续 `fmaf` 指令，消除分支和循环计数器开销。
+- `[2]`：每步 `t` 中，`shared_A[j * TILE_SIZE + threadIdx.y][t]` 被 `COARSE_X` 次 FMA 复用（A 复用），`shared_B[t][k * TILE_SIZE + threadIdx.x]` 被 `COARSE_Y` 次 FMA 复用（B 复用），实现双向数据复用。
 
-提速 1.21x。这表明，原本暴露在外、白白浪费时钟周期的那些内存长回程延迟（Memory Latency），有很大一部分被成功塞到计算耗时的阴影（遮蔽）下方去了。这是手工极限调板的经典手艺（注：在现代 Hopper 甚至 Ampere 架构中，这个技巧已经被硬件级的异步拷贝特性彻底原生接管——`cp.async` 和 TMA）。
+### 极致版本：8×8 寄存器分块
 
----
+```cpp
+// 来源：04_GEMM_Optimization/03_register_tiling/register_tiling.cu : L52-L111
 
-## 终极对决：2048X 极致 8x8 外积 vs NVIDIA 原厂 cuBLAS
+float regC[TM][TN] = {0.0f};   // 64 个累加器
+float regA[TM];                  // 8 个 A 寄存器
+float regB[TN];                  // 8 个 B 寄存器
 
-所有的前期理论铺垫，都是为了迎接深海区的终极挑战。
-我们来到 `03_register_tiling`。矩阵规模拔高到工业落地级的 $2048 \times 2048$。我们将二维寄存器分块推向了我们这个版本算力的极限：
-**每个线程不再只处理 4x4，而是要一次在肚子里吞下 8 × 8 = 64 个 C 元素！**
+// 阶段 3: 从 Shared Memory 加载到寄存器并计算
+for (int dotIdx = 0; dotIdx < BK; ++dotIdx) {
+    // 加载 A 的一列到寄存器 (TM=8 个元素)
+    for (int i = 0; i < TM; ++i)
+        regA[i] = sA[threadRow * TM + i][dotIdx];
+    // 加载 B 的一行到寄存器 (TN=8 个元素)
+    for (int j = 0; j < TN; ++j)
+        regB[j] = sB[dotIdx][threadCol * TN + j];
+    // 外积累加: TM × TN = 64 次 FMA
+    for (int i = 0; i < TM; ++i)
+        for (int j = 0; j < TN; ++j)
+            regC[i][j] = fmaf(regA[i], regB[j], regC[i][j]);
+}
+```
 
-看看我们摆下这个宏大阵列的参数配比（它要求极高的寄存器使用率，若分配不当会引发 Occupancy 崩盘）：
+**要点解读**：
 
-- Block 宏观视野 (BM×BN)：128 × 128 （一个合作社一口气吃下 128x8 的 A 和 8x128 的 B）。
-- 线程微观视野 (TM×TN)： 8 × 8 （每个工人独享 8+8=16个输入寄存器，产出 64 个累加器寄存器）。
-- 线程总动员规模： $(128/8) \times (128/8) = 256$ 个线程一个 Block。
-- 全局算术强度的跃迁：每次搬运 16 个体量进线程，执行 64 次运算反馈。复用比激增到 4！
+- 每个线程持有 `regC[8][8]` = 64 个累加器 + `regA[8]` + `regB[8]` = 80 个寄存器，占用较高的寄存器资源。
+- 每步 `dotIdx`：搬运 16 个元素（8+8），执行 64 次 FMA，复用比 = $64/16 = 4$。
+- Block 内共 $(128/8) \times (128/8) = 256$ 个线程，每个 Block 处理 $128 \times 128 = 16384$ 个 C 元素。
 
-现在，在 20 轮真实迭代的烈火中进行真金锻造：
+### 双缓冲流水线
 
-| 版本 | Kernel 时间 | 实测理论算力 (TFLOPS) | 对抗闭源巨无霸的比率 |
-|:---|:---:|:---:|:---:|
-| **手写极致在外积版 (2D, 8x8)** | **0.60 ms** | **28.79** | **50.1%** |
-| **NVIDIA 亲孙子 cuBLAS SGEMM** | 0.30 ms | 57.49 | 100% |
+```cpp
+// 来源：04_GEMM_Optimization/02_advanced_gemm/advanced_gemm.cu : L68-L105
 
-> 注评：测试硬件理论峰值约 82.6 TFLOPS（RTX 4090单精度 FP32）。
+__shared__ float shared_A[2][TILE_SIZE][TILE_SIZE];
+__shared__ float shared_B[2][TILE_SIZE][TILE_SIZE];
+
+// 预加载第 0 块到 buffer 0
+shared_A[0][threadIdx.y][threadIdx.x] = A[...];
+shared_B[0][threadIdx.y][threadIdx.x] = B[...];
+__syncthreads();
+
+for (int i = 0; i < num_tiles; ++i) {
+    buffer_index = 1 - buffer_index;   // Toggle 切换缓冲区
+
+    // 异步发起下一块的加载（写入 buffer_index）
+    if (i + 1 < num_tiles) {
+        shared_A[buffer_index][...] = A[...];
+        shared_B[buffer_index][...] = B[...];
+    }
+    // 同时计算当前块（读取 1 - buffer_index）
+    for (int k = 0; k < TILE_SIZE; ++k) {
+        value = fmaf(shared_A[1 - buffer_index][threadIdx.y][k],
+                      shared_B[1 - buffer_index][k][threadIdx.x], value);
+    }
+    __syncthreads();
+}
+```
+
+**要点解读**：
+
+- 两组 SMEM 通过 `buffer_index = 1 - buffer_index` 交替使用，使 Global Memory 加载（LSU）和 FMA 计算（ALU）在时间上重叠。
+- 这是软件层面的流水线实现。现代架构（Ampere/Hopper）通过 `cp.async` 和 TMA 在硬件层面原生支持异步拷贝，可进一步消除同步开销。
+
+## 结果与边界
+
+### 性能对比
+
+> **测试条件**：RTX 4090 × 2, CUDA, nvcc -O3
+> **数据来源**：`Results/04_GEMM_Optimization.md` 原始日志
+
+#### Tiling 阶梯进化（1024×1024, 10 次平均）
+
+| 版本 | Kernel 耗时 | 计算吞吐 | vs Baseline | 数据性质 |
+|------|------------|----------|-------------|----------|
+| Tiled GEMM（TILE=32） | 0.3273 ms | 6.56 TFLOPS | 1.00x | [实测] |
+| Coarse GEMM（1D, COARSE_FACTOR=4） | 0.3047 ms | 7.05 TFLOPS | 1.07x | [实测] |
+| Register Tiled 2D（TM=TN=4） | 0.1528 ms | 14.06 TFLOPS | 2.14x | [实测] |
+
+#### 高级技术对比（1024×1024, 10 次平均）
+
+| 版本 | Kernel 耗时 | 计算吞吐 | vs Vectorized | 数据性质 |
+|------|------------|----------|---------------|----------|
+| Vectorized GEMM（float4） | 0.3821 ms | 5.62 TFLOPS | 1.00x | [实测] |
+| Double Buffer GEMM | 0.3149 ms | 6.82 TFLOPS | 1.21x | [实测] |
+
+> 注意：Vectorized GEMM 因 Warp Divergence 导致性能低于 Tiled GEMM Baseline（见常见误区）。
+
+#### 极限优化（2048×2048, 20 次平均）
+
+| 版本 | Kernel 耗时 | 计算吞吐 | vs cuBLAS | 数据性质 |
+|------|------------|----------|-----------|----------|
+| Register Tiling（BM=BN=128, TM=TN=8） | 0.60 ms | 28.79 TFLOPS | 50.1% | [实测] |
+| cuBLAS SGEMM | 0.30 ms | 57.49 TFLOPS | 100% | [实测] |
 
 ```mermaid
 xychart-beta
-  title "2048×2048 大规模 GEMM：计算怪兽间的对垒 (TFLOPS)"
-  x-axis ["基石手写寄存器极客版", "工业级 cuBLAS 军规库"]
-  y-axis "性能天际线" 0 --> 65
-  bar [28.79, 57.49]
+  title "GEMM 优化阶梯：计算吞吐对比 (TFLOPS)"
+  x-axis ["Tiled(1K)", "Coarse(1K)", "RegTiled2D(1K)", "DblBuffer(1K)", "RegTiling(2K)", "cuBLAS(2K)"]
+  y-axis "TFLOPS" 0 --> 65
+  bar [6.56, 7.05, 14.06, 6.82, 28.79, 57.49]
 ```
 
-**实测达到了恐怖的 28.79 TFLOPS！**
-你必须明白，这可不是调包，这是纯纯由我们手打出来的、一砖一瓦盖起来的 C++ 程序，它挖掘出了 4090 GPU 三分之一潜力的极限动能！
+### 边界条件与局限
 
-### 落差解剖：那剩下的 50% 差距丢在了哪里？
+- **与 cuBLAS 的差距分析**：手写 Kernel 达到 cuBLAS 50.1%，剩余差距来自三方面：
+  1. **Bank Conflict（~10% 损耗）**：`sB[BK][BN]` 中，同一 Warp 的线程以步长 TN=8 访问，与 32 Bank 分配产生冲突。解法是声明 `sB[BK][BN+1]` 进行 Padding，但本实现未采用 [理论]
+  2. **流水线气泡（~15% 损耗）**：2048 版本未使用 Double Buffer，计算和加载串行化 [理论]
+  3. **SASS 级调优（~15-20% 差距）**：cuBLAS 在汇编层面精排 FFMA 和 LDG 指令时序，优化 ILP 和寄存器 Bank Conflict，这是编译器级 C++ 难以企及的 [理论]
+- **规模边界**：1024×1024 规模下 Register Tiled 2D 达 14.06 TFLOPS，但 Block 数量较少（仅 $32 \times 32 / (4 \times 4) = 64$ 个 Block），未充分利用 128 个 SM
+- **精度**：FP32 累加在 2048 规模下验证通过，更大规模可能需要关注浮点误差累积
 
-你一定会问，我们已经穷尽了所能想到的结构复用，把局部算术强度拉到爆棚，为什么速度依然停留在 `cuBLAS` (57.49 TFLOPS) 的 50%？
-差距的另一半，隐匿在连 C++ 代码本身都无法精确触及的硬件微观沼泽中。我们坦诚地客观拆解：
+## 常见误区
 
-1. **结构破坏者：Bank Conflict 绞肉机（损耗预估 ~10%）**
-   在内核第 3 阶段计算展开时，同属于一个 Warp 的 16 个线程需要同时去 `__shared__ float sB[8][128]` 里面取同一行的不同列。很不幸，隔膜步长（TN=8）完美碰撞了 32 Bank 的交错分配体系。它直接导致严重的内存 Bank 冲突事件（Bank Conflicts）。专业解决手段是增加“假列”也就是 `Padding`（比如声明为 `sB[8][128+1]`）去错开冲突通道，为了保留原始代码最可读的纯粹面貌，我们在此版本承受了惩罚。
-2. **流水线气泡：双缓冲的让步（损耗预估 ~15%）**
-   细心的你肯定注意到了。2048 破纪录版本中，我退让了，没有应用上面演进过的 Double Buffer。因为在极限参数下控制寄存器溢出（Register Spilling）和流水并发是一门钢丝游戏，这直接导致计算和加载重新出现了少许时序气泡吞噬算力周期。
-3. **降维打击领域：SASS 汇编级精调（压制性预估 ~15-20%）**
-   在最底层的地带，`cuBLAS` 根本就不只是 C++。他们的内核是直接干涉硬件底层汇编（SASS）的杰作。NVIDIA 的性能调优巨匠会以 Cycle（时钟周期）为单位，精算并穿插在每一条密集浮点加乘（FFMA）指令中间去布下那些载入控制（LDG）。为了指令级并行度 (ILP) 不发生打岔，乃至规避比 Shared Memory 更隐蔽的**寄存器 Bank 冲突**，这些都是通过编译器高级抽象很难达到的极境。
+1. **误区**：Shared Memory 已经很快了，不需要进一步优化到寄存器。
+   **实际**：SMEM 带宽虽远高于 HBM，但对于 FP32 算力而言仍是瓶颈。Tiled GEMM 内层循环的算术强度仅 0.25 FLOP/Byte，Register Tiling 将其提升到 1.0 FLOP/Byte（$T_M = T_N = 4$ 时），是从 Memory Bound 转向 Compute Bound 的关键一步 [理论]。
 
----
+2. **误区**：float4 向量化一定能提升性能。
+   **实际**：本项目的 `vectorized_gemm` 实际比 Tiled GEMM 更慢（0.3821 ms vs 0.3273 ms）[实测]。原因是使用了 `if (threadIdx.x % 4 == 0)` 进行条件分支，导致 Warp 内 3/4 的线程空转（Warp Divergence）。正确的向量化应让每个线程负责不重叠的连续 4 个元素，避免 lane 级分支。
 
-## 结语：重塑你对计算瓶颈的物理直觉
+3. **误区**：增大 Thread Tile 总是好的。
+   **实际**：$T_M \times T_N$ 增大时，每线程所需寄存器数增长为 $T_M \times T_N + T_M + T_N$（8×8 时为 80 个），可能导致寄存器溢出（Register Spilling）到 Local Memory，反而降低性能。需要在复用比和 Occupancy 之间权衡。
 
-跨越这一整个漫长的优化阶梯，你脑海里的 GPU 计算物理图景理应被彻底推倒重建了。
-这趟旅程，留给我们两个极其硬核的事实：
+4. **误区**：手写 GEMM 能轻松追平 cuBLAS。
+   **实际**：在充分优化（Register Tiling + Padding + Double Buffer）后，手写 FP32 GEMM 通常能达到 cuBLAS 的 50-70%。剩余差距需要 SASS 汇编级调优或使用 Tensor Core，这也是 CUTLASS 等框架存在的意义。
 
-**第一，Global 内存（HBM）极慢这是常识，但是请记住，连 Shared Memory (L1) 都有可能不够快！**
-一旦跨过寄存器分块 (Register Tiling) 这道大门，你的工程师优化视野就必须从宏大的“如何用卡车把数据拉到厂区（芯片内）” 再次升维净化到 “如何在这个最狭窄、最宝贵的局域台面（Register File 寄存器堆）上把每一个数据碎片的算术使用价值榨干殆尽”。
+## 系列导航
 
-**第二，软件结构优化的罗曼蒂克尽头，是冷酷庞杂的硬件底色。**
-挥舞着 C++ 编译器长鞭，我们一路杀到了逼近 30 TFLOPS 的辉煌阵线。但如果你还想着去跨越这条线超越那个工业怪兽 cuBLAS 怎么办？
-路只剩下两条：要么你去死磕那如天书般的 SASS 汇编，手动排布微指令流；
-要么，你应该将目光抛弃那些传统的、被无数图形像素渲染框住的通用计算微核（CUDA Cores），**转而拥抱那些被特意封装在大芯片深渊中，专为主宰巨量矩阵吞吐而诞生的天级硅片区域**。
+### 前置阅读
 
-是的，我们将在下一个章节——[【进阶第 09 讲 (Tensor Core：降伏 WMMA 矩阵引擎)】](09_Tensor_Core.md)继续攀登新的巅峰。
+| 文章 | 关系 |
+|------|------|
+| [01_从 Vector Add 到 Tiled GEMM](01_Basics_Concepts_and_Tiling.md) | 本文依赖的 Shared Memory Tiling 基础和算术强度概念 |
+
+### 推荐后续
+
+| 文章 | 关系 |
+|------|------|
+| [09_Tensor Core WMMA 混合精度](09_Tensor_Core_WMMA_Mixed_Precision.md) | 使用硬件矩阵引擎突破 CUDA Core FP32 算力天花板 |
+| [14_CUTLASS 模板 GEMM 与 CuTe](14_CUTLASS_TemplateGEMM_CuTe.md) | 工业级模板元编程框架，生产级 GEMM 实现 |
+| [10_内存优化与 Bank Conflict](10_Memory_Optimization_Coalescing_BankConflict.md) | 深入分析本文提到的 Bank Conflict 和合并访存问题 |
