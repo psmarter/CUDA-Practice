@@ -57,10 +57,13 @@ $$C_{i,j} = \sum_{t=0}^{\lceil N/T \rceil - 1} \left( \sum_{k=0}^{T-1} A_{i,\; t
 | :--- | :--- | :--- | :--- | :--- |
 | 寄存器 (Registers) | 紧贴 ALU | 每线程最多 255 个 32-bit | ~1 cycle | 数十 TB/s |
 | 共享内存 (Shared Memory) | 片上 SRAM | 每 SM 约 48–100 KB | ~20-30 cycles | 数 TB/s |
+| L1 数据缓存 (L1 Cache) | 片上 SRAM（与 Shared Memory 共用物理池） | 每 SM 128 KB（可配置分割） | ~30-40 cycles | 数 TB/s |
 | L2 缓存 (L2 Cache) | GPU 芯片内 | 72 MB (4090特色) | ~200 cycles | ~6 TB/s |
 | 全局显存 (Global Memory) | 板载 HBM/GDDR | 24 GB | ~400+ cycles | 1008 GB/s |
 
 Tiling 做的事，本质上就是把需要重用的数据手工从那几百个 cycle 的最慢层级（Global Memory）里捞出来，寄存在几十个 cycle 的较快层级（Shared Memory）中。
+
+> **L1 Cache 与 Shared Memory 的区别**：两者共享同一块片上 SRAM 物理资源（RTX 4090 每 SM 共 128 KB），但用途截然不同。Shared Memory 由程序员显式管理（`__shared__` 声明），用于线程间通信和数据复用；L1 Cache 由硬件自动管理，缓存 Global Memory 的最近访问数据。正是因为 Shared Memory 是程序员控制的，它比 L1 Cache 更适合做有规律的数据预取——Tiling 的本质正是把本该由 L1 随机缓存的数据，改由 Shared Memory 有计划地预取，将随机性转化为确定性。
 
 ```mermaid
 graph TD

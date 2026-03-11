@@ -138,7 +138,34 @@ for (int t = 0; t < TILE_SIZE; ++t) {
 
 1. **线程发散（Warp Divergence）**：为了打包 float4，代码逻辑采用了 `if (threadIdx.x % 4 == 0)` 让部分线程停工围观，极大破坏了 SIMT 并发。
 2. **强制对齐挑战**：直接 `*reinterpret_cast<const float4*>` 跨越指针，若没有保障前置的系统级内存分配对齐（Alignment），在汇编层面会触发多次零碎抓取来拼装寄存器。
-这个反面教材告诉我们：**高级特性在堆叠时，不能违背底层的物理定律。**如果破坏了并发度，指令削减的利好将被全盘抵消。
+这个反面教材告诉我们：**高级特性在堆叠时，不能违背底层的物理定律。** 如果破坏了并发度，指令削减的利好将被全盘抵消。
+
+> **正确实现向量化 GEMM 的关键**：向量化的前提是**所有线程访问连续地址且无需条件分支**。正确做法是在分配 `d_A`、`d_B` 时，通过 `cudaMalloc` 确保 16 字节对齐（`cudaMalloc` 默认即对齐），然后让每个线程负责不重叠的连续 4 个元素，以 `float4` 一次读取：
+>
+> ```cpp
+> // ✅ 正确的向量化：每线程处理连续 4 列，无分支，地址天然对齐
+> __global__ void vectorized_gemm_correct(const float* A, const float* B, float* C,
+>                                          int M, int N, int K) {
+>     int row = blockIdx.y * blockDim.y + threadIdx.y;
+>     int col = (blockIdx.x * blockDim.x + threadIdx.x) * 4;  // 每线程负责 4 列
+>     if (row >= M || col + 3 >= N) return;  // 单次边界检查，无 lane-level 分支
+>
+>     float4 sum = {0.f, 0.f, 0.f, 0.f};
+>     for (int k = 0; k < K; ++k) {
+>         float a = A[row * K + k];
+>         // 一次读取 4 个连续的 B 元素（128-bit LDG 指令）
+>         float4 b = *reinterpret_cast<const float4*>(&B[k * N + col]);
+>         sum.x = fmaf(a, b.x, sum.x);
+>         sum.y = fmaf(a, b.y, sum.y);
+>         sum.z = fmaf(a, b.z, sum.z);
+>         sum.w = fmaf(a, b.w, sum.w);
+>     }
+>     // 一次写入 4 个连续的 C 元素（128-bit STG 指令）
+>     *reinterpret_cast<float4*>(&C[row * N + col]) = sum;
+> }
+> ```
+>
+> 关键点：`(threadIdx.x) * 4` 使得相邻线程各自负责不重叠的连续 4 列，整个 Warp 的写地址形成 128 字节对齐的完美合并访存。这避免了原始实现中 `if (threadIdx.x % 4 == 0)` 带来的 Warp Divergence。
 
 ### 双缓冲流水线 (Double Buffering)
 

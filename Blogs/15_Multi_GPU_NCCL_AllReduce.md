@@ -137,6 +137,18 @@ $$ \text{Ring 单卡通信总发出荷载} =  \frac{N-1}{N} D + \frac{N-1}{N} D 
 
 无论你是买 4 张卡还是组网租下 1024 张卡，你的单机网络接口或者 PCIe 链路所需经历的数据洪流永远只会被死死地压在——"向外发两倍基底文件总体积，向内接两倍总体积"这条水平的常数红线上。分布式系统横向拓展的通信瓶颈，在纯数学层面被一种粗犷又优雅的方法击得粉碎。
 
+> **推导过程（逐步说明）**：
+>
+> - 数据总量 $D$ 被切为 $N$ 块，每块大小 $D/N$
+> - Reduce-Scatter：每卡发出 $N-1$ 次，每次 $D/N$，共发出 $\frac{(N-1)D}{N}$
+> - All-Gather：同上，共再发出 $\frac{(N-1)D}{N}$
+> - 单卡总发出量：$2 \times \frac{N-1}{N} \times D$
+> - 当 $N \to \infty$ 时：总量趋近 $2D$（常数，不随 GPU 数量增长）
+> - 对比 Parameter Server：主节点需处理 $D(N-1)$（随 N 线性增长），Ring 的数学优势在此
+
+> **NCCL 的自适应算法选择**：Ring AllReduce 使所有卡带宽均等，适合小 N（2-8 张卡）和跨节点互联质量均匀的场景。但当节点数超过 8、网络层次化（存在 Intra-node + Inter-node 两层拓扑）时，NCCL 会自动切换到 **Tree AllReduce**（双树算法）：把整个 GPU 集群组织成一棵二叉树，Reduce-Scatter 沿树向上汇聚，All-Gather 沿树向下广播。Tree AllReduce 的单张卡通信量是  \cdot \log_2(N) \cdot \frac{D}{N}$，在大规模集群下通信量更低，但对拓扑的均匀性要求更高。
+> 可以通过环境变量强制指定：NCCL_ALGO=Ring 或 NCCL_ALGO=Tree（调试用），生产环境通常让 NCCL 根据实际拓扑自动决策。
+
 ---
 
 ## NCCL 代管下界：为什么这三行代码极其容易抛错

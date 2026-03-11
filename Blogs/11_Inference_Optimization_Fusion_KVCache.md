@@ -142,6 +142,17 @@ xychart-beta
 
 如果模型最后仅仅说了 10 个 Token，一句干净的“Hello, user”便宣告服务完成，那么这块领地里剩下的那 2038 个词的巨型内存坑位就在那一瞬间彻底沦为空洞。由于分配是连续且预占的，这 2038 个格子被直接锁死，谁也别想进来用，哪怕集群正顶着数十万人的高并发排队。
 
+> **KV Cache 实际内存占用估算（以 LLaMA-7B 为例）**：
+>
+> LLaMA-7B 有 32 层 Transformer，每层有 32 个注意力头，每个头的维度为 128。对于标准 FP16（2 Bytes/元素）格式：
+>
+> $\text{KV Cache Size} = 2 \times \text{num\_layers} \times \text{num\_heads} \times \text{head\_dim} \times \text{seq\_len} \times \text{dtype\_bytes}$
+>
+> $= 2 \times 32 \times 32 \times 128 \times \text{seq\_len} \times 2 \text{ Bytes}$
+>
+> 当 seq_len = 4096 时：$2 \times 32 \times 32 \times 128 \times 4096 \times 2 = \textbf{2 GB}$。
+>
+> 也就是说，**每一个并发请求** 就需要独占 2 GB 的 KV Cache 显存。对于一张 24 GB 的 RTX 4090，加上模型权重（~14 GB for LLaMA-7B FP16），只剩约 10 GB 用于 KV Cache。在长上下文场景下最多能同时处理 ~5 个请求。这也是 PagedAttention 成为必然需求的直接原因：通过按需分页分配，避免为每个请求预留 2 GB 连续显存（大多数时候实际使用远小于最大值）。
 这种在业界被称为**极其严重的软显存内部碎片（Internal Fragmentation）**的系统漏洞，其实际测算浪费率往往达到夸张的 60% 以上。它成了 LLM 服务提供商滴血的成本刀。
 
 ### 2.2 PagedAttention 的虚拟内存切断与查表移植
