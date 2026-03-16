@@ -26,18 +26,16 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 ```
 
 ## 四、 本地自动脚本基础运行记录
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## kernel_fusion.cu 代码逻辑与测试
-**代码路径**: `11_Inference_Optimization/02_kernel_fusion/kernel_fusion.cu`
-**测试命令**: `./build/11_Inference_Optimization/02_kernel_fusion/kernel_fusion`
+**代码路径**: `11_Inference_Optimization/02_kernel_fusion/kernel_fusion.cu`  
+**测试命令**: `./build/11_Inference_Optimization/02_kernel_fusion/kernel_fusion`  
+**Kernel**: 非融合 `add_kernel`、`relu_kernel`、`scale_kernel`；融合 `fused_add_relu_scale`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**: 非融合顺序执行 Add→ReLU→Scale，中间结果写回全局内存再读入；融合版在寄存器内完成三步，仅 2 读 1 写，有效带宽从约 397 GB/s 提升至约 933 GB/s，Kernel 加速比 2.35×。
 
-**Sanitizer & 运行测试输出**: 
+**运行测试输出**: 
 ```text
 检测到 2 块 CUDA 设备
 设备 0： NVIDIA GeForce RTX 4090
@@ -107,15 +105,13 @@ GPU 总时间：       195.81 ms
 ```
 
 ## kv_cache.cu 代码逻辑与测试
-**代码路径**: `11_Inference_Optimization/01_kv_cache/kv_cache.cu`
-**测试命令**: `./build/11_Inference_Optimization/01_kv_cache/kv_cache`
+**代码路径**: `11_Inference_Optimization/01_kv_cache/kv_cache.cu`  
+**测试命令**: `./build/11_Inference_Optimization/01_kv_cache/kv_cache`  
+**Kernel**: `naive_attention_kernel`, `paged_attention_kernel`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**: Naive 在连续 KV 内存上做简化 Attention 读写；Paged 通过 block_table 与 k_blocks/v_blocks 指针数组实现分页 KV，按块映射减少预分配与碎片。显存节省 37.94%，Kernel 略慢 1.22× 来自间接寻址。
 
-**Sanitizer & 运行测试输出**: 
+**运行测试输出**: 
 ```text
 检测到 2 块 CUDA 设备
 设备 0： NVIDIA GeForce RTX 4090
@@ -187,15 +183,13 @@ Paged 有效带宽：  735.04 GB/s
 ```
 
 ## dynamic_batching.cu 代码逻辑与测试
-**代码路径**: `11_Inference_Optimization/03_dynamic_batching/dynamic_batching.cu`
-**测试命令**: `./build/11_Inference_Optimization/03_dynamic_batching/dynamic_batching`
+**代码路径**: `11_Inference_Optimization/03_dynamic_batching/dynamic_batching.cu`  
+**测试命令**: `./build/11_Inference_Optimization/03_dynamic_batching/dynamic_batching`  
+**Kernel**: `batched_attention_fixed`, `batched_attention_varlen`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**: Static 用 `batched_attention_fixed` 按 max_seq_len 对齐并内部分支跳过 Padding；Varlen 用 `batched_attention_varlen` + `seq_starts` 仅遍历有效 token，显存节省 67.99%，Kernel 耗时接近因 Static 已做分支跳过。
 
-**Sanitizer & 运行测试输出**: 
+**运行测试输出**: 
 ```text
 检测到 2 块 CUDA 设备
 设备 0： NVIDIA GeForce RTX 4090
@@ -273,20 +267,4 @@ Varlen Packed  显存  ：1311.22 MB
 
 ```
 
-## kv_cache 代码逻辑与测试
-**实现逻辑分析**:
-1. **KV Cache**: LLM Transformer 中对过去 token 的 Key 和 Value 进行缓存以避免重复计算。
-2. **访存密集**: 将原先密集计算转变为访存受限计算的推手。
-
-
-## kernel_fusion 代码逻辑与测试
-**实现逻辑分析**:
-1. **Kernel Fusion**: 将多个琐碎的内核合并成一个，避免对 Global memory 的重复读写。
-2. **效率**: 省去了多次 Launch overhead，将很多数据驻留在寄存器或 Shared memory 内部周转。
-
-
-## dynamic_batching 代码逻辑与测试
-**实现逻辑分析**:
-1. **Dynamic Batching**: 动态地将到达推理服务器不同长度或不同时间的请求拼合成批次计算。
-2. **吞吐化**: 使算力密集的硬件得以喂饱。
 

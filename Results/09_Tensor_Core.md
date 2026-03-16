@@ -29,20 +29,26 @@ compute-sanitizer ./build/09_Tensor_Core/<sub_directory>/<binary_name>
 ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./<binary_name>
 ```
 
-## 四、 本地自动脚本基础运行记录
+## 四、 说明与约定
+
+- **wmma_gemm / mixed_precision**：当矩阵规模超过 512 时，代码跳过 CPU 参考计算，并将 `cpu_time_ms` 置为 1.0 以避免除零，故日志中的「CPU vs GPU Kernel 加速比」「CPU vs GPU 总时间加速比」为占位数值，**非真实 CPU/GPU 对比**。
+- 实机有效算力、Kernel 时间、FP32 vs WMMA 加速比等以日志为准。
+
+## 五、 本地自动脚本基础运行记录
 
 *(此下为真机二进制标准执行日志)*
 
 ## wmma_gemm.cu 代码逻辑与测试
 
-**代码路径**: `09_Tensor_Core/01_wmma_gemm/wmma_gemm.cu`
-**测试命令**: `./build/09_Tensor_Core/01_wmma_gemm/wmma_gemm`
+**代码路径**: `09_Tensor_Core/01_wmma_gemm/wmma_gemm.cu`  
+**测试命令**: `./build/09_Tensor_Core/01_wmma_gemm/wmma_gemm`  
+**Kernel**: `wmma_gemm_naive`
 
 **实现逻辑分析**:
 
-1. **硬件级矩阵指令映射**: 本项目利用 `<mma.h>` 手动调用了 Volta 及之后架构中引入的 CUDA Warp Matrix Multiply-Accumulate (WMMA) 能力。代码定义了特殊的 `wmma::fragment` 数据结构来显式装载数据到 Tensor Core 寄存器中。
-2. **执行粒度与吞吐控制**: 核心计算发生在 `wmma::mma_sync` 中。每一个 Warp（32线程）齐心协作执行一个 `16x16x16` 的 FP16 $D = A \times B + C$ 操作。针对大规模数据，依然需要切分 Tile 并在外部应用 Grid-stride 以喂饱全部算力单元。
-3. **排错与测试结果**: 由于原有代码中存在未经优化的 $O(N^3)$ 串行 CPU 校验逻辑且规模高达 2048 计算，导致运行时长达几分钟阻塞。修复加入自动跳过降级逻辑后，GPU (RTX 4090) WMMA 单核跑出纯 Kernel 执行时间约 **0.59 ms**，有效算力达到了 **29.25 TFLOPS**。
+1. **硬件级矩阵指令映射**: 利用 `<mma.h>` 调用 Volta 及之后架构的 WMMA 能力，通过 `wmma::fragment` 将数据装入 Tensor Core 寄存器。
+2. **执行粒度**: 核心在 `wmma::mma_sync`，每个 Warp（32 线程）协作完成 16×16×16 的 FP16 $D = A \times B + C$；大规模时按 Tile 切分、Grid-stride 喂满算力。
+3. **测试结果**: 矩阵 2048 时跳过 CPU 参考；实机日志中 Kernel 时间约 **0.56 ms**，有效算力 **30.50 TFLOPS**（占位加速比见上文说明）。
 
 **Sanitizer & 运行测试输出**:
 
@@ -105,14 +111,15 @@ Naive WMMA:   0.5633 ms (基准)
 
 ## mixed_precision.cu 代码逻辑与测试
 
-**代码路径**: `09_Tensor_Core/02_mixed_precision/mixed_precision.cu`
-**测试命令**: `./build/09_Tensor_Core/02_mixed_precision/mixed_precision`
+**代码路径**: `09_Tensor_Core/02_mixed_precision/mixed_precision.cu`  
+**测试命令**: `./build/09_Tensor_Core/02_mixed_precision/mixed_precision`  
+**Kernel**: `gemm_fp32_kernel`, `wmma_mixed_gemm_kernel`
 
 **实现逻辑分析**:
 
-1. **混合精度的数据设计**: 由于 FP16 的动态范围和舍入容限远小于 FP32，为了防止梯度下溢或上溢发散，核心将输入 A 和 B 限制在 `half`，而内部积累阵列 `wmma::accumulator` 类型设为 `float`，做到了无损全精度累加。
-2. **基准性能对比**: 测试中对立运行了使用普通 CUDA Core 的 FP32 GEMM 进行基准比较。在 1024 维度规模下，传统单精度耗时为 ~0.41 ms (算力约 5.2 TFLOPS)。
-3. **测试结果激增**: 当触发基于 WMMA 的 FP16 -> FP32 混合计算管线后，耗时剧减至约 **0.06 ms**，有效算力激增至 **37.73 TFLOPS**，实现基于基准模型超 **7.2倍** 的吞吐加速，所有浮点检验容差控制在 $0.05f$ 以内均 PASSED 成功通关。
+1. **混合精度设计**: 输入 A、B 为 `half`，累加器 `wmma::accumulator<float>` 为 FP32，防止 FP16 累加溢出。
+2. **基准对比**: 传统 FP32 GEMM（`gemm_fp32_kernel`）与 WMMA 混合精度（`wmma_mixed_gemm_kernel`）同规模 1024 对比；1024 时跳过 CPU 参考，占位加速比见上文说明。
+3. **实测结果**: 实机日志中 FP32 Kernel 约 0.39 ms，WMMA Kernel 约 **0.05 ms**，有效算力 **39.36 TFLOPS**，相对 FP32 约 **7.21×**；结果验证在跳过 CPU 时仅输出跳过提示。
 
 **Sanitizer & 运行测试输出**:
 

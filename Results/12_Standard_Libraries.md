@@ -7,11 +7,11 @@
 - **测试库依赖**: CUDA 原生库 (cuBLAS, cuFFT), CUTLASS, NCCL (针对多卡)
 
 ## 二、 测试方法与执行逻辑
-针对此模块下的实现，测试覆盖了：
-1. **正确性验证 (Correctness Check)**：使用 CPU 计算出基准结果 (Reference)，与 GPU 计算结果进行对比并使用宏 `CHECK` 比较误差。
+本模块按以下维度整理，但需注意：`cublas_gemm.cu` 在 `M=N=K=1024` 时默认跳过 CPU 参考计算，因此其 `0.00 ms / 0.00x` 仅代表“未测占位”，不应视作真实 CPU/GPU 对比。
+1. **正确性验证 (Correctness Check)**：在可承受规模下使用 CPU 计算出基准结果 (Reference) 与 GPU 结果进行对比；大矩阵样例可能显式跳过。
 2. **基本耗时测量 (Timer)**：依赖 `cudaEventRecord` 或者 `std::chrono` 来统计算子的时间。
-3. **安全与内存分析 (Compute Sanitizer)**：部分核心利用 `compute-sanitizer` 检查 Shared Memory/Global Memory 越界。
-4. **性能剖析探测 (Nsight Compute - ncu)**：通过 `ncu` 收集 `sm__throughput`, `dram__bytes` 及寄存器利用率数据。
+3. **安全与内存分析 (Compute Sanitizer)**：是否执行以具体子样例的日志记录为准。
+4. **性能剖析探测 (Nsight Compute - ncu)**：是否执行以具体子样例的日志记录为准。
 
 ## 三、 测试命令模板
 ```bash
@@ -97,11 +97,14 @@ cublasLtMatmul    算力：   50.10 TFLOPS
 StridedBatched    算力：   37.88 TFLOPS (相比单算例通常隐藏了 Kernel 启动开销)
 (RTX 4090 FP32 理论峰值：~82.58 TFLOPS)
 
+说明：M=N=K=1024 时 CPU 计算被视为过慢而跳过，因此 `CPU 单算例执行时间：0.00 ms` 与
+`CPU vs GPU (基础) 加速比：0.00x` **仅为占位输出（表示“未测 / SKIPPED”）**，并非真实 CPU/GPU 对比。阅读或引用本节数据时，应只使用上方 cuBLAS 三行 TFLOPS 数值，忽略所有带有 0.00 ms / 0.00x 的占位字段。
+
 --- 结果验证 ---
   [Skip] cublasSgemm	 validation for large matrices.
   [Skip] cublasLtMatmul	 validation for large matrices.
   [Skip] StridedBatched	 validation for large matrices.
-✓ GPU/CPU 一致性验证全部通过 (处理了 Row-Major 转置机制)
+✓ 本节大矩阵样例已显式跳过 GPU/CPU 逐元素验证；可确认的是 Row-Major 转置处理逻辑已在代码路径中实现，但本次日志不构成 CPU 基线验证通过的证据。
 
 ========================================
 

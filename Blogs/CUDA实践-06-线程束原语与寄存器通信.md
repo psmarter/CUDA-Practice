@@ -1,8 +1,18 @@
 ---
-title: "06_Warp_Primitives：无锁寄存器级通信与底层的四种变体"
+title: CUDA-Practice：06 无锁寄存器级通信与底层的四种变体
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - Warp Shuffle
+  - 寄存器通信
+  - 归约算法
+  - 前缀和
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: fec051fc
 date: 2026-03-12 12:30:00
-tags: [CUDA, Warp Shuffle, 寄存器通信, 归约算法, 前缀和]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -22,11 +32,13 @@ categories: 深度学习系统架构
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `06_Warp_Primitives/01_warp_shuffle/warp_shuffle.cu` | `warp_broadcast`<br>`warp_xor_shuffle`<br>`warp_up_down_shuffle` | 寄存器级互穿通信的原语验证 | `N=33554432`<br>*(128 MB FP32)* |
-| `06_Warp_Primitives/02_warp_reduce/warp_reduce.cu` | `block_reduce_sum`<br>`block_reduce_max` | Warp 内 5 步归约与 Block 级中继融合 | `Block=256`<br>`131072 Blocks` |
-| `06_Warp_Primitives/03_warp_scan/warp_scan.cu` | `block_scan_inclusive`<br>`block_scan_exclusive` | Inclusive 向后推流机制及三阶补偿 | `Block=1024` |
+| `06_Warp_Primitives/01_warp_shuffle/warp_shuffle.cu` | `kernel_warp_broadcast`<br>`kernel_warp_xor_shuffle`<br>`kernel_warp_up_down_shuffle`<br>`test_kernel_warp_reduce_sum` | `__shfl_sync` / `__shfl_xor_sync` / `__shfl_up/down_sync` 四种原语、Warp 内 5 步归约 | `N=33554432`<br>*(128 MB FP32)* |
+| `06_Warp_Primitives/02_warp_reduce/warp_reduce.cu` | `block_reduce_sum`<br>`block_reduce_max` | Warp 内 `kernel_warp_reduce_sum/max` + Shared 中继、Block 级无锁归约 | `Block=256`<br>`131072 Blocks` |
+| `06_Warp_Primitives/03_warp_scan/warp_scan.cu` | `block_scan_inclusive`<br>`block_scan_exclusive` | Warp 内 `__shfl_up_sync` 前缀和 + 跨 Warp 基值、Block 级 Scan | `Block=1024` |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+
+> **本篇在系列中的位置**：承接 [02 归约与线程粗化](/posts/44fe4eb3/) 与 [03 前缀和与多块扫描](/posts/bcb510f9/) 中基于 Shared Memory 的归约与前缀和，本篇在同一「规约/扫描」语义下改用 **Warp Shuffle** 在寄存器级完成 Warp 内通信，再通过 Shared Memory 做跨 Warp 中继，形成 Block 级 Reduce/Scan。后续 [05 大模型算子与注意力归一化](/posts/cb29461c/) 的 Softmax、LayerNorm、RMSNorm 等 Warp 优化直接复用本篇原语；[10 访存优化与共享内存冲突](/posts/5b6f891d/) 则从另一角度讨论 Shuffle 所避免的 Bank Conflict 与合并访存。
 
 ## Baseline
 
@@ -159,13 +171,21 @@ __device__ inline float kernel_warp_scan_inclusive(float val) {
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [02_Reduction_Tree_Algo_and_Coarsening.md](02_Reduction_Tree_Algo_and_Coarsening.md) | 在未了解寄存器穿梭之前，可以去瞻仰和对比原生的 Shared Mem 以及粗化机制老路打法 |
-| [03_Scan_Kogge_Stone_and_MultiBlock.md](03_Scan_Kogge_Stone_and_MultiBlock.md) | 深入阅读理解关于 Kogge-Stone 为什么只有它才能完美适配于底层对数翻折的原理原景 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [02 归约与线程粗化](/posts/44fe4eb3/) | 对比 Shared Memory + `__syncthreads` 的传统归约/粗化老路，与本篇的纯寄存器 Warp Reduce 形成鲜明对照 |
+| [03 前缀和与多块扫描](/posts/bcb510f9/) | 理解 Kogge-Stone/Block Scan 的整体结构，有助于理解本篇如何用 `__shfl_up_sync` 在 Warp 内实现前缀和并拼出 Block 级 Scan |
 
 ### 推荐后续
 
-| 文章 | 关系 |
-|------|------|
-| [05_LLM_Ops_FlashAttention_and_Norms.md](05_LLM_Ops_FlashAttention_and_Norms.md) | 在大杀器 `RMSNorm` 当中重度全景使用了这一整个底层的 `Down_Shfl` 五阶大法，直接拔群十余倍速 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [05 大模型算子与注意力归一化](/posts/cb29461c/) | Softmax、LayerNorm、RMSNorm 等算子的大部分 Warp 级优化（特别是 RMSNorm 的 12× 加速）直接重用本篇介绍的 `__shfl_*` 规约与 Scan 原语 |
+| [10 访存优化与共享内存冲突](/posts/5b6f891d/) | 从访存视角理解为何 Warp Shuffle 能避免 Shared Memory 的 Bank Conflict 与 `__syncthreads()` 开销，与本篇形成「寄存器通信 vs 共享内存」的互补视角 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-05-大模型算子与注意力归一化](/posts/cb29461c/)
+- 下一篇：[CUDA实践-07-量化半精度与整数推理](/posts/ef325d2f/)

@@ -31,7 +31,7 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 ## 四、 本地自动脚本基础运行记录
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## vector_add.cu 代码逻辑与测试
 
@@ -40,9 +40,9 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 **实现逻辑分析**:
 
-1. **核心逻辑**: 这是 CUDA 编程的最基础范例。在 Kernel (`vector_add_kernel`) 中运用了 Grid-Stride Loop（网格跨步循环）设计，`i = blockIdx.x * blockDim.x + threadIdx.x; i += blockDim.x * gridDim.x`机制使得处理超大规模元素 (64M) 时不受 Grid 维度限制。
+1. **核心逻辑**: 这是 CUDA 编程的最基础范例。在 Kernel (`vector_add`) 中采用每线程一元素的方式：`idx = blockIdx.x * blockDim.x + threadIdx.x`，通过足够的 Block 数量覆盖全部 64M 元素，结合合并访存实现高带宽。
 2. **主机管理**: 分配超大内存 (单数组 256MB) 完成 `cudaMemcpy` 搬留。
-3. **性能结果**: Kernel 耗时仅 **0.86ms** 左右。不仅对 CPU 产生 180x+ 加速，在 RTX 4090 上展现了 932.97 GB/s 的极限高带宽表现，完美压榨了显存总线。
+3. **性能结果**: Kernel 耗时仅 **0.86ms** 左右。不仅对 CPU 产生 180x+ 加速，在 RTX 4090 上展现了 932.81 GB/s 的极限高带宽表现，完美压榨了显存总线。
 **Sanitizer & 运行测试输出**:
 
 ```text
@@ -107,7 +107,7 @@ CPU vs GPU 总时间加速比：2.05x
 
 1. **基于 Tiling 改进**: 把全局大矩阵均分为 `TILE_SIZE x TILE_SIZE`（如 32x32）的小方块，并利用每个 Block 极其低延迟的 Shared Memory 寄存局部数据 `__shared__ float s_A[...][...]`。
 2. **减少显存压力**: 通过线程同步 `__syncthreads()`，Block 中多线程能够高效复位和重复利用片内数据，大幅度缩小 Global Memory 的带宽瓶颈拖累。
-3. **性能结果**: 在 1024x1024 测试规模下表现优异，其耗时缩降至 **0.31ms**，运算性能由朴素版的 5200 GFLOPS 跃升至 **6925 GFLOPS**。计算结果与 CPU 对比保持一致无误差。
+3. **性能结果**: 在 1024x1024 测试规模下表现优异，其耗时缩降至 **0.31ms**，运算性能由朴素版的约 5226 GFLOPS 跃升至 **6893 GFLOPS**。计算结果与 CPU 对比保持一致无误差。
 **Sanitizer & 运行测试输出**:
 
 ```text

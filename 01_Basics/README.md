@@ -8,7 +8,7 @@
 
 | 文件 | Kernel 名称 | 优化层级 | 核心技术 |
 |------|------------|----------|---------|
-| `01_vector_add/vector_add.cu` | `vector_add` | L1 带宽感知 | Grid-Stride Loop，合并访存 |
+| `01_vector_add/vector_add.cu` | `vector_add` | L1 带宽感知 | 每线程一元素，合并访存 |
 | `02_matrix_mul_naive/matrix_mul_naive.cu` | `matrix_mul_naive` | L1 朴素基准 | 2D Grid，每线程一个输出元素 |
 | `03_matrix_mul_tiled/matrix_mul_tiled.cu` | `matrix_mul_tiled` | L1 Shared Mem Tiling | `__shared__` + `__syncthreads()` |
 

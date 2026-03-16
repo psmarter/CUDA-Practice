@@ -31,7 +31,7 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 ## 四、 本地自动脚本基础运行记录
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## segmented_scan.cu 代码逻辑与测试
 
@@ -240,5 +240,5 @@ Brent-Kung:    0.0037 ms (0.76x)
 
 **实现逻辑分析**:
 
-1. **扩展前缀和**: 基于Flag数组划定段边界，在跨越段边界时中断累加，只在同段内执行Scan。
-2. **应用场景**: 用于稀疏矩阵计算、图算法中划分不同的子任务区间直接并行计算。
+1. **多 Block 三遍扫描 (3-Pass Scan)**：Pass1 由 `segmented_scan` 在每个 Block 内做 Kogge-Stone 扫描，并将该 Block 的最后一个元素（块和）写入 `block_sums[blockIdx.x]`；Pass2 对 `block_sums` 再执行一次前缀和得到 `scanned_block_sums`；Pass3 由 `add_block_sums` 将前一块的基值 `scanned_block_sums[blockIdx.x-1]` 加回本块所有元素，得到全局前缀和。本实现按 Block 分段，未使用 Flag 数组；基于 Flag 的段边界扫描可作为后续扩展。
+2. **与 coarse_scan 的对比**：`coarse_scan` 为单 Block 内线程粗化 + 段末 KS 扫描，适用于小规模（如 N≤4096）；`segmented_scan` 支持任意大 N，通过多 Block 与三遍扫描完成全局前缀和。

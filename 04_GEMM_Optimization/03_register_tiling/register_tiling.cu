@@ -330,7 +330,8 @@ int main() {
     CpuTimer cpuTimer;
     double cpu_time_ms = 0.0;
     double cpu_gflops = 0.0;
-    if (M <= 512 && N <= 512 && K <= 512) {
+    const bool cpu_enabled = (M <= 512 && N <= 512 && K <= 512);
+    if (cpu_enabled) {
         cpuTimer.start();
         gemm_cpu(h_A.data(), h_B.data(), h_C_cpu.data(), M, N, K);
         cpuTimer.stop();
@@ -340,7 +341,6 @@ int main() {
         cout << "CPU 计算性能：   " << setprecision(2) << cpu_gflops << " GFLOPS\n";
     } else {
         cout << "矩阵尺寸过大，跳过 CPU 参考计算。\n";
-        cpu_time_ms = 1.0;
     }
     cout << "\n";
 
@@ -373,8 +373,12 @@ int main() {
     cout << "cuBLAS SGEMM:    " << setprecision(2) << cublas_tflops << " TFLOPS\n";
     cout << "手写/cuBLAS 比率: " << setprecision(1) << ratio << "%\n";
 
-    double speedup_vs_cpu = cpu_time_ms / res_reg.kernel_ms;
-    cout << "CPU vs 手写 GEMM 加速比：" << setprecision(1) << speedup_vs_cpu << "x\n";
+    if (cpu_enabled) {
+        double speedup_vs_cpu = cpu_time_ms / res_reg.kernel_ms;
+        cout << "CPU vs 手写 GEMM 加速比：" << setprecision(1) << speedup_vs_cpu << "x\n";
+    } else {
+        cout << "CPU vs 手写 GEMM 加速比：N/A (未运行 CPU 参考)\n";
+    }
     cout << "\n";
 
     // 结果验证

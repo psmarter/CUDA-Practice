@@ -1,8 +1,21 @@
 ---
-title: "10_Memory_Optimization：合并访存、Bank Conflict 与异步流水线的三维解构"
+title: CUDA-Practice：10 合并访存、Bank Conflict 与异步流水线的三维解构
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - Coalesced Access
+  - Bank Conflict
+  - Async Copy
+  - AoS
+  - SoA
+  - Padding
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: 5b6f891d
 date: 2026-03-12 15:00:00
-tags: [CUDA, 高性能计算, Coalesced Access, Bank Conflict, Async Copy, AoS, SoA, Padding]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -21,11 +34,13 @@ categories: 深度学习系统架构
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `10_Memory/01_coalesced_access/coalesced_access.cu` | `coalesced_access`<br>`strided_access`<br>`aos_access`/`soa_access` | 步长 1 vs 步长 2 与内存实体版图 | `N=16.7M`<br>(256 MB) |
-| `10_Memory/02_bank_conflict/bank_conflict.cu` | `no_conflict_kernel`<br>`conflict_kernel`<br>`padded_kernel` | Stride 冲撞网及 Bank 步移破解垫 | `4096x4096`<br>(64 MB) |
-| `10_Memory/03_async_copy/async_copy.cu` | `sync_copy_kernel`<br>`single_async_copy`<br>`multi_stage_async` | `cp.async` 软管硬件级重掩盖 | `N=67M`<br>(256 MB) |
+| `10_Memory_Optimization/01_coalesced_access/coalesced_access.cu` | `coalesced_access`<br>`strided_access`<br>`aos_access`<br>`soa_access` | Global 合并访存 Stride=1 vs 2、AoS vs SoA 布局 | `N=16.7M`<br>(单数组 64 MB) |
+| `10_Memory_Optimization/02_bank_conflict/bank_conflict.cu` | `no_bank_conflict`<br>`with_bank_conflict`<br>`padded_no_conflict`<br>`analyze_bank_patterns` | Shared 行/列访问、32-way 冲突、Padding+1 消除 | `4096×4096`<br>(64 MB) |
+| `10_Memory_Optimization/03_async_copy/async_copy.cu` | `sync_copy_kernel`<br>`async_copy_kernel`<br>`pipeline_kernel` | 同步拷贝、`cg::memcpy_async`、`cuda::pipeline` 多阶流水 | `N=67M`<br>(256 MB) |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+>
+> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/) 的合并访存与 Tiling、[06 线程束原语与寄存器通信](/posts/fec051fc/) 的寄存器通信（避免 Shared 的 Bank 冲突），本篇系统拆解**三层访存瓶颈**：Global 合并（Coalescing）、Shared Bank Conflict 与 Padding、Global↔Shared 的 Async Copy。后续 [08 多流、图执行与扩展开发](/posts/b1c0c6a3/) 用 Multi-Stream 掩盖 H2D/D2H、[11 推理优化、融合与键值缓存](/posts/9729c03f/) 在推理链路中复用本篇的合并与 Bank 优化；[13 性能分析、屋顶线与占用率](/posts/803b94d6/) 用 Nsight 量化 Bank 冲突与带宽。
 
 ## Baseline
 
@@ -33,9 +48,9 @@ categories: 深度学习系统架构
 
 | Baseline 类别 | 测试场景 | 指标 | 值 | 数据来源 |
 |---------------|----------|------|----|----------|
-| SoA Access (完美提取) | `N=16.7M` (64 MB) | H2D+计算 | 0.59 ms | [实测] Results/10_Memory.md |
-| 无 Bank 冲突（理论连续）| `4096x4096` | Shared 折返 | 0.15 ms | [实测] Results/10_Memory.md |
-| 阻塞式同步拉取 | `N=67M` (256 MB) | Loop 阻塞时 | 0.60 ms | [实测] Results/10_Memory.md |
+| 合并访问 (Stride=1) | `N=16.7M` (64 MB) | Kernel 时间 | 0.15 ms | [实测] Results/10_Memory_Optimization.md |
+| 无 Bank 冲突 | `4096×4096` (64 MB) | Kernel 时间 | 0.15 ms | [实测] Results/10_Memory_Optimization.md |
+| 同步拷贝 (Sync Copy) | `N=67M` (256 MB) | Kernel 时间 | 0.60 ms | [实测] Results/10_Memory_Optimization.md |
 
 ## 瓶颈分析
 
@@ -73,7 +88,7 @@ categories: 深度学习系统架构
 ### 规避 Bank Conflict 大杀器：Padding Offset
 
 ```cpp
-// 来源：10_Memory/02_bank_conflict/bank_conflict.cu : 局部片选简写
+// 来源：10_Memory_Optimization/02_bank_conflict/bank_conflict.cu
 // 场景：需要在 Shared Mem 中放入一整块巨大的 Tile 用于后续高频倒取
 #define TILE_DIM 32
 
@@ -95,10 +110,10 @@ float val = good_tile[threadIdx.x][col];
 ### 现代化 `cp.async` 管线搭建
 
 ```cpp
-// 来源：10_Memory/03_async_copy/async_copy.cu (使用新特性封装 cuda/pipeline)
-#include <cuda_pipeline.h>
+// 来源：10_Memory_Optimization/03_async_copy/async_copy.cu (cuda::pipeline + cuda::memcpy_async)
+#include <cuda/pipeline.h>
 
-__global__ void multi_stage_async(...) {
+__global__ void pipeline_kernel(...) {
     // 搭建阶段深度为 3 的流水软管管道
     __shared__ float stage_buffers[3][BLOCK_SIZE];
     auto pipeline = cuda::make_pipeline();
@@ -132,14 +147,14 @@ __global__ void multi_stage_async(...) {
 ### 性能对比
 
 > **测试条件**：双 RTX 4090 ($sm\_89$), nvcc -O3
-> **数据来源**：`Results/10_Memory.md` 原始实机日志，均以 100次 求均值
+> **数据来源**：`Results/10_Memory_Optimization.md` 原始实机日志，均以 100 次求均值
 
 **1. 极端带宽绞杀局：合并失效下沿探测（64 MB体量）**
 
 | 内存拉取模式 | 实机运行期跨 | 有效吸吞带宽 | 较基线倍比 | 数据性质 |
 |--------------|--------------|--------------|------------|----------|
 | 完全连缀读取 (Stride=1) | 0.15 ms      | **925.31 GB/s**| 1.00x 基期 | [实测] |
-| 断裂点状单步 (Stride=2) | 0.16 ms      | **427.34 GB/s**| 1.08x 带宽斩半 | [实测] |
+| 断裂点状单步 (Stride=2) | 0.16 ms      | **427.34 GB/s**| 耗时约 1.08×，带宽约折半 | [实测] |
 
 极其残酷：在仅发生一步偏移拉接失效，由于被物理抓头强行补足垃圾位块数据，有效运力轰塌至原先 46%。
 
@@ -150,7 +165,7 @@ __global__ void multi_stage_async(...) {
 | SoA (连续聚合群拉) | 0.59 ms      | 912.82 GB/s  | 1.00x 基数 | [实测] |
 | AoS (跳步结构抽取) | 0.58 ms      | 922.31 GB/s  | 全等位持平 | [实测] |
 
-本应当遭遇重刑制裁的跨步结构阵列（AoS 跳跃 $x, y, z$）其结果与高优连阵并无异变。该底核答案揭晓在：此次被实验吞吐量恰巧横置在了这块硅片标定的 72 MB 特极缓存防波堤内！纵有严重乱跳，也极其快速命中在全包络网段被内场消化了。一旦数据过破亿海量被全数抛至极慢外沿（HBM），这等逆天幻影必将反弹回落被带宽按头反噬。这种伪好象给评测量化立下了不可信环境缓存溢涨的大忌。
+本实验中 **AoS kernel 同时读写 x/y/z/w 四字段**，访问模式仍是合并的，故 AoS 与 SoA 带宽接近（922 vs 913 GB/s）。若只读单字段的 AoS 会呈非合并，未在本测试中单独跑。数据量 64 MB 落在 L2（72 MB）内，也会抬高有效带宽；更大体量抛向 HBM 时合并与否的差距会更明显。
 
 ### 边界条件与局限
 
@@ -167,12 +182,22 @@ __global__ void multi_stage_async(...) {
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [01_Basics_Concepts_and_Tiling.md](01_Basics_Concepts_and_Tiling.md) | 有必要了解真正的线程与线程束基础阵型关系再来看这种极限拉散排步 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [01 基础概念与分块](/posts/7608f1b0/) | 先建立 Grid/Block/Warp、合并访存与 Shared Tiling 的直观，再在本篇深入 Coalescing 与 Bank 的定量分析 |
+| [06 线程束原语与寄存器通信](/posts/fec051fc/) | Warp Shuffle 用寄存器通信规避 Shared 的 Bank 冲突与 __syncthreads 开销；本篇从 Shared 侧讲清冲突成因与 Padding 解法 |
 
 ### 推荐后续
 
-| 文章 | 关系 |
-|------|------|
-| [13_Performance_Analysis_Roofline_Occupancy.md](13_Performance_Analysis_Roofline_Occupancy.md) | 你将会学到怎样使用官方真金极探仪（Nsight）直接切进最黑的黑匣抓获真正因 Bank 流产折叠了的指标红字报警 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [08 多流、图执行与扩展开发](/posts/b1c0c6a3/) | 用 Multi-Stream 掩盖 H2D/D2H，与本篇的「单 Kernel 内合并 + Async Copy」形成系统级与内核级两层访存优化 |
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 推理链路中合并访存、Bank 优化与 Async Copy 的落地场景 |
+| [13 性能分析、屋顶线与占用率](/posts/803b94d6/) | 用 Nsight Compute 量化 Bank 冲突、带宽与 Roofline 拐点，验证本篇优化效果 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-09-张量核心与混合精度](/posts/78e375e8/)
+- 下一篇：[CUDA实践-11-推理优化融合与键值缓存](/posts/9729c03f/)

@@ -1,8 +1,22 @@
 ---
-title: "07_Quantization：FP16 带宽翻倍、INT8 dp4a 指令与混合精度工程学"
+title: CUDA-Practice：07 FP16 带宽翻倍、INT8 dp4a 指令与混合精度工程学
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - 量化
+  - FP16
+  - INT8
+  - dp4a
+  - 混合精度
+  - Vectorized
+  - GEMM
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: ef325d2f
 date: 2026-03-12 14:00:00
-tags: [CUDA, 高性能计算, 量化, FP16, INT8, dp4a, 混合精度, Vectorized, GEMM]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -21,11 +35,13 @@ categories: 深度学习系统架构
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `07_Quantization/03_quant_dequant/quant_dequant.cu` | `quantize_per_tensor`<br>`quantize_per_channel`<br>`fp32_to_fp16_cast` | Absmax 量化缩放与类型硬转 | `N=10M` |
-| `07_Quantization/01_fp16_gemm/fp16_gemm.cu` | `gemm_fp16_naive`<br>`gemm_fp16_tiled`<br>`gemm_fp16_vectorized` | `half2` 与 `__hfma2` 双路突袭 | `1024x1024` |
-| `07_Quantization/02_int8_gemm/int8_gemm.cu` | `gemm_int8_dp4a`<br>`gemm_int8_vectorized_dp4a` | 4位 INT8 并置打包 / `__dp4a` | `1024x1024` |
+| `07_Quantization/03_quant_dequant/quant_dequant.cu` | `quantize_per_tensor`<br>`dequantize_per_tensor`<br>`quantize_per_channel`<br>`fp32_to_fp16`<br>`fp16_to_fp32` | Absmax 量化、Per-Tensor / Per-Channel 缩放、FP32↔FP16 类型转换 | `N=10M` |
+| `07_Quantization/01_fp16_gemm/fp16_gemm.cu` | `kernel_naive_fp16_gemm`<br>`kernel_tiled_fp16_gemm`<br>`kernel_vectorized_fp16_gemm` | `half`/`half2` GEMM、Shared Memory Tiling、`__hfma2` 向量化 | `1024x1024` |
+| `07_Quantization/02_int8_gemm/int8_gemm.cu` | `naive_int8_gemm`<br>`dp4a_int8_gemm`<br>`vectorized_int8_gemm` | 标量 INT8 GEMM、`__dp4a`、向量化重排 + `int4` 写回 | `1024x1024` |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+>
+> **本篇在系列中的位置**：承接 [05 大模型算子与注意力归一化](/posts/cb29461c/) 中 Softmax/LayerNorm/RMSNorm 的数值敏感度讨论，本篇从**数据类型与量化**角度回答「如何在几乎不丢精度的前提下，把这些算子搬到 FP16/INT8 上」。后续 [09 张量核心与混合精度](/posts/78e375e8/) 会进一步利用 Tensor Core 把本篇的 FP16/INT8 GEMM 提升到指令峰值，而 [11 推理优化、融合与键值缓存](/posts/9729c03f/) 则在系统层面串联「量化 + 算子融合 + KV Cache」的完整推理链路。
 
 ## Baseline
 
@@ -162,10 +178,19 @@ categories: 深度学习系统架构
 
 | 文章 | 关系 |
 |------|------|
-| [04_GEMM_Optimization_Register_Tiling.md](04_GEMM_Optimization_Register_Tiling.md) | 在掌握量化切分之前，必须吃透该文关于寄存器瓦片是如何在 32 位体系里封锁共享内存通道的深源理念 |
+| [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) | 先理解 FP32 下寄存器分块 / 外积累加 / Double Buffering 的 GEMM 优化，再在本篇基础上把这些结构迁移到 FP16/INT8 上 |
+| [05 大模型算子与注意力归一化](/posts/cb29461c/) | 知道哪些算子（Softmax、LayerNorm、RMSNorm、FlashAttention）最吃带宽、对数值最敏感，有助于判断哪些部分适合采用 FP16 或 INT8 量化 |
 
 ### 推荐后续
 
 | 文章 | 关系 |
 |------|------|
-| [09_Tensor_Core_WMMA_Mixed_Precision.md](09_Tensor_Core_WMMA_Mixed_Precision.md) | 在学会利用 `half2` 在底端汇编压榨双发后，去阅读此文知晓怎样用一排原生函数直接唤醒整块光固化硅晶列阵去吞并算量 |
+| [09 张量核心与混合精度](/posts/78e375e8/) | 在学会用 `half2` / `__dp4a` 做标量/向量级混合精度后，进一步理解 WMMA API 如何把 FP16/INT8 推到 Tensor Core 峰值 |
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 站在系统视角看「量化 + KV Cache + Kernel Fusion」的整体推理优化，将本篇的低精度算子嵌入实际 LLM 推理流水线 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-06-线程束原语与寄存器通信](/posts/fec051fc/)
+- 下一篇：[CUDA实践-08-多流图执行与扩展开发](/posts/b1c0c6a3/)

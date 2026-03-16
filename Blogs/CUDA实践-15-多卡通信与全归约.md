@@ -1,8 +1,23 @@
 ---
-title: "15_Multi_GPU：Ring AllReduce 数学推导与 NCCL 实现"
+title: CUDA-Practice：15 Ring AllReduce 数学推导与 NCCL 实现
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - Multi-GPU
+  - NCCL
+  - AllReduce
+  - Ring Topology
+  - 分布式训练
+  - 梯度同步
+  - PCIe
+  - NVLink
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: b599e19f
 date: 2026-03-12 11:30:00
-tags: [CUDA, 高性能计算, Multi-GPU, NCCL, AllReduce, Ring Topology, 分布式训练, 梯度同步, PCIe, NVLink]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -22,6 +37,10 @@ categories: 深度学习系统架构
 | 源文件 | API 类型 | 核心执行逻辑 / 并行范式 | 测试规模 |
 |--------|---------|-------------------------|----------|
 | `15_Multi_GPU/01_nccl_allreduce/nccl_allreduce.cu` | CUDA/NCCL API | `ncclAllReduce` 多卡梯度求和同步 | `size=1024*1024`<br>`Type=Float` |
+
+> API 名称与源码中的调用保持一致。
+>
+> **本篇在系列中的位置**：承接 [08 多流、图执行与扩展开发](/posts/b1c0c6a3/)、[11 推理优化、融合与键值缓存](/posts/9729c03f/)、[12 标准库与工程实践](/posts/a1e20e80/)、[13 性能分析、屋顶线与占用率](/posts/803b94d6/) 中单机/单卡调度、算子优化与性能建模的内容，本篇将视角扩展到 **多 GPU 通信拓扑与 AllReduce 算法本身**，回答「当单卡 Kernel 已跑满后，多卡训练/推理还卡在哪里，以及 Ring AllReduce / NCCL 如何在物理拓扑上逼近极限」。
 
 ## Baseline
 
@@ -156,12 +175,22 @@ categories: 深度学习系统架构
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [08_Advanced_CUDAGraphs_Streams_Extensions.md](08_Advanced_CUDAGraphs_Streams_Extensions.md) | 在阅读使用多流并行掩盖通信迟延前，建议先复习理解 Stream 框架 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [08 多流、图执行与扩展开发](/posts/b1c0c6a3/) | 理解单机上如何用 Stream / CUDA Graphs 做通信与计算重叠，是扩展到多机/多卡 Pipeline Overlap 的基础 |
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 先看单机 LLM 推理/训练中如何榨干算力与显存，再在本篇基础上思考多卡训练中 AllReduce 带来的新瓶颈 |
+| [13 性能分析、屋顶线与占用率](/posts/803b94d6/) | 用 Roofline/带宽模型理解 Parameter Server 与 Ring AllReduce 在通信带宽上的理论差异 |
 
 ### 推荐后续
 
-| 文章 | 关系 |
-|------|------|
-| [11_Inference_Optimization_Fusion_KVCache.md](11_Inference_Optimization_Fusion_KVCache.md) | 前往工业最前沿阅读通信无法被降低时如何优化内核显存访问 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [12 标准库与工程实践](/posts/a1e20e80/) | 多卡训练中局部算子仍依赖高性能标准库，需要与通信优化一起综合考虑整体吞吐 |
+| [14 模板矩阵乘与代数布局](/posts/f1b57921/) | 当 AllReduce 开销被压缩后，局部 GEMM/Attention 内核将重新成为瓶颈，需依赖 CUTLASS/CuTe 构建接近 cuBLAS 的自定义核 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-14-模板矩阵乘与代数布局](/posts/f1b57921/)
+- 下一篇：无，建议返回[CUDA实践-00-系列导读与学习路线](/posts/d6fa227a/)重新选择学习路线。

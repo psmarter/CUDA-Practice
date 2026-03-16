@@ -1,8 +1,22 @@
 ---
-title: "12_Standard_Libraries：cuBLAS、cuFFT 与 Thrust——站在巨人肩上的正确姿势"
+title: CUDA-Practice：12 cuBLAS、cuFFT 与 Thrust——站在巨人肩上的正确姿势
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - cuBLAS
+  - cuFFT
+  - Thrust
+  - 标准库
+  - GEMM
+  - FFT
+  - 并行算法
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: a1e20e80
 date: 2026-03-12 15:30:00
-tags: [CUDA, 高性能计算, cuBLAS, cuFFT, Thrust, 标准库, GEMM, FFT, 并行算法]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -19,13 +33,15 @@ categories: 深度学习系统架构
 > **硬件环境**：NVIDIA RTX 4090 (Ada Lovelace, sm_89)
 > 128 SMs | FP32 82.6 TFLOPS | HBM 1008 GB/s | L2 72 MB | Roofline 拐点 81.9 FLOP/Byte
 
-| 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
-|--------|-------------|----------|----------|
-| `12_Standard/01_cublas_gemm/cublas_gemm.cu` | `cublasSgemm`<br>`cublasLtMatmul`<br>`StridedBatched` | 官方底层最优解极限与批次并投 | `1024x1024`<br>(Batch 8) |
-| `12_Standard/02_cufft/cufft_example.cu` | `cufftExecC2C` | 快速频变与宏级管线批转 | `N=4096`<br>`N=65536`串频 |
-| `12_Standard/03_thrust/thrust_algorithms.cu` | `sort`, `reduce`, `transform` | 并发泛型库单发截杀 | `N=10M`<br>(38.15 MB) |
+| 源文件 | Kernel / 接口 | 核心技术 | 测试规模 |
+|--------|---------------|----------|----------|
+| `12_Standard_Libraries/01_cublas_gemm/cublas_gemm.cu` | `cublasSgemm`<br>`cublasLtMatmul`<br>`cublasSgemmStridedBatched` | cuBLAS GEMM 基础/启发式/批处理接口 | `1024×1024`<br>(Batch 8) |
+| `12_Standard_Libraries/02_cufft/cufft_example.cu` | `cufftExecC2C` | cuFFT 1D FFT/IFFT、Batch 规划与带宽测评 | `N=4096` 单次<br>`Batch=65536,N=1024` |
+| `12_Standard_Libraries/03_thrust/thrust_algorithms.cu` | `thrust::sort`<br>`thrust::reduce`<br>`thrust::transform` | Thrust 并行排序/归约/变换 | `N=10M`<br>(38.15 MB) |
 
 > 库接口名称及测试执行项完全依照 NVIDIA 官方原生 API 进行排置查验。
+>
+> **本篇在系列中的位置**：承接 [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) 与 [09 张量核心与混合精度](/posts/78e375e8/) 对「手写 GEMM 极限」的探索，本篇给出工业界**性能上限基准**——cuBLAS/cuFFT/Thrust 等标准库，帮助你判断「何时该自己写 Kernel、何时该老老实实调库」。后续 [14 模板矩阵乘与代数布局](/posts/f1b57921/) 展示如何在库与手写之间，用模板库生成接近 cuBLAS 的专用算子。
 
 ## Baseline
 
@@ -33,9 +49,9 @@ categories: 深度学习系统架构
 
 | Baseline 类别 | 测试场景 | 指标 | 值 | 数据来源 |
 |---------------|----------|------|----|----------|
-| CPU DFT 基底测算 | `N=4096` 步数 | CPU 完全计算时间 | 395.07 ms | [实测] Results/12_Std.md |
-| CPU 常规 Sort 测算 | `N=10M` 浮点数 | 标准库排列总时 | 2124.06 ms | [实测] Results/12_Std.md |
-| CPU std accumulate| `N=10M` | 规约极限时 | 28.35 ms | [实测] Results/12_Std.md |
+| CPU DFT 基底测算 | `N=4096` 步数 | CPU 完全计算时间 | 395.07 ms | [实测] Results/12_Standard_Libraries.md |
+| CPU 常规 Sort 测算 | `N=10M` 浮点数 | 标准库排列总时 | 2124.06 ms | [实测] Results/12_Standard_Libraries.md |
+| CPU std accumulate| `N=10M` | 规约极限时 | 28.35 ms | [实测] Results/12_Standard_Libraries.md |
 
 ## 瓶颈分析
 
@@ -119,16 +135,16 @@ categories: 深度学习系统架构
 ### 性能对比
 
 > **测试条件**：双 RTX 4090 ($sm\_89$), nvcc -O3
-> **数据来源**：`Results/12_Std.md` 原始实机日志，均以数十余百次重击求真均。
+> **数据来源**：`Results/12_Standard_Libraries.md` 原始实机日志，均以多次重复取平均。
 
-**1. cuBLAS 天花板打底算力检算 (1024 方块形核矩阵)**
+**1. cuBLAS 天花板打底算力检算 (1024 方块形核矩阵，CPU 侧为“跳过/占位”)**
 
 | 装配模式调用口 | 单次极微核期内跨量 | 核定峰值暴发界 (TFLOPS) | 数据性质 |
 |----------------|--------------------|-------------------------|----------|
 | 纯版 `cublasSgemm` | 0.04 ms          | **49.91 TFLOPS**        | [实测] |
 | Tensor级 `cublasLt`| 0.04 ms          | **50.10 TFLOPS**        | [实测] |
 
-对 $1024 \times 1024$ 型格在极其极其缩端的微毫下（只花0.04 毫秒）库就已经稳定将有效计算打达 50T（其在更大规模甚至将逼触到封底线 82T 顶峰）。而手刻在极致的瓦片拼花调配压榨也只是勉强能碰到其约一半车尾端。不与神作对是绝对定律。
+对 $1024 \times 1024$ 型格在极其极其缩端的微毫下（只花 0.04 毫秒）库就已经稳定将有效计算打达 50T（其在更大规模甚至将逼触到封底线 82T 顶峰）。而手刻在极致的瓦片拼花调配压榨也只是勉强能碰到其约一半车尾端。不与神作对是绝对定律。需要特别指出的是：在 `Results/12_Standard_Libraries.md` 对应的日志中，CPU 端为了避免 1024 规模下的长时间运行被**刻意跳过**，因此出现了 `CPU 单算例执行时间：0.00 ms / CPU vs GPU 加速比：0.00x` 这类**占位字段**——这些数字仅表示“未测 / SKIPPED”，不能被当作真实 CPU 性能或加速比来引用。
 
 **2. cuFFT 并法下发提批增量极限 (N=4096 / Batch 下挂测)**
 
@@ -165,12 +181,21 @@ categories: 深度学习系统架构
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [04_GEMM_Optimization_Register_Tiling.md](04_GEMM_Optimization_Register_Tiling.md) | 在领教何为顶级封神代码运算威力之前深刻理清楚纯人脑拼抢对这些深层网卡调动的恐怖工作壁垒极限 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) | 手写 GEMM 的极致优化与 28.79 TFLOPS 上限，帮助你理解 cuBLAS 50 TFLOPS 是什么量级 |
+| [09 张量核心与混合精度](/posts/78e375e8/) | 了解 Tensor Core/WMMA 能力，再对比 cuBLAS 背后自动利用 Tensor Core 的工业实现 |
 
 ### 推荐后续
 
-| 文章 | 关系 |
-|------|------|
-| [14_CUTLASS_TemplateGEMM_CuTe.md](14_CUTLASS_TemplateGEMM_CuTe.md) | 在深感底层官方闭合库之不容针尖钻入但又面临极其庞大需要自接小算核去重合（Epilogue Fusion）需求局势下的唯一次世代解脱通道途径！ |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 在推理系统中，把 cuBLAS/cuFFT/Thrust 作为基础算子调用，与 Kernel Fusion / KV Cache / Batching 结合 |
+| [14 模板矩阵乘与代数布局](/posts/f1b57921/) | 当标准库无法满足算子融合/特殊布局时，用 CUTLASS/CuTe 生成类似 cuBLAS 水平的专用内核 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-11-推理优化融合与键值缓存](/posts/9729c03f/)
+- 下一篇：[CUDA实践-13-性能分析屋顶线与占用率](/posts/803b94d6/)

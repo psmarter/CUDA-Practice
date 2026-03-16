@@ -31,7 +31,7 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 ## 四、 本地自动脚本基础运行记录
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## nsight_profiling.cu 代码逻辑与测试
 

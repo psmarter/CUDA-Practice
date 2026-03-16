@@ -1,8 +1,19 @@
 ---
-title: "03_Scan：并行前缀和算法路线选择与端到端扩展"
+title: CUDA-Practice：03 并行前缀和算法路线选择与端到端扩展
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - Prefix Sum
+  - Scan
+  - Kogge-Stone
+  - Brent-Kung
+  - Shared Memory
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: bcb510f9
 date: 2026-03-12 13:30:00
-tags: [CUDA, Prefix Sum, Scan, Kogge-Stone, Brent-Kung, Shared Memory]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -21,10 +32,12 @@ categories: 深度学习系统架构
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `03_Scan/01_prefix_sum/prefix_sum.cu` | `kogge_stone_scan_kernel`<br>`brent_kung_scan_kernel` | 单 Block 下极致 Span 与极致 Work 的对撞演练 | `N=1024` |
-| `03_Scan/02_segmented_scan/segmented_scan.cu` | `scan_pass1_coarse`<br>`scan_pass2_block_sums`<br>`scan_pass3_add_base` | Thread Coarsening（4K）与百万级 3-Pass 端到端扩展 | `N=4096`<br>`N=1048576` |
+| `03_Scan/01_prefix_sum/prefix_sum.cu` | `kogge_stone_scan`<br>`brent_kung_scan` | 单 Block KS（$\log N$ 步）/ BK（两阶段树），Shared Memory 双缓冲防 RAW | `N=1024` |
+| `03_Scan/02_segmented_scan/segmented_scan.cu` | `coarse_scan`<br>`segmented_scan`<br>`add_block_sums` | 单 Block 粗化 + 段末 KS（N≤4096）；多 Block 3-Pass（Pass1 块内 KS+block_sums，Pass2 对 block_sums Scan，Pass3 add_block_sums） | `N=4096`<br>`N=1048576` |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+
+> **本篇在系列中的位置**：承接 [02 归约与线程粗化](/posts/44fe4eb3/) 的树形折叠与 Shared Memory 同步，本篇在同一层级做**需保留每一步中间结果**的前缀和（Scan），并推广到多 Block（3-Pass）。后续 [06 线程束原语与寄存器通信](/posts/fec051fc/) 可用 `__shfl_up_sync` 等做 Warp 内无 Shared Memory 的 Scan；[12 标准库与工程实践](/posts/a1e20e80/) 的 Thrust 提供工业级 `inclusive_scan` 可对比本实现。
 
 ## Baseline
 
@@ -91,29 +104,28 @@ categories: 深度学习系统架构
 
 - KS 的致命微操在于：整个读取与修改全部砸在同一片物理 Shared Memory 里。因为步数被砍得极低极暴力，各个线程交战区重叠面积极其庞大。假如拔掉中间的 `__syncthreads()`，右方速度爆表的线程会瞬间把刚刚的最新和写回覆盖在左边那帮还甚至没来得及作为基础读取的原本数上 ($RAW \ Hazard$)。双护城河锁与局部私自缓存变量 `val` 是隔离时空冲突的不二之法。
 
-### 工业架构的分段粗化补齐 (Coarsening)
+### 单 Block 粗化扫描 (coarse_scan) 与 3-Pass 分工
 
 ```cpp
-// 来源：03_Scan/02_segmented_scan/segmented_scan.cu : scan_pass1_coarse 内
-// 在应对不那么长的片段（N=4096），不必切入昂贵耗时三段排队流水，直接让1024人每个吃饱4个
-    float thread_sum = 0.0f;
-    float local_vals[COARSE_FACTOR]; // 私自寄存器扣押缓冲
-
-    #pragma unroll
+// 来源：03_Scan/02_segmented_scan/segmented_scan.cu : coarse_scan 核心思路（N≤4096 单 Block）
+// shared_data[0..n-1] 存数据，section_sums 紧接其后存每段末尾值
     for (int i = 0; i < COARSE_FACTOR; ++i) {
-        int idx = tid + i * blockDim.x;
-        // 把数据读断进私有并先给自己身上强加一次内部顺序和
-        if (idx < length) {
-            thread_sum += input[idx]; 
-            local_vals[i] = thread_sum; 
-        }
+        int index = tid * COARSE_FACTOR + i;
+        if (index < n) shared_data[index] = input[index];
     }
-    // 把 thread_sum 这个极致的高级摘要抛向 shared_data 然后调用唯一的 Kogge Stone 
+    __syncthreads();
+    // 段内顺序前缀和
+    for (int i = 1; i < COARSE_FACTOR; ++i) {
+        int index = tid * COARSE_FACTOR + i;
+        if (index < n) shared_data[index] += shared_data[index - 1];
+    }
+    __syncthreads();
+    // 收集每段末尾 → section_sums，再对 section_sums 做 KS，最后把 section_sums[section_id-1] 加回并写 output
 ```
 
 **要点解读**：
 
-- 当数据量小浮至 4096 这条线，切 `3-Pass` 架构会导致三次跨 HBM 存读唤醒税极不划算。只要直接开挂 `COARSE_FACTOR` 并用纯串行的 `local_vals` 作为自己的一亩三分地吃下冗余，最后只需做极其唯一的一次 `KS` 打平然后反退回即可，该法比前者三核起转还要压下近 30% 耗时。
+- 当 N=4096 时，单 Block 用 `coarse_scan`：每线程负责 COARSE_FACTOR 个元素，先段内顺序前缀和，再对「段末值」做一次 KS 得到段前缀和，最后加回。避免 3-Pass 的多次 Kernel 与 HBM 往返，实测比同规模下 3-Pass 的 Segmented Scan 略快（约 0.0047 ms vs 0.0059 ms [实测]）。大规模 N=1M 必须用 3-Pass（`segmented_scan` + 对 block_sums 再 Scan + `add_block_sums`）。
 
 ## 结果与边界
 
@@ -156,12 +168,20 @@ categories: 深度学习系统架构
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [02_Reduction_Tree_Algo_and_Coarsening.md](02_Reduction_Tree_Algo_and_Coarsening.md) | 在 Shared Memory 还未明晰前对树形折返原理操作体系底座的宏观补充 |
+| 文章 | 与本篇的衔接 |
+|------|----------------|
+| [02 归约与线程粗化](/posts/44fe4eb3/) | 树形折叠、Shared Memory 与 `__syncthreads` 的用法；本篇在同一套同步与存储层级上做「保留中间结果」的前缀和并扩展到多 Block |
 
-### 推荐后续
+### 推荐后续（承上启下）
 
-| 文章 | 关系 |
-|------|------|
-| [06_Warp_Primitives_Register_Shuffle.md](06_Warp_Primitives_Register_Shuffle.md) | 用寄存器底层的 `__shfl_up_sync` 原理解开最后那二十多下 `__syncthreads` 死锁紧闭墙的神级跳跃，带你了解为什么寄存器级永远没有护城河数据竞态！ |
+| 文章 | 与本篇的衔接 |
+|------|----------------|
+| [06 线程束原语与寄存器通信](/posts/fec051fc/) | 用 `__shfl_up_sync` 等在 Warp 内做无 Shared Memory 的 Scan，减少 `__syncthreads` 与 Bank 冲突，与本篇 KS 双缓冲形成对照 |
+| [12 标准库与工程实践](/posts/a1e20e80/) | Thrust 的 `inclusive_scan` 等可与本实现做正确性与性能对比，理解工业库的封装与优化取舍 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-02-归约与线程粗化](/posts/44fe4eb3/)
+- 下一篇：[CUDA实践-04-矩阵乘优化与寄存器分块](/posts/1a09f6f/)

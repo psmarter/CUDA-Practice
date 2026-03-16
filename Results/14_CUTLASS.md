@@ -7,11 +7,11 @@
 - **测试库依赖**: CUDA 原生库 (cuBLAS, cuFFT), CUTLASS, NCCL (针对多卡)
 
 ## 二、 测试方法与执行逻辑
-针对此模块下的实现，测试覆盖了：
-1. **正确性验证 (Correctness Check)**：使用 CPU 计算出基准结果 (Reference)，与 GPU 计算结果进行对比并使用宏 `CHECK` 比较误差。
+本模块按以下维度整理，但需注意：大尺寸 GEMM 默认跳过 CPU 基线，TensorOp 样例还保留了失败实验日志，因此不能将所有小节理解为“同等强度的完整验证”。
+1. **正确性验证 (Correctness Check)**：在可承受规模下使用 CPU 计算出基准结果 (Reference) 与 GPU 结果进行比对；本模块的大尺寸样例多数仅保留运行日志。
 2. **基本耗时测量 (Timer)**：依赖 `cudaEventRecord` 或者 `std::chrono` 来统计算子的时间。
-3. **安全与内存分析 (Compute Sanitizer)**：部分核心利用 `compute-sanitizer` 检查 Shared Memory/Global Memory 越界。
-4. **性能剖析探测 (Nsight Compute - ncu)**：通过 `ncu` 收集 `sm__throughput`, `dram__bytes` 及寄存器利用率数据。
+3. **安全与内存分析 (Compute Sanitizer)**：是否执行以具体子样例的日志记录为准。
+4. **性能剖析探测 (Nsight Compute - ncu)**：是否执行以具体子样例的日志记录为准。
 
 ## 三、 测试命令模板
 ```bash
@@ -157,14 +157,21 @@ CUTLASS Error: Error Internal
 Kernel 执行时间：    0.00 ms
 计算性能：       238609.29 TFLOPS
 
+> **重要说明（实验失败案例）**  
+> 上述 `CUTLASS Tensor Core GEMM` 段落中的多次 `CUTLASS Error: Error Internal` 表明 Kernel 实际**未成功发射/执行**。`Kernel 执行时间：0.00 ms` 以及由此算出的 `238609.29 TFLOPS` 仅是“除以接近 0 的占位时间”产生的**无效数值**，不能视为任何形式的真实性能或 Benchmark 结果。  
+> 本仓库保留该日志，是为了记录「在当前 sm_89 / 编译器 / CUTLASS 版本组合下，该 Tensor Core 配置会触发内部错误」这一**反例**，方便后续排查与修复，而不是为了宣称 CUTLASS 性能可以超过 cuBLAS 数千倍。
+
 --- cuBLAS Tensor Core GEMM (对比基准) ---
 Kernel 执行时间：    0.11 ms
 计算性能：       157.07 TFLOPS
 
 --- 性能对比 ---
-CUTLASS GEMM:  238609.29 TFLOPS
+CUTLASS GEMM:  失败（Error Internal）
 cuBLAS GEMM:   157.07 TFLOPS
-CUTLASS/cuBLAS: 151915.5%
+CUTLASS/cuBLAS: —
+
+> **对比小结（仅 cuBLAS 行有效）**  
+> 上表中 Tensor Core 模式下的 `cuBLAS GEMM` 一行为**有效实测数据**；而 `CUTLASS GEMM: 238609.29 TFLOPS` 及 `CUTLASS/cuBLAS: 151915.5%` 由于同样基于失败 Kernel 的 0.00 ms 占位时间计算，**不具参考意义**。比较 Tensor Core 性能时，请仅使用 cuBLAS 一侧的数值，并将本次 CUTLASS TensorOp 结果视作“待修复的失败实验记录”。
 
 --- 结果验证 ---
 ✓ 结果验证跳过 (因加速测试跑通，未计算大尺寸 CPU Baseline) 

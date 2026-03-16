@@ -1,8 +1,20 @@
 ---
-title: "09_Tensor_Core：硬件原生矩阵指令与混合精度协同"
+title: CUDA-Practice：09 硬件原生矩阵指令与混合精度协同
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - Tensor Core
+  - WMMA
+  - 混合精度
+  - FP16
+  - GEMM
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: 78e375e8
 date: 2026-03-11 12:00:00
-tags: [CUDA, 高性能计算, Tensor Core, WMMA, 混合精度, FP16, GEMM]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -26,6 +38,8 @@ categories: 深度学习系统架构
 | `09_Tensor_Core/02_mixed_precision/mixed_precision.cu` | `wmma_mixed_gemm_kernel` | FP16 输入 + FP32 累加混合精度防溢出 | M=N=K=1024 |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+>
+> **本篇在系列中的位置**：承接 [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) 的寄存器分块、[07 量化、半精度与整数推理](/posts/ef325d2f/) 的 FP16/INT8 数据类型，本篇从**硬件指令级**把 GEMM 从 CUDA Core 标量 FMA 升级到 **Tensor Core WMMA**（16×16×16 矩阵乘加），并说明混合精度（FP16 输入 + FP32 累加）如何兼顾吞吐与数值稳定。后续 [14 模板矩阵乘与代数布局](/posts/f1b57921/) 会在工业级模板下进一步压榨 WMMA；[11 推理优化、融合与键值缓存](/posts/9729c03f/) 则把 Tensor Core 置于完整推理流水线中理解。
 
 ## Baseline
 
@@ -148,13 +162,21 @@ __global__ void wmma_mixed_gemm_kernel(const half* A, const half* B, float* C, C
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [04_GEMM_Optimization_Register_Tiling.md](04_GEMM_Optimization_Register_Tiling.md) | 了解传统 CUDA Core 下的极致并行运算天花板与排布规律 |
-| [07_Quantization_FP16_INT8_dp4a.md](07_Quantization_FP16_INT8_dp4a.md) | 深入理解本章 FP16 精度类型数值表示的物理层原理解读 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) | 先掌握 CUDA Core 下的 Register Tiling、外积累加与 Double Buffering，再理解本篇如何用 WMMA 在**指令级**替代标量 FMA，实现同语义下的数量级算力跃升 |
+| [07 量化、半精度与整数推理](/posts/ef325d2f/) | FP16 数据类型与带宽收益、数值范围与舍入；本篇 WMMA 的 FP16 输入 + FP32 累加正是该思路在 Tensor Core 上的落地 |
 
 ### 推荐后续
 
-| 文章 | 关系 |
-|------|------|
-| [14_CUTLASS_TemplateGEMM_CuTe.md](14_CUTLASS_TemplateGEMM_CuTe.md) | 探索引入工业级模板库如何彻底驯服 WMMA 释放极限硬件性能 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [14 模板矩阵乘与代数布局](/posts/f1b57921/) | 工业级模板如何对 WMMA 做 Shared Memory Tiling、流水线与多级分块，把本篇的 Naive WMMA 推到接近硬件峰值 |
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 推理系统中 Tensor Core 与算子融合、KV Cache 的配合，形成端到端 LLM 推理优化视角 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-08-多流图执行与扩展开发](/posts/b1c0c6a3/)
+- 下一篇：[CUDA实践-10-访存优化与共享内存冲突](/posts/5b6f891d/)

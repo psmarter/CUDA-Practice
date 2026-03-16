@@ -2,64 +2,54 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-> 从零开始的 CUDA 编程学习与实践项目。从基础算子的实现到结合具体场景的高性能优化，提供完整的代码参考与性能记录。
+从零开始的 CUDA 编程学习与实践仓库：从基础算子实现到工业级优化（GEMM、Flash Attention、KV Cache 等），提供可运行代码与实机性能记录。配套技术博客见 **[Smarter's Blog — https://smarter.xin/](https://smarter.xin/)**，系列文章与仓库章节一一对应，便于系统学习。
 
-## 📁 项目结构
+---
+
+## 项目结构
 
 | 目录 | 内容 | 难度 |
 |------|------|------|
-| `01_Basics` | 向量加法、朴素矩阵乘法、分块矩阵乘法 | ⭐ |
-| `02_Reduction` | 基础归约、优化归约（收敛/共享内存/粗化）、点积 | ⭐⭐ |
+| `01_Basics` | 向量加法、朴素/分块矩阵乘法 | ⭐ |
+| `02_Reduction` | 归约（朴素/收敛/共享内存/粗化）、点积 | ⭐⭐ |
 | `03_Scan` | 前缀和、分段扫描 | ⭐⭐ |
-| `04_GEMM_Optimization` | 分块 GEMM、向量化 GEMM、双缓冲 GEMM、**寄存器分块 GEMM** | ⭐⭐⭐ |
-| `05_LLM_Ops` | Softmax、LayerNorm、Flash Attention (V1 + V3)、**RoPE**、**RMSNorm** | ⭐⭐⭐⭐ |
-| `06_Warp_Primitives` | Warp Shuffle、Warp Reduce、Warp Scan | ⭐⭐ |
-| `07_Quantization` | FP16 GEMM、INT8 GEMM、量化/反量化 | ⭐⭐⭐ |
-| `08_Advanced` | CUDA Graphs、多流并发、PyTorch C++ Extension | ⭐⭐⭐ |
-| `09_Tensor_Core` | WMMA GEMM、混合精度计算 | ⭐⭐⭐ |
+| `04_GEMM_Optimization` | 分块 / 向量化 / 双缓冲 / **寄存器分块** GEMM | ⭐⭐⭐ |
+| `05_LLM_Ops` | Softmax、LayerNorm、**Flash Attention**、RoPE、RMSNorm | ⭐⭐⭐⭐ |
+| `06_Warp_Primitives` | Warp Shuffle、Reduce、Scan | ⭐⭐ |
+| `07_Quantization` | FP16/INT8 GEMM、量化与反量化 | ⭐⭐⭐ |
+| `08_Advanced` | CUDA Graphs、多流、PyTorch C++ 扩展 | ⭐⭐⭐ |
+| `09_Tensor_Core` | WMMA GEMM、混合精度 | ⭐⭐⭐ |
 | `10_Memory_Optimization` | 合并访存、Bank Conflict、异步拷贝 | ⭐⭐⭐ |
-| `11_Inference_Optimization` | KV Cache + PagedAttention、Kernel Fusion、Dynamic Batching | ⭐⭐⭐⭐ |
-| `12_Standard_Libraries` | cuBLAS GEMM、cuFFT、Thrust | ⭐⭐ |
-| `13_Performance_Analysis` | Occupancy 分析、Roofline 模型、Nsight Profiling | ⭐⭐⭐ |
-| `14_CUTLASS` | CUTLASS SIMT GEMM、**Tensor Core GEMM**、**CuTe 基础** | ⭐⭐⭐ |
-| `15_Multi_GPU` | 多卡通信：**NCCL AllReduce** | ⭐⭐⭐⭐ |
+| `11_Inference_Optimization` | KV Cache + PagedAttention、Kernel 融合、动态批处理 | ⭐⭐⭐⭐ |
+| `12_Standard_Libraries` | cuBLAS、cuFFT、Thrust | ⭐⭐ |
+| `13_Performance_Analysis` | 占用率、Roofline、Nsight 剖析 | ⭐⭐⭐ |
+| `14_CUTLASS` | CUTLASS GEMM、Tensor Core、CuTe 基础 | ⭐⭐⭐ |
+| `15_Multi_GPU` | NCCL AllReduce 多卡通信 | ⭐⭐⭐⭐ |
 
-## 🧠 技术路线 (Skill Tree)
+- **代码**：各章子目录内为独立可编译的 CUDA 工程（见各章 `README.md`）。
+- **博客**：`Blogs/` 下为与章节对应的深度文章（数学推导、硬件原理、实现与调优）；在线版与更多笔记见 [https://smarter.xin/](https://smarter.xin/)。
+- **性能结果**：`Results/` 下为真机基准测试报告（环境：2× RTX 4090，详见 `Results/README.md`）。
 
-本项目构建了四个由浅入深的 CUDA 进阶学习路线：
+---
 
-- **基础与访存调优 (L1)**：CUDA 执行模型、Memory Coalescing、Bank Conflict 消解、Double Buffering。
-- **经典算子与并发 (L2)**：Warp Primitives、并行规约 (Reduction) 与前缀和 (Scan)。
-- **大模型硬核算子 (L3)**：Flash Attention (SRAM Tiling + Online Softmax)、RMSNorm、RoPE。
-- **微架构与系统级 (L4)**：Tensor Core (WMMA/MMA)、CUTLASS/CuTe、CUDA Graphs、KV Cache & PagedAttention、NCCL 全局通信。
+## 技术路线概览
 
-## 📈 性能记录 (Performance Benchmarks)
+- **L1 基础与访存**：执行模型、合并访存、Bank Conflict、双缓冲。
+- **L2 经典算子**：Warp 原语、归约、前缀和。
+- **L3 大模型算子**：Flash Attention、RMSNorm、RoPE 等。
+- **L4 系统与微架构**：Tensor Core、CUTLASS/CuTe、CUDA Graphs、KV Cache、NCCL。
 
-各子目录中预留了理论极值与实测数据的追踪记录表，用于展示针对不同架构特性进行优化的实际加速效果。以下为部分典型优化案例的概览：
+---
 
-| 核心算子 | 优化突破口 | 核心目标与对比基准 |
-| :--- | :--- | :--- |
-| **GEMM (Register Tiling)** | Block/Thread 级划分 + 寄存器复用 | 减少全局/共享内存压力，对比基准：cuBLAS |
-| **Flash Attention (V3)**   | 向量化（float4）宏块 + SRAM 分解 | 将显存复杂度降至 $O(N)$ 并提升长序列处理速度 |
-| **INT8 GEMM (DP4A)**       | 底层 DP4A 四并发位运算操作 | 降低访存量及带宽要求，对比基准：FP32 原生计算 |
-
-## 🔥 核心亮点
-
-- **Flash Attention 完整实现**：720 行代码，涵盖 Naive 3-step → V1 (Tiling + Online Softmax) → V3 (Macro-Block + float4 向量化)
-- **KV Cache + PagedAttention**：492 行，包含完整的 Block Table 映射逻辑和显存对比分析
-- **GEMM 优化全链路**：Naive → Tiled → Vectorized → Double Buffer → **Register Tiling (cuBLAS 对比)** → Tensor Core
-- **统一基准测试框架**：每个 Kernel 都包含 CPU 参考实现 → GPU 实现 → 正确性验证 → 性能分析（带宽/GFLOPS/加速比）。*(注：由于测试机器差异，各子项目的 README 中均预留了 Benchmark 性能对比占位符供运行后自行填写)*
-- **LLM 标配算子**：Flash Attention、RoPE、RMSNorm、LayerNorm、Softmax
-- **公共工具库**：`Common/include/` 包含 CUDA 错误检查、计时器、Warp 级原语、统一类型别名
-
-## 🛠 编译与运行
+## 编译与运行
 
 ### 环境要求
 
-- CUDA Toolkit ≥ 11.0
-- CMake ≥ 3.18
-- C++17 编译器
-- 推荐 GPU：具有较新架构（如 Ampere 等）的 NVIDIA 设备
+- CUDA Toolkit ≥ 11.0  
+- CMake ≥ 3.18  
+- C++17  
+- 推荐：NVIDIA GPU（如 Ampere 及以上）  
+- `14_CUTLASS` 需设置 `CUTLASS_DIR`；`15_Multi_GPU` 需 NCCL 与多卡，Windows/无 NCCL 时可能无法全量编译。
 
 ### 编译
 
@@ -71,36 +61,36 @@ cmake --build . --parallel 8
 
 ### 运行
 
+**请在 `build` 目录下执行**（即先 `cd build` 再运行）：
+
 ```bash
-# 运行单个项目，例如：
+# 示例：运行基础向量加与 Flash Attention
 ./01_Basics/01_vector_add/vector_add
 ./05_LLM_Ops/03_flash_attention/flash_attention
 ```
 
-## 🏗 技术栈
+更多用例与子目录说明见各章 `README.md`；复现与性能采集方法见 `Results/README.md`。
 
-- **语言**：CUDA C/C++ (C++17)
-- **构建系统**：CMake
-- **GPU 库**：cuBLAS、cuFFT、Thrust、WMMA、CUTLASS
-- **平台**：Linux / Windows (MSVC)
+---
 
-## 📊 代码统计
+## 技术栈与统计
 
-- **40+ 个 CUDA 源文件**，分布在 15 个主题目录
-- **9,500+ 行** CUDA/C++ 代码
-- 结构清晰且附有详尽中文注释。
+- **语言 / 构建**：CUDA C++（C++17）、CMake  
+- **依赖**：cuBLAS、cuFFT、Thrust、WMMA、CUTLASS、NCCL（多卡）  
+- **平台**：Linux / Windows (MSVC)  
+- **规模**：40+ 个 `.cu` 文件，约 9,500+ 行，带中文注释
 
-## ✍️ 代码说明
+---
 
-本项目的核心实现主要通过手写编写（包含底层 Kernel、封装与 CPU 对照），而在结果验证、输出排版以及辅助验证工具代码上的生成借助了辅助工具以加速代码编写。
-
-## 📚 参考资料
+## 参考资料
 
 - [CUDA C++ Programming Guide](https://docs.nvidia.com/cuda/cuda-c-programming-guide/)
-- [CUTLASS: CUDA Templates for Linear Algebra Subroutines](https://github.com/NVIDIA/cutlass)
-- [Flash Attention 论文 (Dao et al., 2022)](https://arxiv.org/abs/2205.14135)
+- [CUTLASS](https://github.com/NVIDIA/cutlass)
+- [Flash Attention (Dao et al., 2022)](https://arxiv.org/abs/2205.14135)
 - [vLLM: PagedAttention](https://arxiv.org/abs/2309.06180)
 
-## 📄 License
+---
 
-本项目采用 [MIT License](LICENSE) 开源。
+## License
+
+[MIT License](LICENSE)

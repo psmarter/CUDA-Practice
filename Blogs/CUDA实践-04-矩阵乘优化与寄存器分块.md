@@ -1,8 +1,21 @@
 ---
-title: "04_GEMM 优化：从 Shared Memory Tiling 到寄存器外积——逼近计算瓶颈"
+title: CUDA-Practice：04 从 Shared Memory Tiling 到寄存器外积——逼近计算瓶颈
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - GEMM
+  - Register Tiling
+  - Shared Memory
+  - 外积
+  - Thread Coarsening
+  - cuBLAS
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: 1a09f6f
 date: 2026-03-11 10:00:00
-tags: [CUDA, 高性能计算, GEMM, Register Tiling, Shared Memory, 外积, Thread Coarsening, cuBLAS]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -29,6 +42,8 @@ categories: 深度学习系统架构
 | `04_GEMM_Optimization/03_register_tiling/register_tiling.cu` | `register_tiling_gemm` | 极致寄存器分块（BM=BN=128, TM=TN=8） | 2048×2048 |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+>
+> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/) 中的 Shared Memory Tiling 与 Roofline 分析，以及 [02 归约与线程粗化](/posts/44fe4eb3/)、[03 前缀和与多块扫描](/posts/bcb510f9/) 里的树形折叠与同步直觉，本篇聚焦于将 GEMM 的数据进一步推入寄存器，在 CUDA Core 上逼近计算瓶颈；后续 [09 张量核心与混合精度](/posts/78e375e8/) 与 [14 模板矩阵乘与代数布局](/posts/f1b57921/) 则在此基础上引入 Tensor Core 和工业级模板实现。
 
 ## Baseline
 
@@ -264,12 +279,19 @@ xychart-beta
 
 | 文章 | 关系 |
 |------|------|
-| [01_从 Vector Add 到 Tiled GEMM](01_Basics_Concepts_and_Tiling.md) | 本文依赖的 Shared Memory Tiling 基础和算术强度概念 |
+| [01 基础概念与分块](/posts/7608f1b0/) | 本文依赖的 Shared Memory Tiling 基础和算术强度概念 |
 
 ### 推荐后续
 
 | 文章 | 关系 |
 |------|------|
-| [09_Tensor Core WMMA 混合精度](09_Tensor_Core_WMMA_Mixed_Precision.md) | 使用硬件矩阵引擎突破 CUDA Core FP32 算力天花板 |
-| [14_CUTLASS 模板 GEMM 与 CuTe](14_CUTLASS_TemplateGEMM_CuTe.md) | 工业级模板元编程框架，生产级 GEMM 实现 |
-| [10_内存优化与 Bank Conflict](10_Memory_Optimization_Coalescing_BankConflict.md) | 深入分析本文提到的 Bank Conflict 和合并访存问题 |
+| [09 张量核心与混合精度](/posts/78e375e8/) | 使用硬件矩阵引擎突破 CUDA Core FP32 算力天花板 |
+| [14 模板矩阵乘与代数布局](/posts/f1b57921/) | 工业级模板元编程框架，生产级 GEMM 实现 |
+| [10 访存优化与共享内存冲突](/posts/5b6f891d/) | 深入分析本文提到的 Bank Conflict 和合并访存问题 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-03-前缀和与多块扫描](/posts/bcb510f9/)
+- 下一篇：[CUDA实践-05-大模型算子与注意力归一化](/posts/cb29461c/)

@@ -31,7 +31,7 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 ## 四、 本地自动脚本基础运行记录
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## layernorm.cu 代码逻辑与测试
 
@@ -457,6 +457,10 @@ Flash Attention V3:            5.33 ms (1.24x)
 ========================================
 
 ```
+
+> 补充说明：上面的 Flash Attention 段落保留的是当前仓库一次完整运行日志。与 Softmax / LayerNorm / RMSNorm / RoPE 中的 `0.00 ms` 打印精度问题不同，这里 `5.33 ms` 等数字本身并不存在格式化歧义；但若后续调整 `flash_attention_v3` 的实现细节或输出缓冲初始化路径，建议重新进行 correctness 复验，再将其视为严格的对外结论。
+
+> 说明：Softmax / LayerNorm / RMSNorm / RoPE 等算子中，部分 Warp 优化 Kernel 的单次执行时间极短，打印时四舍五入显示为 `0.00 ms`，但带宽和加速比计算使用了更精细的计时结果，因此数值仍然可信。对于这些小规模测试，当数据完全驻留在 L2 Cache 时，按 HBM 峰值（约 1008 GB/s）计算的“有效带宽”可能超过理论值，这是缓存命中导致的正常现象，并不代表物理总线被突破。
 
 ## softmax 代码逻辑与测试
 

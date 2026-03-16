@@ -1,8 +1,19 @@
 ---
-title: "02_Reduction：并行归约的体系结构推演与带宽压榨"
+title: CUDA-Practice：02 并行归约的体系结构推演与带宽压榨
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - Reduce
+  - Warp Divergence
+  - Shared Memory
+  - Thread Coarsening
+  - FMA
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: 44fe4eb3
 date: 2026-03-12 13:00:00
-tags: [CUDA, Reduce, Warp Divergence, Shared Memory, Thread Coarsening, FMA]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -21,11 +32,13 @@ categories: 深度学习系统架构
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `02_Reduction/01_reduce_sum/reduce_sum.cu` | `simple_reduce_sum`<br>`convergent_reduce_sum`<br>`shared_reduce_sum` | 解决发散 / Shared Memory 缓存 | `N=2048` |
-| `02_Reduction/02_reduce_optimized/reduce_optimized.cu` | `coarse_reduce_sum`<br>`segment_reduce_sum` | 线程粗化 (Thread Coarsening) | `N=1048576 (1M)` |
-| `02_Reduction/03_dot_product/dot_product.cu` | `dot_prod_fma_kernel` | FMA 融合指令 / L2 缓存命中拦截 | `N=1048576 (1M)` |
+| `02_Reduction/01_reduce_sum/reduce_sum.cu` | `simple_reduce_sum`<br>`convergent_reduce_sum`<br>`shared_reduce_sum` | 发散消除 / 收敛索引 / Shared Memory 树状归约 | `N=2048` |
+| `02_Reduction/02_reduce_optimized/reduce_optimized.cu` | `segmented_reduce_sum`<br>`coarsened_reduce_sum`<br>`coarsened_reduce_max` | 多 Block + atomicAdd、线程粗化 (COARSE_FACTOR=4)、Shared Memory 收尾 | `N=1048576 (1M)` |
+| `02_Reduction/03_dot_product/dot_product.cu` | `shared_dot_product`<br>`coarsened_dot_product`<br>`fma_dot_product` | 点积 = 乘后归约、FMA 融合、L2 缓存热数据 | `N=1048576 (1M)` |
 
-> Kernel 名称与源码中 `__global__` 函数签名完全一致。
+> Kernel 名称与源码中 `__global__` 函数签名完全一致。本篇多 Block 归约以 **Shared Memory 树状折叠 + atomicAdd** 收尾，未使用 `__shfl_*`；Warp 级无锁归约见 [06 线程束原语与寄存器通信](/posts/fec051fc/)。
+
+> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/) 的带宽墙与 Shared Memory 直觉，将「分块与片上缓存」用于**归约**这一经典模式（多 Block、atomicAdd、线程粗化）。后续 [03 前缀和与多块扫描](/posts/bcb510f9/) 同属树形结构但需保留前缀和；[06 线程束原语与寄存器通信](/posts/fec051fc/) 用 `__shfl_*` 做无 Shared Memory 的 Warp 归约；[05 大模型算子与注意力归一化](/posts/cb29461c/) 的 Softmax/LayerNorm 依赖归约作为子步骤。
 
 ## Baseline
 
@@ -74,16 +87,15 @@ categories: 深度学习系统架构
 ### Divergence 修复的几何折转
 
 ```cpp
-// 来源：02_Reduction/01_reduce_sum/reduce_sum.cu : 局部片选简写
-    // 【错误模式】：stride 递增，导致索引跳跃式分裂 (tid * 2 * stride)
-    
-    // 【收敛模式】：stride 递减，索引物理连续性
-    for (unsigned int stride = blockDim.x; stride > 0; stride /= 2) {
-        if (tid < stride) {
-            // 所有工作的线程全部紧凑地压在前列 Warp，没有间隙暗区
-            sdata[tid] += sdata[tid + stride];
+// 来源：02_Reduction/01_reduce_sum/reduce_sum.cu（convergent_reduce_sum / shared_reduce_sum 的 stride 逻辑）
+    // 【错误模式】simple_reduce_sum：stride 从 1 倍增，if (threadIdx.x % stride == 0) 导致 Warp 内活跃线程不连续
+
+    // 【收敛模式】：stride 从 blockDim.x 减半至 1，活跃线程 tid 始终落在 [0, stride)，即连续无间隙
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+        __syncthreads();  // shared 版本先同步再读
+        if (threadIdx.x < stride) {
+            shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
         }
-        __syncthreads();
     }
 ```
 
@@ -94,30 +106,33 @@ categories: 深度学习系统架构
 ### 线程粗化的 Register 化截留
 
 ```cpp
-// 来源：02_Reduction/02_reduce_optimized/reduce_optimized.cu
-__global__ void coarse_reduce_sum(float* input, float* output, int length) {
+// 来源：02_Reduction/02_reduce_optimized/reduce_optimized.cu : coarsened_reduce_sum 核心片段
+__global__ void coarsened_reduce_sum(float* input, float* output, int length) {
+    __shared__ float shared_data[BLOCK_SIZE];
     int tid = threadIdx.x;
-    // COARSE_FACTOR 强行拉大跨步，减少 Grid 全局数量
     int sid = 2 * COARSE_FACTOR * blockDim.x * blockIdx.x + tid;
-    
+
     float sum = 0.0f;
     if (sid < length) {
         sum = input[sid];
-        // 无视原本的二叉树框架，极度暴力的单线程顺序寄存器累加
-        #pragma unroll
         for (int i = 1; i < COARSE_FACTOR * 2; ++i) {
-            int idx = sid + i * blockDim.x;
-            if (idx < length) { sum += input[idx]; }
+            if (sid + i * BLOCK_SIZE < length)
+                sum += input[sid + i * BLOCK_SIZE];
         }
     }
-    sdata[tid] = sum; 
-    // 后续放入 Shared Memory 执行正规的折叠以封口
+    shared_data[tid] = sum;
+    // 树状 Shared Memory 归约 + 最后 atomicAdd(output, shared_data[0])
+    for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+        __syncthreads();
+        if (tid < stride) shared_data[tid] += shared_data[tid + stride];
+    }
+    if (tid == 0) atomicAdd(output, shared_data[0]);
 }
 ```
 
 **要点解读**：
 
-- `COARSE_FACTOR * 2` 直接把 8 倍的工作量全部沉淀在 `float sum` 寄存器里。没有 `__syncthreads()`，没有 Bank Conflict，只有对全局内存极致的流水线猛塞（合并同址跨越 Load）。
+- `COARSE_FACTOR * 2`（=8）将每线程负责的元素数拉大到 8 个，先在寄存器 `sum` 中串行累加，再写入 `shared_data[tid]`，Block 数降为约 1/8，`__syncthreads()` 与 `atomicAdd` 调用次数同步减少。收尾仍为 Shared Memory 树状归约 + 单次 `atomicAdd`，本实现未使用 `__shfl_*`。
 
 ## 结果与边界
 
@@ -162,13 +177,21 @@ __global__ void coarse_reduce_sum(float* input, float* output, int length) {
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [01_Basics_Concepts_and_Tiling.md](01_Basics_Concepts_and_Tiling.md) | 在 Shared Memory 还未明晰前对分块操作体系底座的宏观补充 |
+| 文章 | 与本篇的衔接 |
+|------|----------------|
+| [01 基础概念与分块](/posts/7608f1b0/) | 建立带宽墙、Roofline 与 Shared Memory Tiling 直觉；本篇在同一存储层级上做「归约」模式并引入多 Block 与 atomicAdd |
 
-### 推荐后续
+### 推荐后续（承上启下）
 
-| 文章 | 关系 |
-|------|------|
-| [03_Scan_Kogge_Stone_and_MultiBlock.md](03_Scan_Kogge_Stone_and_MultiBlock.md) | 与归约高度对应的前缀求和操作，揭开同样树形演化中极其背道而驰的算力天坑 |
-| [06_Warp_Primitives_Register_Shuffle.md](06_Warp_Primitives_Register_Shuffle.md) | 在归约完全逼尽 SRAM 极限时，进一步抛弃内存只用寄存器对撞完成归约的神器 |
+| 文章 | 与本篇的衔接 |
+|------|----------------|
+| [03 前缀和与多块扫描](/posts/bcb510f9/) | 同属树形/线性扫描结构，但需保留中间前缀结果，多 Block 与分段策略与归约形成对照 |
+| [06 线程束原语与寄存器通信](/posts/fec051fc/) | 本篇用 Shared Memory + atomicAdd 收尾；06 用 `__shfl_*` 在 Warp 内无 Shared Memory 完成归约/Scan，进一步压延迟 |
+| [05 大模型算子与注意力归一化](/posts/cb29461c/) | Softmax、LayerNorm、RMSNorm 均以归约（max/sum/方差）为子步骤，本篇为理解其 Kernel 打底 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-01-基础概念与分块](/posts/7608f1b0/)
+- 下一篇：[CUDA实践-03-前缀和与多块扫描](/posts/bcb510f9/)

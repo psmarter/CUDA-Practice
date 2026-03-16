@@ -31,7 +31,7 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 ## 四、 本地自动脚本基础运行记录
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## multi_stream.cu 代码逻辑与测试
 
@@ -172,6 +172,9 @@ GPU Forward 有效带宽：1022.08 GB/s
 GPU Backward 有效带宽：936.41 GB/s
 (RTX 4090 理论峰值：~1008 GB/s)
 
+说明：Forward 带宽略高于 HBM 理论峰值是因为测试体量为 40 MB，完全可以落入 RTX 4090 的 72 MB L2 缓存；
+此处统计的是「缓存命中后的有效带宽」，并非真实 DRAM 物理总线吞吐。
+
 --- 结果验证 ---
 ✓ Swish Forward PASSED: 结果 -0.00 (期望 -0.00)
 ✓ Swish Backward PASSED: 结果 -0.00 (期望 -0.00)
@@ -246,6 +249,10 @@ CPU vs GPU (Graph) Kernel 加速比：41.52x
 CPU vs GPU (Graph) 总时间加速比：0.72x
 GPU 有效带宽：859.11 GB/s
 (RTX 4090 理论峰值：~1008 GB/s)
+
+说明：本例问题规模极小（仅约 2.67 MB、100K 元素），H2D/D2H 固定开销占据了 GPU 端到端时间的大头，
+因此虽然 CUDA Graph 明显降低了 **Kernel 发射开销**（Launch 时间 1.18x 加速），
+但整体 GPU 总时间仍略慢于 CPU，属于典型的 Launch Bound 教学示例。
 
 --- Kernel 性能对比 ---
 Multi-Stream Launch:   0.0049 ms (基准)

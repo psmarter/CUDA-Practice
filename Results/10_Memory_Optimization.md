@@ -26,16 +26,14 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 ```
 
 ## 四、 本地自动脚本基础运行记录
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## bank_conflict.cu 代码逻辑与测试
-**代码路径**: `10_Memory_Optimization/02_bank_conflict/bank_conflict.cu`
-**测试命令**: `./build/10_Memory_Optimization/02_bank_conflict/bank_conflict`
+**代码路径**: `10_Memory_Optimization/02_bank_conflict/bank_conflict.cu`  
+**测试命令**: `./build/10_Memory_Optimization/02_bank_conflict/bank_conflict`  
+**Kernel**: `no_bank_conflict`, `with_bank_conflict`, `padded_no_conflict`, `analyze_bank_patterns`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**: 无冲突（行访问）、有冲突（列访问 32-way）、Padding（列宽 +1）三组 2D Shared 对比；`analyze_bank_patterns` 用不同 stride 测 1D 冲突（stride=32 时验证跳过为预期）。
 
 **Sanitizer & 运行测试输出**: 
 ```text
@@ -120,13 +118,11 @@ Padding优化:        0.16 ms (0.94x 几乎与无冲突持平)
 ```
 
 ## async_copy.cu 代码逻辑与测试
-**代码路径**: `10_Memory_Optimization/03_async_copy/async_copy.cu`
-**测试命令**: `./build/10_Memory_Optimization/03_async_copy/async_copy`
+**代码路径**: `10_Memory_Optimization/03_async_copy/async_copy.cu`  
+**测试命令**: `./build/10_Memory_Optimization/03_async_copy/async_copy`  
+**Kernel**: `sync_copy_kernel`, `async_copy_kernel`, `pipeline_kernel`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**: 同步拷贝（寄存器中转）、单阶 `cg::memcpy_async`、多阶 `cuda::pipeline` + `cuda::memcpy_async` 对比。本测试为纯搬运+轻量计算，多阶流水略慢于同步属预期，Async Pipeline 更适合计算耗时足以掩盖传输的场景。
 
 **Sanitizer & 运行测试输出**: 
 ```text
@@ -190,9 +186,9 @@ GPU 总时间：        52.90 ms
 
 --- Kernel 性能对比 ---
 同步拷贝 (基准) :   0.5956 ms
-单阶异步 相比同步: 1.00x 加速
-多阶流水 相比同步: 0.95x 加速
-多阶流水 相比单阶: 0.95x 加速
+单阶异步 相比同步: 1.00x
+多阶流水 相比同步: 0.95x（略慢，纯带宽场景下 Async Pipeline 不占优）
+多阶流水 相比单阶: 0.95x
 
 --- 结果验证 ---
 ✓ Sync Copy PASSED: 结果 0.00 (期望 0.00)
@@ -205,13 +201,11 @@ GPU 总时间：        52.90 ms
 ```
 
 ## coalesced_access.cu 代码逻辑与测试
-**代码路径**: `10_Memory_Optimization/01_coalesced_access/coalesced_access.cu`
-**测试命令**: `./build/10_Memory_Optimization/01_coalesced_access/coalesced_access`
+**代码路径**: `10_Memory_Optimization/01_coalesced_access/coalesced_access.cu`  
+**测试命令**: `./build/10_Memory_Optimization/01_coalesced_access/coalesced_access`  
+**Kernel**: `coalesced_access`, `strided_access`, `aos_access`, `soa_access`
 
-**实现逻辑分析**: 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
+**实现逻辑分析**: 合并访问（Stride=1）与跨步访问（Stride=2）对比 Global Memory 事务合并；AoS/SoA 对比结构体布局。本实验中 AoS kernel 同时读写 x/y/z/w 四字段，访问仍为合并，故 AoS 与 SoA 带宽接近；仅读单字段时的 AoS 非合并未在本测试中单独跑。
 
 **Sanitizer & 运行测试输出**: 
 ```text

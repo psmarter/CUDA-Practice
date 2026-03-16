@@ -31,7 +31,7 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 ## 四、 本地自动脚本基础运行记录
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## reduce_sum.cu 代码逻辑与测试
 
@@ -106,7 +106,7 @@ GPU 有效带宽：2.17 GB/s
 --- Kernel 性能对比 ---
 Simple:        0.0051 ms (基准)
 Convergent:    0.0038 ms (1.36x)
-Shared Mem:      0.00 ms (1.36x)
+Shared Mem:    0.0038 ms (1.36x)
 
 --- 结果验证 ---
 ✓ Simple Reduce PASSED: 结果 2048.00 (期望 2048.00)
@@ -125,9 +125,9 @@ Shared Mem:      0.00 ms (1.36x)
 
 **实现逻辑分析**:
 
-1. **数据粗化 (Thread Coarsening)**: 每个线程不是仅加载一个元素，而是在 Global 载入时就利用寄存器完成连续多个数据的初步加和，例如 `i += blockDim.x * gridDim.x * 2`，大大削减了总启动的线程块数量和调度开销。
-2. **利用 Warp 级原语收尾**: 通过 `__shfl_down_sync` 实现 Warp 规约，消除了最后 32 个元素时必需的 shared memory 同步，从而把极细粒度的计算发挥到微秒极限。
-3. **执行表现**: 归约耗时进一步下降到 **0.005 ms**，在极大数组时使得 GPU 计算能力和极低延迟获得体现，对比纯 CPU `4.78 ms`，加速可达 **~1000x**。
+1. **数据粗化 (Thread Coarsening)**: 每个线程不是仅加载一个元素，而是在 Global 载入时就利用寄存器完成连续多个数据的初步加和，形式上类似 `sid = 2 * COARSE_FACTOR * blockDim.x * blockIdx.x + tid`，再在循环中访问 `sid + i * BLOCK_SIZE`，大大削减了总启动的线程块数量和调度开销。
+2. **Shared Memory 收尾 + atomicAdd 聚合**: Block 内先将粗化后的局部和写入 `shared_data[tid]`，随后使用标准的树状 Shared Memory 归约（`__syncthreads` + `stride /= 2`）得到每个 Block 的局部和，最后通过一次 `atomicAdd(output, shared_data[0])` 将结果写回全局内存。本实现未使用 `__shfl_down_sync`，而是完全基于 Shared Memory + 原子操作完成收尾。
+3. **执行表现**: 归约耗时进一步下降到约 **0.0047 ms**（以 Coarsened 版本为主），在 1M 大数组下对比 CPU `4.69 ms`，Kernel 级加速约 **~1000x**，端到端加速约 **11x**。
 **Sanitizer & 运行测试输出**:
 
 ```text

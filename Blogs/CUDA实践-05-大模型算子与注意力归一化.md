@@ -1,8 +1,22 @@
 ---
-title: "05_LLM_Ops：Transformer 核心算子——Softmax, Norm, RoPE 与 FlashAttention"
+title: CUDA-Practice：05 Transformer 核心算子——Softmax、Norm、RoPE 与 FlashAttention
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - LLM
+  - Softmax
+  - LayerNorm
+  - RMSNorm
+  - RoPE
+  - FlashAttention
+  - Welford算法
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: cb29461c
 date: 2026-03-12 12:00:00
-tags: [CUDA, 高性能计算, LLM, Softmax, LayerNorm, RMSNorm, RoPE, FlashAttention, Welford算法]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -183,13 +197,23 @@ categories: 深度学习系统架构
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [02_Reduction_Tree_Algo_and_Coarsening.md](02_Reduction_Tree_Algo_and_Coarsening.md) | 在处理层归一或 Attention 并行前必读的底层蝶形打法逻辑 |
-| [06_Warp_Primitives_Register_Shuffle.md](06_Warp_Primitives_Register_Shuffle.md) | 获取了解 12 倍加速的 RMSNorm 内含有的 `__shfl_down_sync` 寄存器越界通信法器 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [01 基础概念与分块](/posts/7608f1b0/) | 建立带宽墙、Roofline 与 Shared Memory Tiling 直觉，为后文分析算术强度和 Memory Bound/Compute Bound 提供基础 |
+| [02 归约与线程粗化](/posts/44fe4eb3/) | Softmax/LayerNorm/RMSNorm/FlashAttention 中的归约（max/sum/均值/方差）全部复用其中的树形规约与线程粗化思想 |
+| [03 前缀和与多块扫描](/posts/bcb510f9/) | Online Softmax 与 FlashAttention 中的“在线状态机”和多 Block Scan，与 3-Pass Scan 的跨 Block 拼接逻辑一脉相承 |
+| [06 线程束原语与寄存器通信](/posts/fec051fc/) | Softmax、LayerNorm、RMSNorm 中的 `__shfl_*` Warp 规约全部依赖本篇介绍的寄存器级通信原语 |
 
 ### 推荐后续
 
-| 文章 | 关系 |
-|------|------|
-| [11_Inference_Optimization_Fusion_KVCache.md](11_Inference_Optimization_Fusion_KVCache.md) | 去认识到以上所有的绝学拼凑打通入到大语言模型的整周期推理中到底如何降低死算发热 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [09 张量核心与混合精度](/posts/78e375e8/) | 将本篇中在 CUDA Core 上优化到极致的 GEMM/Attention 迁移到 Tensor Core 上，进一步抬升算力上限 |
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 以本篇 Softmax/Norm/RoPE/FlashAttention 为基础，讨论在完整 LLM 推理图中的算子融合、KV Cache 与批处理策略 |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-04-矩阵乘优化与寄存器分块](/posts/1a09f6f/)
+- 下一篇：[CUDA实践-06-线程束原语与寄存器通信](/posts/fec051fc/)

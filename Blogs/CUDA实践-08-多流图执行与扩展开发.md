@@ -1,8 +1,19 @@
 ---
-title: "08_Advanced：打破系统调度之墙 —— 多流并发、CUDA Graphs 与 PyTorch 扩展解析"
+title: CUDA-Practice：08 多流并发、CUDA Graphs 与 PyTorch 扩展解析
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - Multi-Stream
+  - CUDA Graphs
+  - PyTorch Extension
+  - Pipeline
+  - C++ Extension
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: b1c0c6a3
 date: 2026-03-12 14:30:00
-tags: [CUDA, Multi-Stream, CUDA Graphs, PyTorch Extension, Pipeline, C++ Extension]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -21,11 +32,13 @@ categories: 深度学习系统架构
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `08_Advanced/02_multi_stream/multi_stream.cu` | `compute_kernel` (包含 `sin`/`cos`) | 多流队列派发分离 | `N=16.7M`<br>(192 MB) |
-| `08_Advanced/01_cuda_graphs/cuda_graphs.cu` | `add_kernel`<br>`mul_kernel` | Graph 定制拓扑图快射 | `N=100_000`<br>(轻量级算子) |
-| `08_Advanced/03_pytorch_extension/pytorch_extension.cu` | `swish_forward_kernel`<br>`swish_backward_kernel` | Pytorch C++ 侧内连直融反代 | `N=10.4M`<br>(40 MB) |
+| `08_Advanced/02_multi_stream/multi_stream.cu` | `compute_kernel` | 多流队列派发分离，A * sin(B) + B * cos(A) | `N=16.7M`<br>(192 MB) |
+| `08_Advanced/01_cuda_graphs/cuda_graphs.cu` | `add_kernel`<br>`mul_kernel` | `(A + B) * D + F` 三段向量流水，Graph Capture + Replay | `N=100_000`<br>(轻量级算子) |
+| `08_Advanced/03_pytorch_extension/pytorch_extension.cu` | `swish_forward_kernel`<br>`swish_backward_kernel` | Swish 前向/反向，自定义 C++/CUDA 扩展 | `N=10.4M`<br>(40 MB) |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+>
+> **本篇在系列中的位置**：承接 [07 量化、半精度与整数推理](/posts/ef325d2f/) 与 [10 访存优化与共享内存冲突](/posts/5b6f891d/)，本篇从**系统与框架视角**回答「当算子本身已经很快，端到端还慢在哪里？」——分别用 **Multi-Stream** 掩盖 H2D/D2H、用 **CUDA Graphs** 降低极短 Kernel 的 Launch 开销、用 **PyTorch C++ Extension** 绕过 Python 调度。后续 [11 推理优化、融合与键值缓存](/posts/9729c03f/) 会在推理系统中把这些技术串成一条完整流水线，[15 多卡通信与全归约](/posts/b599e19f/) 则把问题扩展到多卡通信。
 
 ## Baseline
 
@@ -34,8 +47,8 @@ categories: 深度学习系统架构
 | Baseline 类别 | 测试场景 | 指标 | 值 | 数据来源 |
 |---------------|----------|------|----|----------|
 | Default Stream (强耦合) | `N=16.7M` (192 MB) | Pipeline 周期间隔 | 15.55 ms | [实测] Results/08_Advanced.md |
-| CPU 三段连续单独 Launch | `N=100K` (极轻代量) | 聚合射出用时 | 4.9 µs | [实测] Results/08_Advanced.md |
-| Python PyTorch `torch.Swish` | `N=10.4M` 单通求值 | 发射至收包前项 | 30.30 ms | [实测] Results/08_Advanced.md |
+| 传统多 Kernel Launch | `N=100K` (极轻代量) | 单圈发射+执行时间 | 4.9 µs | [实测] Results/08_Advanced.md |
+| 参考 CPU Swish 实现 | `N=10.4M` 单通求值 | 前向耗时（等价 Python 逐元素算子） | 30.30 ms | [实测] Results/08_Advanced.md |
 
 ## 瓶颈分析
 
@@ -172,10 +185,20 @@ torch::Tensor custom_swish_forward(torch::Tensor x) {
 
 | 文章 | 关系 |
 |------|------|
-| [10_Memory_Optimization_Coalescing_BankConflict.md](10_Memory_Optimization_Coalescing_BankConflict.md) | 在想做流水遮盖传输缝隙之前先确保单块内部对于最原生显存带宽合并没出烂摊致命伤。 |
+| [05 大模型算子与注意力归一化](/posts/cb29461c/) | 先理解大模型算子（Softmax、Norm、FlashAttention）在单卡上的算力/带宽瓶颈位置，再考虑系统级如何通过多流与 Graphs 改善端到端性能 |
+| [07 量化、半精度与整数推理](/posts/ef325d2f/) | 本篇默认你已经知道哪些算子可以安全量化到 FP16/INT8，因此可以放心用 Multi-Stream/Graphs 批量调度这些低精度核函数 |
+| [10 访存优化与共享内存冲突](/posts/5b6f891d/) | 在做流水线遮盖传输缝隙之前，先确保单个 Kernel 内部已经做到合并访存、避免 Bank Conflict，不然多流只会放大底层访存问题 |
 
 ### 推荐后续
 
 | 文章 | 关系 |
 |------|------|
-| [11_Inference_Optimization_Fusion_KVCache.md](11_Inference_Optimization_Fusion_KVCache.md) | 这也是极其细碎碎核重度被直接切底融到单个 Kernel 直爆出倍数的极致落地点方案展现 |
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 把本篇的 Multi-Stream、Graphs、C++ Extension 放进真实推理系统，结合 KV Cache 与算子融合，形成端到端的 LLM 推理优化方案 |
+| [13 性能分析、屋顶线与占用率](/posts/803b94d6/) | 从 Roofline 与 Occupancy 视角重新审视本篇场景是 Memory Bound 还是 Launch Bound，帮助你判断何时该用 Multi-Stream，何时该用 Graphs |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-07-量化半精度与整数推理](/posts/ef325d2f/)
+- 下一篇：[CUDA实践-09-张量核心与混合精度](/posts/78e375e8/)

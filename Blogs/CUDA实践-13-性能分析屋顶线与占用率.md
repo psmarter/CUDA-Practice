@@ -1,8 +1,22 @@
 ---
-title: "13_Performance_Analysis：Roofline 定天界，Occupancy 辨虚实——量化的 GPU 诊断流"
+title: CUDA-Practice：13 Roofline 定天界，Occupancy 辨虚实——量化的 GPU 诊断流
+tags:
+  - CUDA
+  - GPU编程
+  - 并行计算
+  - 高性能计算
+  - Roofline Model
+  - Occupancy
+  - ILP
+  - Nsight Compute
+  - 性能分析
+  - Memory Bound
+  - Compute Bound
+categories:
+  - CUDA-Practice
+cover: /img/Nvidia_CUDA_Logo.jpg
+abbrlink: 803b94d6
 date: 2026-03-11 12:30:00
-tags: [CUDA, 高性能计算, Roofline Model, Occupancy, ILP, Nsight Compute, 性能分析, Memory Bound, Compute Bound]
-categories: 深度学习系统架构
 ---
 
 ## 本文目标
@@ -26,6 +40,8 @@ categories: 深度学习系统架构
 | `13_Performance_Analysis/03_nsight_profiling/nsight_profiling.cu` | `profile_example_kernel_bad`<br>`profile_example_kernel_good` | 非合并访存 (Stride=32) 对比标准合并访存的性能探针 | N=10,000,000 |
 
 > Kernel 名称与源码中 `__global__` 函数签名完全一致。
+>
+> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/)、[04 矩阵乘优化与寄存器分块](/posts/1a09f6f/)、[10 访存优化与共享内存冲突](/posts/5b6f891d/) 中对「算子实现与访存形态」的具体优化，本篇抽象出统一的 **性能建模与诊断视角**——通过 Roofline/Occupancy/Nsight 工具，回答「我的算子还可以快多少？」和「到底是算力不够还是带宽/实现出问题」。后续 [11 推理优化、融合与键值缓存](/posts/9729c03f/)、[12 标准库与工程实践](/posts/a1e20e80/) 会在推理系统与标准库层面复用这些分析方法。
 
 ## Baseline
 
@@ -58,7 +74,7 @@ categories: 深度学习系统架构
 - 算术强度估算：Naive GEMM 内层没有使用 Tiling 缓存复用。每次迭代计算都从全局显存重取数据。如果假定所有数据均完美通过缓存命中（仅最理想的情况），其算术强度 $I = 2N^3 / (3N^2 \times 4) = N / 6$。对于 N=1024，$I \approx 170.67 \text{ FLOP/Byte}$ [理论]。
 - 这看似远大于 81.9，属于 Compute Bound。
 - 理论天花板原本应为 $82.6 \text{ TFLOPS}$ [理论]。然而实测只有可怜的 5.23 TFLOPS。
-- 瓶颈在于 $170.67$ 只是基于完美缓存的假象。由于 Naive 算法的显存重访率极高，实际传输的物理流量暴增，它实际跌回了 Memory Bound 斜坡底端。突破口必须是引入 Shared Memory 提高缓存命中（请参考 [04_GEMM_Optimization](04_GEMM_Optimization_Register_Tiling.md)）。
+- 瓶颈在于 $170.67$ 只是基于完美缓存的假象。由于 Naive 算法的显存重访率极高，实际传输的物理流量暴增，它实际跌回了 Memory Bound 斜坡底端。突破口必须是引入 Shared Memory 提高缓存命中（请参考 [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/)）。
 
 ## 优化思路
 
@@ -172,13 +188,22 @@ __global__ void profile_example_kernel_bad(CPFloat input, PFloat output, CInt n,
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [01_Basics_Concepts_and_Tiling.md](01_Basics_Concepts_and_Tiling.md) | 在入门阶中直观探讨 Memory Bound 的物理限制逻辑 |
-| [04_GEMM_Optimization_Register_Tiling.md](04_GEMM_Optimization_Register_Tiling.md) | 手动 Tiling 把 Compute Bound 下低能算子推向极致的经典实例 |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [01 基础概念与分块](/posts/7608f1b0/) | 提供初步的 Memory Bound/Compute Bound 直觉，为本篇的 Roofline 数学化诊断做铺垫 |
+| [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) | Naive GEMM vs Tiled GEMM 的性能差异，可以用本篇 Roofline/Occupancy 框架重新审视 |
+| [10 访存优化与共享内存冲突](/posts/5b6f891d/) | 本篇指出问题（非合并访存、Bank/带宽瓶颈），10 章从 Global/Shared/Async Copy 三层给出具体解法 |
 
 ### 推荐后续
 
-| 文章 | 关系 |
-|------|------|
-| [10_Memory_Optimization_Coalescing_BankConflict.md](10_Memory_Optimization_Coalescing_BankConflict.md) | 进入更下一层学习合并访存、Bank Conflict 与 Async Copy Pipeline |
+| 文章 | 与本篇的衔接 |
+|------|--------------|
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 在推理系统中用本篇的 Roofline/Occupancy 思路评估 Kernel Fusion、PagedAttention、Continuous Batching 的收益上界 |
+| [12 标准库与工程实践](/posts/a1e20e80/) | 对比手写内核与标准库的性能时，直接用本篇提供的建模方法判断是否已接近硬件或库的Roofline |
+
+---
+
+## 顺序导航
+
+- 上一篇：[CUDA实践-12-标准库与工程实践](/posts/a1e20e80/)
+- 下一篇：[CUDA实践-14-模板矩阵乘与代数布局](/posts/f1b57921/)

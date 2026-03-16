@@ -29,22 +29,24 @@ compute-sanitizer ./build/07_Quantization/<sub_directory>/<binary_name>
 ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.avg.pct_of_peak_sustained_elapsed ./<binary_name>
 ```
 
-## 四、 本地自动脚本基础运行记录
+## 四、 说明与约定
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+- **fp16_gemm / int8_gemm**：当矩阵规模较大（如 M=1024）时，代码中 CPU 参考计算被跳过（`if (M <= 512)` 才执行），故日志中「CPU 执行时间：0.00 ms」「CPU vs GPU 加速比：0.00x」表示未做 CPU 对比，并非 GPU 无加速。
+- **quant_dequant**：Kernel 耗时极短（0.02–0.03 ms）、有效带宽超过 HBM 理论峰值（~1008 GB/s）是因为数据落在 L2 缓存，属正常现象。
+
+## 五、 本地自动脚本基础运行记录
+
+*(此下为真机二进制标准执行日志)*
 
 ## quant_dequant.cu 代码逻辑与测试
 
-**代码路径**: `07_Quantization/03_quant_dequant/quant_dequant.cu`
-**测试命令**: `./build/07_Quantization/03_quant_dequant/quant_dequant`
+**代码路径**: `07_Quantization/03_quant_dequant/quant_dequant.cu`  
+**测试命令**: `./build/07_Quantization/03_quant_dequant/quant_dequant`  
+**Kernel**: `quantize_per_tensor`, `dequantize_per_tensor`, `quantize_per_channel`, `fp32_to_fp16`, `fp16_to_fp32`
 
-**实现逻辑分析**:
+实现：Per-Tensor / Per-Channel 量化与反量化、FP32↔FP16 类型转换；有效带宽超过 HBM 峰值因数据落在 L2 缓存。
 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
-
-**Sanitizer & 运行测试输出**:
+**运行测试输出**:
 
 ```text
 检测到 2 块 CUDA 设备
@@ -145,16 +147,13 @@ GPU 有效带宽：
 
 ## fp16_gemm.cu 代码逻辑与测试
 
-**代码路径**: `07_Quantization/01_fp16_gemm/fp16_gemm.cu`
-**测试命令**: `./build/07_Quantization/01_fp16_gemm/fp16_gemm`
+**代码路径**: `07_Quantization/01_fp16_gemm/fp16_gemm.cu`  
+**测试命令**: `./build/07_Quantization/01_fp16_gemm/fp16_gemm`  
+**Kernel**: `kernel_naive_fp16_gemm`, `kernel_tiled_fp16_gemm`, `kernel_vectorized_fp16_gemm`
 
-**实现逻辑分析**:
+实现：Naive / Tiled (Shared Memory) / Vectorized (`half2`) 三种 FP16 GEMM；Host 负责分配与拷贝，与 CPU 结果容差验证。大矩阵 (如 1024×1024) 时跳过 CPU 参考，故日志中「CPU 执行时间：0.00 ms」「加速比：0.00x」表示未做 CPU 对比。
 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
-
-**Sanitizer & 运行测试输出**:
+**运行测试输出**:
 
 ```text
 检测到 2 块 CUDA 设备
@@ -232,16 +231,13 @@ Vectorized:      0.22 ms (1.91x)
 
 ## int8_gemm.cu 代码逻辑与测试
 
-**代码路径**: `07_Quantization/02_int8_gemm/int8_gemm.cu`
-**测试命令**: `./build/07_Quantization/02_int8_gemm/int8_gemm`
+**代码路径**: `07_Quantization/02_int8_gemm/int8_gemm.cu`  
+**测试命令**: `./build/07_Quantization/02_int8_gemm/int8_gemm`  
+**Kernel**: `naive_int8_gemm`, `dp4a_int8_gemm`, `vectorized_int8_gemm`
 
-**实现逻辑分析**:
+实现：Naive / dp4a（4 个 INT8 打包乘加）/ Vectorized（每线程 4 列、`int4` 写回）三种 INT8 GEMM；大矩阵时同样跳过 CPU 参考，加速比 0.00x 表示未做 CPU 对比。
 
-1. 定义了相应的 CUDA Kernel 函数进行核心计算。
-2. 包含了 Host 端代码负责显存分配 (cudaMalloc) 及数据拷贝 (cudaMemcpy)。
-3. 利用 `CHECK` 宏或者 `std::abs` 针对 CPU 计算结果与 GPU 结果进行了容差比对与正确性验证。
-
-**Sanitizer & 运行测试输出**:
+**运行测试输出**:
 
 ```text
 检测到 2 块 CUDA 设备
@@ -316,24 +312,3 @@ Vectorized dp4a:      0.19 ms (2.14x)
 ========================================
 
 ```
-
-## fp16_gemm 代码逻辑与测试
-
-**实现逻辑分析**:
-
-1. **FP16 GEMM**: 使用半精度浮点数进行矩阵乘法，以提升计算速度和显存带宽。
-2. **优势**: 在保持一定精度的前提下，显著降低内存带宽压力，计算吞吐翻倍。
-
-## int8_gemm 代码逻辑与测试
-
-**实现逻辑分析**:
-
-1. **INT8 GEMM**: 采用 dp4a 等指令支持的 8 bit 整型进行计算。
-2. **优势**: 极大地增加了计算密度，适用于对精度要求不高的推理任务。
-
-## quant_dequant 代码逻辑与测试
-
-**实现逻辑分析**:
-
-1. **量化与反量化**: 在低精度计算的前后执行的数据缩放处理。
-2. **考量**: 权衡精度损失和传输计算带来的性能收益。

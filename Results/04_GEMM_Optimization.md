@@ -31,7 +31,7 @@ ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,dram__throughput.
 
 ## 四、 本地自动脚本基础运行记录
 
-*(此下为 `run_all_tests.sh` 抓取的真机二进制标准执行日志)*
+*(此下为真机二进制标准执行日志)*
 
 ## register_tiling.cu 代码逻辑与测试
 
@@ -104,7 +104,7 @@ cuBLAS SGEMM:    57.49 TFLOPS
 CPU vs 手写 GEMM 加速比：1.7x
 
 --- 结果验证 ---
-✓ 结果验证跳过 (因矩阵尺寸过大，CPU 基准未计算)
+✓ 结果验证跳过 (因矩阵尺寸过大，CPU 基准未计算；本节不包含 GPU/CPU 逐元素对比，仅验证了 GPU 端计算过程无显式错误)
 
 ========================================
 
@@ -290,7 +290,7 @@ Double Buffer GEMM:   0.3149 ms (1.21x)
 
 1. **Double Buffering**: 引入双缓冲机制，利用异或等切换缓冲区，消除软管线的等待时间。
 2. **指针投递与内存布局转化**: 使用向量化存取(float4)以及 Shared Memory Padding 降低存取延迟。
-3. **优化结果**: 性能通常进一步提升，逼近硬件理论上限的 70-80%。
+3. **优化结果**: 在 1024×1024 规模下，Double Buffer 相比向量化版本再提升约 1.2 倍，实测约 6.8 TFLOPS（约占 RTX 4090 FP32 理论峰值的 8% 左右），主要受限于 Tile 尺寸与调度，而非理论上限的 70-80%。
 
 ## register_tiling 代码逻辑与测试
 
@@ -299,3 +299,6 @@ Double Buffer GEMM:   0.3149 ms (1.21x)
 1. **寄存器重用**: 进一步将 Shared Memory 中的数据缓存到 Registers 中进行反复的 FMA 操作。
 2. **指令级并行**: 通过循环展开（Pragma unroll）提高指令发射速率并减少分支预测开销。
 3. **极端优化边界**: 使该算子受限于寄存器数量和计算单元，而不是带宽层级。
+
+> 注：对于 2048×2048 的大矩阵，由于 CPU 参考计算被刻意跳过以避免测试时间过长，`Results` 中“CPU vs 手写 GEMM 加速比”的数值仅在小尺寸下具有实际意义；大尺寸场景下应主要关注手写 Kernel 与 cuBLAS 之间的 TFLOPS 比例（约 50%）。 
+> 换句话说，本页 `Register Tiling GEMM 性能基准测试` 区块中涉及 CPU 的行（加速比、CPU 性能等）可视为“仅供小矩阵对比的参考格式”，对默认的大矩阵规模 **不构成严格意义上的 CPU/GPU 对比结论**。
