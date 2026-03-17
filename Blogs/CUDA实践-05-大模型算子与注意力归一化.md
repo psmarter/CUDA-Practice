@@ -1,5 +1,5 @@
 ---
-title: CUDA-Practice：05 Transformer 核心算子——Softmax、Norm、RoPE 与 FlashAttention
+title: CUDA-Practice：05 从归约到 Transformer 算子——Softmax、Norm 与 FlashAttention
 tags:
   - CUDA
   - GPU编程
@@ -23,11 +23,10 @@ date: 2026-03-12 12:00:00
 
 读完本文，你将能够：
 
-- 理解 Softmax 中 3 遍读写带来的 Memory Bound，并掌握 Online Softmax 的单遍流式计算推导
-- 认识灾难性相消对 LayerNorm 的毁灭性打击，掌握 Welford 算法以防止方差精度丢失
-- 解析 RMSNorm 砍掉均值归约带来的同步豁免加速比
-- 基于算术强度和 SFU 周期，解释超越函数（sin/cos）如何堵塞 RoPE 算力流水线
-- 理解 FlashAttention 的 SRAM Tiling 原理，以及 V3 宏块对微观控制流的掩盖
+- 理解 Softmax 的带宽墙：三遍读写（max → sum → 归一化）导致算术强度极低、典型 Memory Bound；掌握 Online Softmax 的单遍流式更新与分母衰减公式
+- 理解 LayerNorm 中「方差 = $E(x^2) - (E(x))^2$」在 FP32 下的灾难性相消，掌握 Welford 递推如何用增量 $\Delta = x - \mu$ 避免大数相减
+- 理解 RMSNorm 去掉均值归约后少一次 Block 同步、更适合 Warp 级并行的原因；理解 RoPE 中 sin/cos 的 SFU 周期成为瓶颈时，float2 向量化仅带来有限提升
+- 理解 FlashAttention 的 SRAM Tiling 思想：不物化 $N \times N$ 分数矩阵到 HBM，在片上用 Online Softmax 流式完成 $QK^T$、Softmax、$P \cdot V$，以及 V3 宏块与 float4 对控制流与带宽的优化
 
 ## 对应代码路径
 
@@ -36,180 +35,321 @@ date: 2026-03-12 12:00:00
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `05_LLM_Ops/01_softmax/softmax.cu` | `warp_reduce_softmax` | Online Softmax / 二叉树规约 | `Seq=4096`<br>`Batch=128` |
-| `05_LLM_Ops/02_layernorm/layernorm.cu` | `layer_norm_welford` | Welford 在线方差递推 | `Hidden=4096`<br>`Batch=128` |
-| `05_LLM_Ops/05_rmsnorm/rmsnorm.cu` | `rmsnorm_warp` | 砍去均值缩放 / Warp Shuffle | `Hidden=4096`<br>`Seq=2048` |
-| `05_LLM_Ops/04_rope/rope.cu` | `rope_vectorized` | `float2` 向量化加载 / RoPE | `Dim=128`<br>`Seq=2048` |
-| `05_LLM_Ops/03_flash_attention/flash_attention.cu` | `flash_attention_v3` | SRAM Tiling / 宏分块掩盖控制流 | `BR=32, BC=32`<br>`Seq=2048` |
+| `05_LLM_Ops/01_softmax/softmax.cu` | `naive_softmax`<br>`online_softmax`<br>`warp_reduce_softmax` | 三遍 Shared Memory 归约 / Online 单遍 max+sum / Warp 原语归约 | Batch=128, Seq=4096 |
+| `05_LLM_Ops/02_layernorm/layernorm.cu` | `naive_layernorm`<br>`welford_layernorm`<br>`warp_reduce_layernorm` | 分离均值与方差归约 / Welford 单遍 / Warp 级 Welford | Batch=128, Hidden=4096 |
+| `05_LLM_Ops/05_rmsnorm/rmsnorm.cu` | `rmsnorm_naive`<br>`rmsnorm_warp` | 单线程每行 / Warp Shuffle 归约 mean(x²) | Tokens=2048, Hidden=4096 |
+| `05_LLM_Ops/04_rope/rope.cu` | `rope_naive`<br>`rope_vectorized` | 每线程一对 (2i,2i+1) / float2 合并读写 | Seq=2048, Heads=32, Dim=128 |
+| `05_LLM_Ops/03_flash_attention/flash_attention.cu` | `flash_attention`<br>`flash_attention_v3` | SRAM 分块 + Online Softmax / 宏块 BR_V3=128 + float4 | Seq=2048, Heads=4, HeadDim=64, BR=BC=32 |
 
-> Kernel 名称与源码中 `__global__` 函数签名完全一致。
+> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/) 的带宽墙与 Roofline、[02 归约与线程粗化](/posts/44fe4eb3/) 的树状归约与 Shared Memory 同步、[03 前缀和与多块扫描](/posts/bcb510f9/) 的在线状态与跨 Block 逻辑。本篇将归约与 Tiling 应用于大模型中的 Softmax、LayerNorm、RMSNorm、RoPE 与 Attention；[06 线程束原语与寄存器通信](/posts/fec051fc/) 详解 `__shfl_*` 等 Warp 原语；[11 推理优化、融合与键值缓存](/posts/9729c03f/) 在完整推理图中做算子融合与 KV Cache。
 
-## Baseline
+---
 
-**问题陈述**：在千亿参数大模型推理中，占据运算量 90% 以上的并非全是矩阵乘法，非线性激活、位置编码、归一化以及注意力机制的 $S = QK^T$ 严重拖垮了总带宽。这些层通常具备极其轻微的计算密度（$I \ll 81.9\text{ FLOP/Byte}$），极易撞死在物理显存墙上。
-我们以这些算子的原版教科书式数学实现作为基准线，以评估优化手段对吞吐带宽的榨取率。
+## 三个实现分别做了什么
 
-| Baseline 类别 | 测试场景 | 指标 | 值 | 数据来源 |
-|---------------|----------|------|----|----------|
-| Naive Softmax (3遍扫描) | `Seq=4096` | 运算执行耗时 | 0.0053 ms | [实测] Results/05_LLM_Ops.md |
-| Naive LayerNorm (分离求值) | `Hidden=4096` | 有效显存吞吐 | 644.72 GB/s | [实测] Results/05_LLM_Ops.md |
-| Vectorized RoPE (float2) | `Seq=2048` | vs Naive 加速比 | 1.03x | [实测] Results/05_LLM_Ops.md |
-| Naive Attention ($N^2$ 落盘) | `Seq=2048, Head=4` | 中间态 HBM 体积| 128.00 MB | [理论] |
-| Naive Attention ($N^2$ 裸算) | `Seq=2048, Head=4` | 执行推测耗时 | 6.60 ms | [实测] Results/05_LLM_Ops.md |
+### 1. Softmax：从三遍扫描到 Online 与 Warp 归约
 
-## 瓶颈分析
+**数学**：$\text{softmax}(x_i) = e^{x_i - m} / \sum_j e^{x_j - m}$，其中 $m = \max(x)$ 用于数值稳定。朴素做法必须先扫一遍求 $m$、再扫一遍求分母、再扫一遍写回，即 **3 次读 + 1 次写**，算术强度极低，严重 Memory Bound。
 
-切开标准 Transformer 模块，各种非线性微型算子的拥堵成因可解构为以下四点：
+`naive_softmax`：每个 Block 处理一行（一个序列）。第一轮每线程局部求 max，树状归约到 `shared_data[0]`；第二轮每线程算 $\sum e^{x_i - m}$，再树状归约得分母；第三轮每线程写 `output[i] = exp(x_i - m) / block_sum`。多次 `__syncthreads()` 与多轮 Global Memory 遍历导致带宽成为瓶颈。
 
-1. **Softmax 的多遍扫描阻断 (Memory Bound)**
-   - $\text{Softmax}$ 为防止数值溢出需 $x_i - \max(x)$。朴素做法必须完整读取第一遍找最大值、第二遍求 $e^x$ 分母和、第三遍做除法写回。这种 $3\text{ Read} + 1\text{ Write}$ 的模式导致其算术强度 $I \approx 0.31\text{ FLOPs/Byte}$ [理论]，严重依赖 HBM 带宽。
-2. **LayerNorm 方差精度的灾难性相消 (Numerics)**
-   - $\sigma^2 = E(x^2) - (E(x))^2$ 在单遍遍历中如果 $x$ 基数极大而波动极小，FP32 仅 23 位的尾数会在大数相减中把真正的微小方差生生抹平（截断误差）。
-3. **RoPE 超越函数的流水线阻塞 (Compute Bound 特例)**
-   - 虽然使用了 `float2` 一次读取 64-bit 彻底喂饱了 LSU，但 $\sin \theta, \cos \theta$ 属于超越函数。CUDA 核心需几十个极慢的特殊功能单元（SFU）周期去用多项式甚至查表逼近。运算管线的极长等待硬性接管了整体耗时。
-4. **Attention 分数矩阵的全盘物化炸弹 (Capacity & Bandwidth)**
-   - $S = QK^T$ 所产生的矩阵面积呈 $\mathcal{O}(N^2)$ 级。在 $N=2048$ 时，产生的高达 $128 \text{ MB}$ 临时显存（$Q \cdot K$）不但立刻耗尽 SRAM 空间，还会导致向外 HBM 倾泻写入后再行读入激活，让显存来回颠簸（Thrashing）。
+`online_softmax`：单遍遍历中维护「当前最大值」与「当前分母」的在线更新。当遇到更大的 $x_k$ 时，用系数 $e^{m_{old} - m_{new}}$ 对已有分母做衰减，再加上 $e^{x_k - m_{new}}$，数学上与两阶段 Softmax 等价。归约阶段只需合并各线程的 (max, sum) 对，仍用树状归约 + 同样的衰减公式合并，从而将**全局读入次数**降为单遍。
 
-## 优化思路
+`warp_reduce_softmax`：在 Online 思想基础上，用 `warp_reduce_max` / `warp_reduce_sum`（基于 `__shfl_*`）在 Warp 内做寄存器级归约，再在 Block 内用 Shared Memory 做跨 Warp 归约，减少 SMEM 读写与同步次数，进一步压榨带宽。
 
-针对各个算子的致命瓶颈，工业界给出了以下标准手术切除：
+```cpp
+// 来源：05_LLM_Ops/01_softmax/softmax.cu : L61-L72
+// online_softmax 的局部单遍 max+sum 更新
+float local_max = -INFINITY;
+float local_sum = 0.0f;
+for (int i = tid; i < seq_len; i += blockDim.x) {
+    float val = input[row * seq_len + i];
+    float new_max = fmaxf(local_max, val);
+    local_sum = local_sum * expf(local_max - new_max) + expf(val - new_max);
+    local_max = new_max;
+}
+```
 
-### 优化 1：Online Softmax 动态修正重标
+### 2. LayerNorm：从分离均值/方差到 Welford 单遍与 Warp 归约
 
-**解决的瓶颈**：必须提前锁定全局最大值引起的强制多遍内存扫描。
-**核心思想**：只做单遍循环扫描流！我们在寄存器内置状态机 $m_{old}, d_{old}$。当新传入未知数据 $x_k$ 发现更大的 $m_{new}$ 时，强行将以往积淀的所有旧发力分母项乘以补偿衰减系数 $e^{m_{old} - m_{new}}$ 实施全局折旧。
-**预期收益**：成功将全局内存读取频次硬砍至 1 遍并保持精度的绝对数学一致。
+**数学**：$\text{LayerNorm}(x) = \gamma \cdot (x - \mu) / \sqrt{\sigma^2 + \epsilon} + \beta$。朴素做法先求 $\mu$（一次归约）、再求 $\sigma^2$（第二次遍历）；若用 $\sigma^2 = E(x^2) - (E(x))^2$ 在单遍中算，则大数相减会导致 FP32 尾数丢失（灾难性相消）。
 
-### 优化 2：Welford 递推与 RMSNorm 摘除
+`naive_layernorm`：先对行内元素求和并树状归约得 `block_mean`，再对 $(x_i - \text{block\_mean})^2$ 求和并归约得方差，最后写归一化结果。两轮完整遍历 + 多轮 `__syncthreads()`。
 
-**解决的瓶颈**：方差失真与大批量 `__syncthreads()` 卡口。
-**核心思想**：LayerNorm 使用单刀直入追踪差分 $\Delta_k = x_k - \mu_{k-1}$ 更新均值的 Welford 在线方程来规避平方项相减炸膛。
-其次，对于更普遍的场景：干脆暴力抛弃原本的均值归算动作，只余留纯粹向后的均方根乘方归一，成为 **RMSNorm**。它摘除了一场全员对齐等待计算平均值的强制屏障。
-**预期收益**：将 LayerNorm 提速 7%，并将简化版的 RMSNorm 通过 256并发与蝶形网络打满至几十微秒级 [实测]。
+`welford_layernorm`：用 Welford 在线算法单遍维护均值与「平方偏差和」$M_2$。递推为：$\delta = x_k - \mu_{k-1}$，$\mu_k = \mu_{k-1} + \delta/k$，$M_{2,k} = M_{2,k-1} + \delta \cdot (x_k - \mu_k)$。方差由 $M_2 / n$ 得到，全程只用增量，避免 $E(x^2) - (E(x))^2$ 的大数相减。Block 内用 `welford_combine` 合并各线程的 (mean, m2, count)，再统一算 `inv_std` 与输出。
 
-### 优化 3：FlashAttention 宏块 SRAM Tiling (V3)
+`warp_reduce_layernorm`：每线程先算局部 Welford 结构，再用 `warp_reduce_welford`（`__shfl_down_sync` + `welford_combine`）在 Warp 内归约，最后 Block 内归约，减少 SMEM 与同步。
 
-**解决的瓶颈**：千万级 Token 的 $N^2$ 无底限外显存物化。
-**核心思想**：彻底推翻大矩阵落地法则。仅仅撕下一微型窗口的 $Q \ (B_R)$ 和 $K, V \ (B_C)$ 输入到极小的高速 SRAM ($< 100 \text{ KB}$)内，依靠 Online Softmax 在里面原位消化掉所有的积和修正后立刻吐出最终解。进一步选用极限超大 Tile 块尺幅以摊薄掉密密麻麻的内核边界循环控制判断周期。
-**预期收益**：完全摧毁 $128 \text{ MB}$ 中继文件，反杀获得最高至数十数百倍的高效计算提速 [实测]。
+```cpp
+// 来源：05_LLM_Ops/02_layernorm/layernorm.cu : L93-L99
+// welford_layernorm 的局部 Welford 递推
+WelfordData local_data = {0.0f, 0.0f, 0.0f};
+for (int i = tid; i < hidden_size; i += blockDim.x) {
+    float x = input[row * hidden_size + i];
+    local_data.count += 1.0f;
+    float delta = x - local_data.mean;
+    local_data.mean += delta / local_data.count;
+    local_data.m2 += delta * (x - local_data.mean);
+}
+```
+
+### 3. RMSNorm、RoPE 与 FlashAttention：归一化简化、位置编码与 SRAM Tiling
+
+**RMSNorm**：公式 $x / \sqrt{\text{mean}(x^2) + \epsilon} \cdot \gamma$，不做去均值，只需一次「平方和」归约。`rmsnorm_naive` 每行单线程循环求 `sum_sq` 再写输出；`rmsnorm_warp` 用 `__shfl_xor_sync` 做 Warp 内归约 + 跨 Warp 的 Shared Memory 归约，然后广播 `rms` 再写输出。少一次均值归约，同步与访存都更轻。
+
+**RoPE**：对每对 $(x_{2i}, x_{2i+1})$ 做旋转 $(\cos\theta_i, -\sin\theta_i; \sin\theta_i, \cos\theta_i)$。`rope_naive` 每线程读两个 float、算 sin/cos、写回；`rope_vectorized` 用 `float2` 一次读写一对，减少全局内存事务。瓶颈往往在 sin/cos 的 SFU 周期，故向量化仅带来约 1.03× 提升 [实测]。
+
+**FlashAttention**：Naive Attention 先算 $S = QK^T$ 并写回 HBM（$N^2$ 体积），再对 $S$ 做 Softmax，再算 $P \cdot V$。Flash 不物化 $S$：将 $Q$、$K$、$V$ 按块加载到 SRAM，在块内算 $QK^T$ 的局部块、用 **Online Softmax** 维护行级 max 与分母、边算边乘 $V$ 累加到输出，最后再按行归一化。`flash_attention`（V1）用 BR×BC 小块；`flash_attention_v3` 用更大 Q 块（BR_V3=128）、float4 加载与 `#pragma unroll` 摊薄控制流，在 Seq=2048 下优于 Naive 并避免 128 MB 中间矩阵 [实测]。
+
+---
+
+## Baseline 与瓶颈分析
+
+### Softmax 的多遍访存
+
+朴素 Softmax 每行：读入整行求 max（1 遍）、再读入求 $\sum e^{x-m}$（第 2 遍）、写 $e^{x-m}$ 再读回做除法或第三遍读入写归一化结果。总访存约 3 读 + 1 写，算术强度远低于 Roofline 拐点，**Memory Bound**。
+
+### LayerNorm 的方差精度
+
+用 $\sigma^2 = \frac{1}{n}\sum x_i^2 - \mu^2$ 时，当 $x_i$ 数量级大而波动小时，两项相近，FP32 有效位数有限，相减后方差被截断。**Welford** 只做「当前值相对当前均值的增量」的乘加，数值稳定。
+
+### RoPE 的 SFU 瓶颈
+
+RoPE 的算力主要在 sin/cos。这些超越函数走 SFU，周期远长于普通 FMA。此时即便用 float2 把访存压满，整体仍被 **Compute Bound（SFU）** 限制，向量化收益约 1.03× [实测]。
+
+### Attention 的 $N^2$ 物化
+
+$S = QK^T$ 大小为 $N \times N$。Seq=2048、多 Head 时，中间矩阵达 128 MB [理论]，超出片上 SRAM，必须落 HBM，再读回做 Softmax 与 $P \cdot V$，导致带宽与容量双重压力。**FlashAttention** 通过 SRAM 分块 + 重计算（不存 $S$），将 HBM 读写与中间体积大幅降低。
+
+---
+
+## 优化思路：单遍、Welford、去均值与 SRAM Tiling
+
+### 核心思想概览
+
+| 算子 | 瓶颈 | 优化方向 |
+|------|------|----------|
+| Softmax | 三遍读写 | Online 单遍 max+sum + 分母衰减公式；Warp 归约减 SMEM/同步 |
+| LayerNorm | 方差相消 + 两遍 | Welford 单遍递推；Warp 级归约 |
+| RMSNorm | 少一次归约即可 | 仅 mean(x²) 归约，无均值；Warp Shuffle 归约 |
+| RoPE | sin/cos 周期 | float2 合并访存（收益受 SFU 限制） |
+| Attention | $N^2$ 落盘与带宽 | SRAM 分块 + Online Softmax，不物化 $S$；V3 宏块 + float4 |
+
+### Online Softmax 的分母修正
+
+设当前已处理的最大值为 $m_{old}$、分母为 $d_{old}$。遇到新值 $x_k$ 时令 $m_{new} = \max(m_{old}, x_k)$，则此前所有 $e^{x - m_{old}}$ 在「以 $m_{new}$ 为基准」下应变为 $e^{x - m_{new}} = e^{x - m_{old}} \cdot e^{m_{old} - m_{new}}$，故：
+
+$$d_{new} = d_{old} \cdot e^{m_{old} - m_{new}} + e^{x_k - m_{new}}$$
+
+这样单遍即可得到与两阶段等价的分母，是 FlashAttention 内块内 Softmax 的数学基础。
+
+### Welford 递推
+
+均值的递推：$\mu_k = \mu_{k-1} + (x_k - \mu_{k-1})/k$。定义 $\delta = x_k - \mu_{k-1}$，则 $\mu_k = \mu_{k-1} + \delta/k$。平方偏差和可递推为 $M_{2,k} = M_{2,k-1} + \delta \cdot (x_k - \mu_k)$，方差为 $M_{2,n}/n$。合并两个 Welford 结构时用 `welford_combine`（见源码），保证数值稳定。
+
+### FlashAttention 数据流（概念）
+
+```mermaid
+graph LR
+    classDef hbm fill:#f9d0c4,stroke:#333;
+    classDef sram fill:#fcf1c8,stroke:#333;
+
+    subgraph HBM
+        Q[Q]:::hbm
+        K[K]:::hbm
+        V[V]:::hbm
+        O[O]:::hbm
+    end
+
+    subgraph SRAM
+        sQ["Q 块"]:::sram
+        sK["K/V 块"]:::sram
+    end
+
+    Q --> sQ
+    K --> sK
+    V --> sK
+    sQ --> O
+    sK --> O
+```
+
+块内：用 sQ 的一行与 sK 的一块算局部 $S_{ij}$，Online Softmax 更新 $m_i$、$l_i$，累加 $P \cdot V$ 到输出，**不写回** $S$ 到 HBM。
+
+---
 
 ## 关键代码解释
 
-### State Machine 驱动下的 Online Softmax
+### Online Softmax 的归约合并（带衰减）
 
 ```cpp
-// 来源：05_LLM_Ops/01_softmax/softmax.cu : 局部片选简写
-    float m_old = -INFINITY;
-    float d_old = 0.0f;
-    for (int i = tid; i < seq_len; i += blockDim.x) {
-        float x_k = input[i];
-        
-        // [1] 不断探取前方高能，动态攫取新的霸主峰值
-        float m_new = max(m_old, x_k);
-        
-        // [2] 这一条核爆级公式：将以前全部算出来积压在手上的分母权重
-        // 用最新的最大值与旧最大值的落差 exp 强行等比剥落拉平！
-        d_old = d_old * expf(m_old - m_new) + expf(x_k - m_new);
-        
-        m_old = m_new;
+// 来源：05_LLM_Ops/01_softmax/softmax.cu : L75-L82
+// 归约时合并各线程的 (max, sum)，合并时对 sum 做衰减
+for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (tid < stride) {
+        float new_max = fmaxf(shared_max[tid], shared_max[tid + stride]);
+        shared_sum[tid] = shared_sum[tid] * expf(shared_max[tid] - new_max)
+                        + shared_sum[tid + stride] * expf(shared_max[tid + stride] - new_max);
+        shared_max[tid] = new_max;
     }
+    __syncthreads();
+}
 ```
 
-**要点解读**：
+合并两段 (max, sum) 时，两段的分母都要换算到同一基准 `new_max`，再相加，与单遍 Online 公式一致。
 
-- `[1]-[2]` 彻底终结了 Softmax 的两阶段定律。我们完全可以在不断吸收未知边界数据时，通过 `expf(m_old - m_new)` 的极其精美的常系数惩罚，让早先算错偏差的求和基底乖乖地缩回它该在的位置上。这种剥落机制是后面 Flash Attention 中重计算能生效的最重要理论基石。
-
-### Welford 方差抗相消计算
+### Welford 合并函数
 
 ```cpp
-// 来源：05_LLM_Ops/02_layernorm/layernorm.cu : L28-L38
-    float mu = 0.0f, m2 = 0.0f, count = 0.0f;
-    for(int i = tid; i < hidden; i += blockDim.x) {
-        float val = input[row * hidden + i];
-        count += 1.0f;
-        
-        // [1] 从来不直接将所有数莽干加在一起，永远只研究当前值到基线的“摇摆偏度” (delta)
-        float delta = val - mu;
-        mu += delta / count;         
-        // [2] 更新平方和累加库，注意连乘的偏度一个是基于老的均值，一个是除以权证后的新均值
-        m2 += delta * (val - mu);    
-    }
+// 来源：05_LLM_Ops/02_layernorm/layernorm.cu : L66-L80
+__device__ __forceinline__ WelfordData welford_combine(WelfordData a, WelfordData b) {
+    WelfordData res;
+    res.count = a.count + b.count;
+    float delta = b.mean - a.mean;
+    res.mean = a.mean + delta * b.count / res.count;
+    res.m2 = a.m2 + b.m2 + delta * delta * a.count * b.count / res.count;
+    return res;
+}
 ```
 
-**要点解读**：
+将两段统计量 (mean, m2, count) 合并为整体均值和平方偏差和，用于 Block/Warp 归约。
 
-- `[1]-[2]` 这个看似晦涩的方程叫 Welford 增量更新法。就算你的自然输入流里充斥着上百万数值的宏大漂浮（例如 LLM 后期极大激活的 Outliers），$val$ 减去刚更新的 $\mu$ 时剥离出来的增量（$\Delta$）永远很扁平微弱安全，将浮点精度的末尾几位极其完美的保留了下来。
+### FlashAttention V1 的块内 Online Softmax 与 O 更新
+
+```cpp
+// 来源：05_LLM_Ops/03_flash_attention/flash_attention.cu : L161-L174
+float exp_diff = __expf(m_i - m_i_new);
+float l_i_new = exp_diff * l_i + p_sum;
+// O_new = O_old * exp_diff + P * V
+for (int d = 0; d < head_dim; ++d) {
+    float pv_sum = 0.0f;
+    for (int k_idx = 0; k_idx < BC; ++k_idx) { ... }
+    float old_o = O[qkv_offset + row_q * head_dim + d];
+    O[qkv_offset + row_q * head_dim + d] = old_o * exp_diff + pv_sum;
+}
+m_i = m_i_new;
+l_i = l_i_new;
+```
+
+每次新 K/V 块进来，用当前块的 max 更新 $m_i$，用 exp 衰减因子更新 $l_i$ 和已有输出行，再加上当前块对应的 $P \cdot V$，最后在 Kernel 末尾对 O 做一次除以 $l_i$ 的归一化。
+
+### Block / Thread 映射（典型配置）
+
+| 算子 | Grid | Block | 每 Block 职责 |
+|------|------|-------|----------------|
+| Softmax | (batch,) | (BLOCK_SIZE,) 如 1024 | 一行（一个序列） |
+| LayerNorm | (batch,) | (BLOCK_SIZE,) | 一行（一个 token 的 hidden 维） |
+| RMSNorm warp | (num_tokens,) | (256,) | 一行，Warp 内归约 sum_sq |
+| RoPE | (seq_len, num_heads) | (head_dim/2,) | 一个 (pos, head) 的所有维度对 |
+| Flash V3 | (seq/BR_V3, heads, batch) | (128,) | 多行 Q，共享 K/V 块 |
+
+---
 
 ## 结果与边界
 
-### 性能对比
+### Softmax（Batch=128, Seq=4096，100 次迭代取平均）
 
-> **测试条件**：双 RTX 4090 ($sm\_89$), nvcc -O3
-> **数据来源**：`Results/05_LLM_Ops.md` 原始实机日志，均以 50-100 次打脸求均值避开冷启动
+> 数据来源：`Results/05_LLM_Ops.md` 原始日志
 
-**1. Softmax 通道扫荡对绝**
+| 版本 | Kernel 耗时 | 有效带宽 | vs Naive | 数据性质 |
+|------|------------|---------|----------|----------|
+| Naive Softmax | 0.0053 ms | 785.19 GB/s | 1.00x | [实测] |
+| Online Softmax | 0.0041 ms | — | 1.30x | [实测] |
+| Warp Reduce Softmax | ≈0.0035 ms | 1180.62 GB/s | ≈1.50x | [实测] |
 
-*对于规模 `Seq=4096, Batch=128` (全尺寸2MB)*
+（Warp Reduce 打印为 0.00 ms 为精度舍入，带宽与加速比基于内部计时 [实测]。）
 
-| 实现手段 | 运算执行耗时 | 带宽榨取率 | 加速对标 | 数据性质 |
-|----------|------------|----------|----------|----------|
-| Naive 多阶段共享内扫描 | 0.0053 ms | 785.19 GB/s | 1.00x | [实测] |
-| Online 递减归并法 | 0.0041 ms | - | 1.30x | [实测] |
-| Warp 原语蝶形连打归约 | **0.0035 ms** | **1180.62 GB/s** | **1.50x** | [实测] |
+### LayerNorm（Batch=128, Hidden=4096）
 
-在线衰推在无损下砍出了 1.3 倍的绝对提速。至于最终版为什么能冲破物理天际达 1180 GB/s？这是由于 72MB 庞大的 L2 缓存对于只有 2MB 体量测试的高命中缓冲假象，但这无不例证我们成功把代码榨干直至把 GPU 的晶体管管线给逼迫到绝境。
+> 数据来源：`Results/05_LLM_Ops.md` 原始日志
 
-**2. LayerNorm 与 RMSNorm (Hidden=4096)**
+| 版本 | Kernel 耗时 | 有效带宽 | vs Naive | 数据性质 |
+|------|------------|---------|----------|----------|
+| Naive LayerNorm | 0.0065 ms | 644.72 GB/s | 1.00x | [实测] |
+| **Welford LayerNorm** | **0.0061 ms** | **691.89 GB/s** | **1.07x** | [实测] |
 
-| Kernel | 执行耗时 | 有效物理吞吐带宽 | 数据性质 |
-|----------|------------|------------------|----------|
-| Naive LayerNorm | 0.0065 ms | 644.72 GB/s | [实测] |
-| Welford 精准不丢版 | **0.0061 ms** | **691.89 GB/s** | [实测] |
-| Naive RMSNorm | 0.32 ms | 212.46 GB/s | [实测] |
-| **Warp-level RMSNorm**| **0.026 ms** | **2620.64 GB/s** | [实测] (含 L2 极度增益) |
+### RMSNorm（Tokens=2048, Hidden=4096）
 
-抛除均值的等候墙使得极其惨烈的 12.33 倍断档杀伤加速比于同等规模上在 RMSNorm 间上演 [实测]。
+> 数据来源：`Results/05_LLM_Ops.md` 原始日志
 
-**3. Flash Attention 的惊天时空大碰撞**
+| 版本 | Kernel 耗时 | 有效带宽 | vs Naive | 数据性质 |
+|------|------------|---------|----------|----------|
+| Naive RMSNorm（单线程/行） | 0.32 ms | 212.46 GB/s | 1.00x | [实测] |
+| **Warp RMSNorm** | **≈0.026 ms** | **2620.64 GB/s** | **≈12.33x** | [实测] |
 
-*对于微型规模 `Seq=2048, HeadDim=64, BR=32, BC=32`* 
+Warp 版 256 线程/行 + 无均值归约，同步与访存都显著减少；有效带宽超过 HBM 峰值为 L2 缓存命中导致 [理论]。
 
-| 执行阶段版本 | HBM 中存盘体积 | 核上纯累加时 | CPU 基准倍杀 | 数据性质 |
-|-------------|--------------|--------------|--------------|----------|
-| Naive $N^2$ 落盘暴力流 | **128.00 MB** | 6.60 ms | - | [实测] |
-| Flash V1 (细散砖切块) | 仅缓存 O | 9.58 ms | 惨降 | [实测] |
-| Flash V3 (Macro 切配+Float4) | 0.00 MB | **5.33 ms** | 1279.17x | [实测] |
+### RoPE（Seq=2048, Heads=32, HeadDim=128）
 
-为什么最初版比原版还慢？因为在 $2048$ 这个还未膨胀的超短句段下，$32\times 32$ 极其细碎严密的控制流（循环判断锁及各种同步界线）死死拖垮了运算器流水线掩护了极短周期的带宽补足。将 Tile 快幅扩充至极值并利用粗管抽水 (Flash V3)，流水线终于得以疏导并正式掀翻 Native 原生矩阵体系落盘霸权。
+> 数据来源：`Results/05_LLM_Ops.md` 原始日志
 
-### 边界条件与局限
+| 版本 | Kernel 耗时 | 有效带宽 | vs Naive | 数据性质 |
+|------|------------|---------|----------|----------|
+| Naive RoPE | 0.04 ms | 1675.92 GB/s | 1.00x | [实测] |
+| Vectorized RoPE (float2) | ≈0.039 ms | 1734.27 GB/s | ≈1.03x | [实测] |
 
-- **超越函数的硬伤**：利用 `float2` 吸入参数仅给 RoPE 带来了可悲的 **1.03×** 提升 [实测]。这也揭露了一个极其无情的算力真相——当 $sin$ 等三角算子因为依赖几十周期的 SFU 指令周期彻底将调度队列堵塞发烫时；在后段给再粗放多少条高速路数据带入也只不过杯水车薪。只能通过粗鲁截断降级的 LUT 查询表来做有损更换。
+sin/cos 的 SFU 周期成为主瓶颈，向量化收益有限。
+
+### FlashAttention（Seq=2048, Heads=4, HeadDim=64, BR=BC=32）
+
+> 数据来源：`Results/05_LLM_Ops.md` 原始日志
+
+| 版本 | 中间 S 体积 | Kernel 耗时 | vs Naive | 数据性质 |
+|------|-------------|------------|----------|----------|
+| Naive Attention（3 步） | 128 MB | 6.60 ms | 1.00x | [实测] |
+| Flash V1 | 0 | 9.58 ms | 0.69x | [实测] |
+| **Flash V3** | **0** | **5.33 ms** | **1.24x** | [实测] |
+
+V1 在短序列下小块带来的控制流与同步开销大于省下的带宽，反而更慢；V3 宏块 + float4 摊薄开销后优于 Naive，并消除 128 MB 中间显存。
+
+```mermaid
+xychart-beta
+  title "05 大模型算子：相对 Naive 加速比"
+  x-axis ["Softmax\nOnline", "Softmax\nWarp", "LayerNorm\nWelford", "RMSNorm\nWarp", "Flash V3"]
+  y-axis "相对加速" 0 --> 14
+  bar [1.3, 1.5, 1.07, 12.33, 1.24]
+```
+
+### 边界与局限
+
+- **Softmax/LayerNorm/RMSNorm**：测试数据可完全进 L2 时，有效带宽可能超过 1008 GB/s，属缓存效应，不代表突破 HBM 物理带宽。
+- **FlashAttention**：在**短序列**（如 2048）且 L2 能容纳部分数据时，Naive 已较省；Flash 的优势在长序列与显存紧张时更明显。V1 小块的边界与分支多，易被控制流拖慢。
+- **RoPE**：若需进一步加速，可考虑 LUT 近似 sin/cos（有损）或移至 Tensor Core 等专用单元（若支持）。
+
+---
 
 ## 常见误区
 
-1. **误区**：一旦出现算出来的概率极高为 `NaN`（Not a Number），就是因为显存爆了。
-   **实际**：这极有可能是底层没有插入 `val - max_v` 或者是没有去上用 Welford 防灾保护算法。FP16 和 FP32 的阶码浮位非常可怜，哪怕一个极其微弱的 `exp(100)` 早已在显存上将其彻底撕裂开溢崩盘。
-2. **误区**：Flash Attention 在所有场景之下都神挡杀神。
-   **实际**：在序列极其短小的首包输入期间或者是你长了极其庞大的高速 L2 分担墙时，它的超低吞吐收益将会悉数被内部极度繁琐沉重且要重复计算的 $SRAM$ 内状态机推算墙掩埋从而呈现被原版 Native 手段极尽全方位屠戮乃至碾压变慢的尴尬现象。这也是它只专供处理超级长难下文及极大模型体面的根源机制。
+1. **误区**：Softmax 出现 NaN 一定是显存不足。
+   **实际**：更常见是未做数值稳定（未减 max）或方差计算方式不当。例如未用 $x - \max$ 直接算 exp 会溢出；LayerNorm 用 $E(x^2) - (E(x))^2$ 易灾难性相消产生异常方差，进而导致 NaN。应使用减 max 的 Softmax 与 Welford 类方差。
+
+2. **误区**：FlashAttention 在所有序列长度下都更快。
+   **实际**：在很短序列且 L2 充足时，Naive 的 3 步实现可能更快；Flash 的 SRAM 分块与重计算有固定开销，V1 小块还会被控制流与同步拖慢。Flash 主要优势在长序列与显存占用 [实测]。
+
+3. **误区**：RMSNorm 只是少算一个均值，加速应该很小。
+   **实际**：少一次均值归约意味着少一轮 Block 内同步与一次全局归约，在 Warp 级实现下可与 Naive（单线程/行）形成数量级差异（本项目约 12.33×）[实测]。
+
+4. **误区**：RoPE 用 float2 向量化后应该明显更快。
+   **实际**：RoPE 的主要成本在 sin/cos（SFU），访存占比相对小。float2 把访存做满后，整体仍受 SFU 限制，实测仅约 1.03× 提升 [实测]。
+
+---
 
 ## 系列导航
 
 ### 前置阅读
 
 | 文章 | 与本篇的衔接 |
-|------|--------------|
-| [01 基础概念与分块](/posts/7608f1b0/) | 建立带宽墙、Roofline 与 Shared Memory Tiling 直觉，为后文分析算术强度和 Memory Bound/Compute Bound 提供基础 |
-| [02 归约与线程粗化](/posts/44fe4eb3/) | Softmax/LayerNorm/RMSNorm/FlashAttention 中的归约（max/sum/均值/方差）全部复用其中的树形规约与线程粗化思想 |
-| [03 前缀和与多块扫描](/posts/bcb510f9/) | Online Softmax 与 FlashAttention 中的“在线状态机”和多 Block Scan，与 3-Pass Scan 的跨 Block 拼接逻辑一脉相承 |
-| [06 线程束原语与寄存器通信](/posts/fec051fc/) | Softmax、LayerNorm、RMSNorm 中的 `__shfl_*` Warp 规约全部依赖本篇介绍的寄存器级通信原语 |
+|------|----------------|
+| [01 基础概念与分块](/posts/7608f1b0/) | 带宽墙、Roofline、Tiling 与存储层级，本篇算子的 Memory/Compute Bound 分析基础 |
+| [02 归约与线程粗化](/posts/44fe4eb3/) | Softmax/LayerNorm/RMSNorm 的树状归约与 `__syncthreads()` |
+| [03 前缀和与多块扫描](/posts/bcb510f9/) | Online Softmax / FlashAttention 的「在线状态」与跨块逻辑 |
+| [06 线程束原语与寄存器通信](/posts/fec051fc/) | `__shfl_*` 等 Warp 归约在 Softmax/Norm 中的使用 |
 
-### 推荐后续
+### 推荐后续（承上启下）
 
 | 文章 | 与本篇的衔接 |
-|------|--------------|
-| [09 张量核心与混合精度](/posts/78e375e8/) | 将本篇中在 CUDA Core 上优化到极致的 GEMM/Attention 迁移到 Tensor Core 上，进一步抬升算力上限 |
-| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 以本篇 Softmax/Norm/RoPE/FlashAttention 为基础，讨论在完整 LLM 推理图中的算子融合、KV Cache 与批处理策略 |
+|------|----------------|
+| [09 张量核心与混合精度](/posts/78e375e8/) | 将 GEMM/Attention 迁到 Tensor Core，突破 CUDA Core 算力 |
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 以本篇算子为基础，做推理图融合、KV Cache 与批处理 |
 
 ---
 

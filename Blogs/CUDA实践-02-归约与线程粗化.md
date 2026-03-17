@@ -1,5 +1,5 @@
 ---
-title: CUDA-Practice：02 并行归约的体系结构推演与带宽压榨
+title: CUDA-Practice：02 从归约到线程粗化——Warp 发散消除与带宽压榨
 tags:
   - CUDA
   - GPU编程
@@ -20,10 +20,10 @@ date: 2026-03-12 13:00:00
 
 读完本文，你将能够：
 
-- 解析 GPU 线程束内的 Warp Divergence 物理成因及其解决方案
-- 定量分析 Shared Memory 版本与全局 Memory 收敛版本在小数据量下的假象等同（L1 Cache 效应）
-- 理解并实现 Thread Coarsening (线程粗化)，有效分摊调度税并打爆 HBM 内存带宽
-- 认知 FMA (Fused Multiply-Add) 指令融合与利用超大 L2 Cache (72MB) 实现的超物理理论峰值带宽机制
+- 理解归约的带宽墙：为什么加法算术强度趋近于 0，归约是典型的 Memory Bound 算子
+- 用 Warp Divergence 的物理成因解释朴素树状归约（stride 倍增）为何浪费算力，以及收敛索引（stride 折半）如何消除发散
+- 理解 Shared Memory 树状归约与多 Block 下 `atomicAdd` 收尾的必要性
+- 实现线程粗化（Thread Coarsening），在寄存器内先累加多元素再写 Shared Memory，有效降低 Block 数、同步与原子操作次数，逼近 HBM 带宽极限
 
 ## 对应代码路径
 
@@ -32,85 +32,156 @@ date: 2026-03-12 13:00:00
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `02_Reduction/01_reduce_sum/reduce_sum.cu` | `simple_reduce_sum`<br>`convergent_reduce_sum`<br>`shared_reduce_sum` | 发散消除 / 收敛索引 / Shared Memory 树状归约 | `N=2048` |
-| `02_Reduction/02_reduce_optimized/reduce_optimized.cu` | `segmented_reduce_sum`<br>`coarsened_reduce_sum`<br>`coarsened_reduce_max` | 多 Block + atomicAdd、线程粗化 (COARSE_FACTOR=4)、Shared Memory 收尾 | `N=1048576 (1M)` |
-| `02_Reduction/03_dot_product/dot_product.cu` | `shared_dot_product`<br>`coarsened_dot_product`<br>`fma_dot_product` | 点积 = 乘后归约、FMA 融合、L2 缓存热数据 | `N=1048576 (1M)` |
+| `02_Reduction/01_reduce_sum/reduce_sum.cu` | `simple_reduce_sum`<br>`convergent_reduce_sum`<br>`shared_reduce_sum` | 朴素树状（发散）/ 收敛索引 / Shared Memory 树状归约 | N = 2048 |
+| `02_Reduction/02_reduce_optimized/reduce_optimized.cu` | `segmented_reduce_sum`<br>`coarsened_reduce_sum`<br>`coarsened_reduce_max` | 多 Block + atomicAdd、线程粗化 (COARSE_FACTOR=4)、Shared Memory 收尾 | N = 1,048,576 (1M) |
+| `02_Reduction/03_dot_product/dot_product.cu` | `shared_dot_product`<br>`coarsened_dot_product`<br>`fma_dot_product` | 点积 = 乘后归约、线程粗化、FMA 融合、L2 热数据 | N = 1,048,576 (1M) |
 
-> Kernel 名称与源码中 `__global__` 函数签名完全一致。本篇多 Block 归约以 **Shared Memory 树状折叠 + atomicAdd** 收尾，未使用 `__shfl_*`；Warp 级无锁归约见 [06 线程束原语与寄存器通信](/posts/fec051fc/)。
+> 本篇多 Block 归约以 **Shared Memory 树状折叠 + atomicAdd** 收尾，未使用 `__shfl_*`；Warp 级无锁归约见 [06 线程束原语与寄存器通信](/posts/fec051fc/)。
 
-> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/) 的带宽墙与 Shared Memory 直觉，将「分块与片上缓存」用于**归约**这一经典模式（多 Block、atomicAdd、线程粗化）。后续 [03 前缀和与多块扫描](/posts/bcb510f9/) 同属树形结构但需保留前缀和；[06 线程束原语与寄存器通信](/posts/fec051fc/) 用 `__shfl_*` 做无 Shared Memory 的 Warp 归约；[05 大模型算子与注意力归一化](/posts/cb29461c/) 的 Softmax/LayerNorm 依赖归约作为子步骤。
+> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/) 的带宽墙与 Shared Memory 直觉，将「片上缓存与同步」用于**归约**这一经典模式（多 Block、atomicAdd、线程粗化）。后续 [03 前缀和与多块扫描](/posts/bcb510f9/) 同属树形结构但需保留前缀和；[06 线程束原语与寄存器通信](/posts/fec051fc/) 用 `__shfl_*` 做无 Shared Memory 的 Warp 归约；[05 大模型算子与注意力归一化](/posts/cb29461c/) 的 Softmax/LayerNorm 依赖归约作为子步骤。
 
-## Baseline
+---
 
-**问题陈述**：将含有 $N$ 个元素的数组折叠为一个标量。这是深度学习 Softmax 或者 LayerNorm 前置的极限抽象。由于加法操作算术强度趋向于 0，该算子极度 Memory Bound。
+## 三个实现分别做了什么
 
-| Baseline 类别 | 测试场景 | 指标 | 值 | 数据来源 |
-|---------------|----------|------|----|----------|
-| CPU 参考推演 (14核) | `N=1M` (4.00 MB) | Reduce Sum 耗时 | 4.69 ms | [实测] Results/02_Reduction.md |
-| CPU 参考推演 (14核) | `N=1M` 点积 (8.00 MB)| Dot Product 耗时 | 1.69 ms | [实测] Results/02_Reduction.md |
-| Naive Simple Reduce | `N=2048` 极小规模 | Divergence 耗时 | 0.0051 ms | [实测] Results/02_Reduction.md |
-| Segmented Naive GPU | `N=1M` 大规模 | 多 Block 原子锁耗时 | 0.0084 ms | [实测] Results/02_Reduction.md |
+### 1. Reduce Sum：从朴素到收敛再到 Shared Memory
 
-## 瓶颈分析
+**问题**：将长度为 $N$ 的数组归约为一个标量 $\sum_{i=0}^{N-1} x_i$。这是 Softmax、LayerNorm 等算子的核心子步骤。
 
-为何朴素树状归约与分段归约无法打满物理带宽？原因解构如下：
+`simple_reduce_sum` 采用**树状归约**：`stride` 从 1 倍增（1, 2, 4, …），每轮用 `if (threadIdx.x % stride == 0)` 让部分线程做 `input[i] += input[i + stride]`。加法次数为 $O(\log N)$，但同一 Warp 内满足条件的线程**不连续**（例如 stride=16 时只有 tid=0,16 执行），导致 Warp Divergence，大量算力被掩码浪费。
 
-1. **Warp Divergence 导致物理核心闲置浪费**
-   - Naive Reduce 中使用 `stride = 1, 2, 4` 配对。`if (tid % stride == 0)` 导致同 Warp 内活跃线程间距拉开。在 $stride=16$ 时，单个指令提取单元下只剩 2 人执行，其余 30 个线程强行掩码阻塞，算力真空率高达 93.75% [理论]。
-2. **多 Block Segmented 同步隔离极高路费**
-   - 面对 1M 数组，按常规切分需激发 1024 个 Block（设极小规模双吃为 512）。1024 股数据在各自算出归约极值后，为了最终全图合并不受相互篡改，全数去冲撞排队 `atomicAdd`，自旋死锁造成严重阻塞。
-3. **低指令并行度 (ILP) 与发射税**
-   - 当单个线程只提取 1 或 2 个元素即发生一次 `__syncthreads()` 卡位时，底层指令流水由于没有连续无依赖的运算流填充，无法覆盖显存延迟本身。并且唤醒上千个短命 Block 占比过高。
+`convergent_reduce_sum` **倒转折叠方向**：`stride` 从 `blockDim.x` 折半递减至 1，条件改为 `if (threadIdx.x < stride)`。这样每轮参与计算的线程 tid 始终落在 $[0, \textit{stride})$，**连续无间隙**，未参与的 Warp 被调度器挂起，存活 Warp 内利用率恢复。
 
-## 优化思路
+`shared_reduce_sum` 在收敛逻辑基础上，先将数据加载到 **Shared Memory**，再在片上做树状归约，避免对 Global Memory 的重复读写；收尾由线程 0 将 `shared_data[0]` 写回全局。单 Block 时无 atomicAdd；多 Block 版本见下文。
 
-### 优化 1：Convergent Memory Indexing 解发散
+```cpp
+// 来源：02_Reduction/01_reduce_sum/reduce_sum.cu : L5-L15
+__global__ void simple_reduce_sum(PFloat input, PFloat output) {
+    CInt i = 2 * threadIdx.x;
+    for (int stride = 1; stride <= blockDim.x; stride *= 2) {
+        if (threadIdx.x % stride == 0) {
+            input[i] += input[i + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *output = input[0];
+    }
+}
+```
 
-**解决的瓶颈**：Warp 内部分步长断裂。
-**核心思想**：彻底倒转树形折叠路线。`stride` 从 `blockDim.x` 开始折半倒退至 1。此时所有存活计算的 `threadIdx.x` 会严丝合缝地在 $0 \dots (\frac{N}{2}-1)$ 之间完全连续。
-**预期收益**：未活跃的 Warp 直接被调度器挂起免除执行，存活的 Warp 利用率恢复到 100%。
+```cpp
+// 来源：02_Reduction/01_reduce_sum/reduce_sum.cu : L31-L44
+__global__ void shared_reduce_sum(PFloat input, PFloat output) {
+    __shared__ float shared_data[BLOCK_SIZE];
+    CInt i = threadIdx.x;
+    shared_data[i] = input[i] + input[i + BLOCK_SIZE];
+    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+        __syncthreads();
+        if (threadIdx.x < stride) {
+            shared_data[i] += shared_data[i + stride];
+        }
+    }
+    if (threadIdx.x == 0) {
+        *output = shared_data[0];
+    }
+}
+```
 
-### 优化 2：Thread Coarsening 线程粗化
+### 2. Reduce Optimized：多 Block 与线程粗化
 
-**解决的瓶颈**：极高频次的核间同步锁与低效 Kernel 调度比例。
-**核心思想**：直接把原本指派给 1024 个短命 Block 做的事情，砍给仅有不到原来的四分之一或八分之一的粗粒度 Block 来做（如设定 `COARSE_FACTOR=4`）。每个线程不加掩饰地连续吞下并内部私有化 `sum += input[i]` 多达 8 此，将其直接拦截在最内层无等待寄存器端（提升 ILP）。
-**预期收益**：极大压缩 Block 并发池总量，将 1M 归约全带宽吞没打入 0.0047 ms 内 [实测]。
+当 $N$ 很大（如 1M）时，单 Block 无法覆盖。`segmented_reduce_sum` 将数组按 Block 分段：每个 Block 负责 $2 \times \textit{blockDim.x}$ 个元素，在 Shared Memory 中做树状归约，最后用 **atomicAdd(output, shared_data[0])** 将各 Block 的局部和合并为一个标量。Block 数多时，大量线程在原子变量上排队，成为瓶颈。
 
-### 优化 3：FMA 底层融合与 L2 跨越
+`coarsened_reduce_sum` 引入**线程粗化**：每个线程不再只处理 2 个元素，而是连续处理 $2 \times \textit{COARSE\_FACTOR}$ 个（本实现中 COARSE_FACTOR=4，即每线程 8 个）。在寄存器中先用 `sum` 累加，再写入 `shared_data[tid]`，然后仍用树状归约 + 单次 atomicAdd 收尾。等效 Block 数降为约 $1/(2 \times \textit{COARSE\_FACTOR})$，`__syncthreads()` 与 atomicAdd 调用次数同步减少，带宽利用率显著提升。
 
-**解决的瓶颈**：点积中乘法与加法的双周期分裂损耗。
-**核心思想**：使用 `fmaf(a, b, sum)` 将独立的相乘、相加合二为一，共用一级硬件流水以节省周期并增加舍入精度。外加上，如果我们故意使双阵列容量（$2 \times 4\text{MB} = 8\text{MB}$）控制在极高配置的 72MB RTX 4090 L2 Cache 之内进行热重载，就能打碎物理位阶，触发直对 SM 的爆表读取。
-**预期收益**：测算出破表理论宽度的 1506 GB/s，完全压倒 HBM 发车极限 [实测]。
+`coarsened_reduce_max` 将同一粗化结构用于求最大值，Block 内用 `fmaxf` 归约，收尾用 atomicCAS 实现 float 的「原子取大」（本实现未用 atomicMax 因 CUDA 对 float 无原生支持）。
+
+### 3. Dot Product：乘后归约与 FMA
+
+点积 $\sum_i a_i b_i$ 可视为「先逐元素乘，再归约」。`shared_dot_product` 用多 Block + Shared Memory 树状归约 + atomicAdd，每线程先算若干组 $a[i]*b[i]$ 再写入 shared；`coarsened_dot_product` 同样做线程粗化。`fma_dot_product` 用 `fmaf(a, b, sum)` 将乘加融合为单条 FMA 指令，在多数现代编译器下与 `a*b+sum` 常被优化成同一指令，实测差异可忽略；语义上 FMA 对舍入更可控。
+
+---
+
+## Baseline 与瓶颈分析
+
+### 归约的带宽墙
+
+归约每元素读 1 次（写回 1 个标量可忽略），做 1 次加法。算术强度：
+
+$$I = \frac{1 \text{ FLOP}}{4 \text{ Bytes}} = 0.25 \text{ FLOP/Byte} \quad [\text{理论}]$$
+
+若按「读 N 个 float、写 1 个」粗算为 $N \times 4$ 字节搬运，强度仍远低于 Roofline 拐点 81.9 FLOP/Byte，因此归约是典型的 **Memory Bound** 算子——性能天花板由带宽决定。能否打满 HBM 带宽是衡量归约实现好坏的首要指标。
+
+### 朴素树状归约的 Warp Divergence
+
+`simple_reduce_sum` 中 `stride` 从 1 倍增时，条件 `threadIdx.x % stride == 0` 使同 Warp 内活跃线程**稀疏**。例如 stride=16 时，Warp 0 中只有 tid=0 和 tid=16 执行，其余 30 个线程被掩码阻塞，该 Warp 有效利用率仅 2/32。步长越大，存活线程越少，算力浪费越严重。
+
+### 多 Block 下的 atomicAdd 瓶颈
+
+1M 元素若每 Block 处理 $2 \times 1024$ 个元素，约需 512 个 Block。每个 Block 归约后都要执行一次 `atomicAdd(output, shared_data[0])`，数百个线程串行化地更新同一地址，产生竞争与序列化，成为除带宽外的另一瓶颈。线程粗化通过减少 Block 数量，直接减少 atomicAdd 调用次数，从而缓解该瓶颈。
+
+---
+
+## 优化思路：收敛索引与线程粗化
+
+### 收敛索引（消除 Warp Divergence）
+
+**核心思想**：将树状折叠的**方向**从「stride 从 1 倍增」改为「stride 从 blockDim.x 折半递减」。这样每轮满足 `threadIdx.x < stride` 的线程 tid 落在 $[0, \textit{stride})$，在 Warp 内连续。例如 stride=16 时，只有前 16 个线程工作，且全部落在 Warp 0 的前半部分；stride=8 时前 8 个线程，仍在同一 Warp 内连续。未参与轮次的 Warp 直接退出循环，无分支发散。
+
+### 线程粗化（降低 Block 数与原子竞争）
+
+**核心思想**：让每个线程在**寄存器**内先连续处理多份数据（如 8 个元素），做局部累加，再写入 Shared Memory 的一个槽位，然后照常做 Block 内树状归约 + 一次 atomicAdd。这样：
+
+- 覆盖相同总元素数所需的 Block 数降为原来的约 $1/(2 \times \textit{COARSE\_FACTOR})$；
+- `__syncthreads()` 和 atomicAdd 次数成比例减少；
+- 更多工作留在寄存器，利于隐藏访存延迟、提高 ILP。
+
+**访存与同步量级对比**（1M 元素，BLOCK_SIZE=1024，COARSE_FACTOR=4）：
+
+| 版本 | 每 Block 覆盖元素数 | Block 数 | atomicAdd 次数 |
+|------|---------------------|----------|----------------|
+| Segmented | $2 \times 1024$ | $\lceil 10^6 / (2 \times 1024) \rceil \approx 489$ | 489 |
+| Coarsened | $2 \times 4 \times 1024$ | $\lceil 10^6 / (8 \times 1024) \rceil \approx 123$ | 123 |
+
+Block 数约降为 1/4，原子竞争显著减轻。
+
+---
 
 ## 关键代码解释
 
-### Divergence 修复的几何折转
+### 收敛版 stride 与 Shared Memory 归约
 
 ```cpp
-// 来源：02_Reduction/01_reduce_sum/reduce_sum.cu（convergent_reduce_sum / shared_reduce_sum 的 stride 逻辑）
-    // 【错误模式】simple_reduce_sum：stride 从 1 倍增，if (threadIdx.x % stride == 0) 导致 Warp 内活跃线程不连续
-
-    // 【收敛模式】：stride 从 blockDim.x 减半至 1，活跃线程 tid 始终落在 [0, stride)，即连续无间隙
-    for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
-        __syncthreads();  // shared 版本先同步再读
-        if (threadIdx.x < stride) {
-            shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
-        }
+// 来源：02_Reduction/01_reduce_sum/reduce_sum.cu : L19-L28（convergent 逻辑）
+// stride 从 blockDim.x 减半至 1，活跃线程 tid ∈ [0, stride)，连续无间隙
+for (int stride = blockDim.x; stride >= 1; stride /= 2) {
+    if (threadIdx.x < stride) {
+        input[i] += input[i + stride];
     }
+    __syncthreads();
+}
 ```
 
-**要点解读**：
+```cpp
+// 来源：02_Reduction/01_reduce_sum/reduce_sum.cu : L36-L40（shared 版本）
+for (int stride = blockDim.x / 2; stride >= 1; stride /= 2) {
+    __syncthreads();  // 先同步再读，避免读未就绪数据
+    if (threadIdx.x < stride) {
+        shared_data[i] += shared_data[i + stride];
+    }
+}
+```
 
-- 虽然同为 $\log N$ 次加法，收敛版本在 $stride \le 16$ 即倒数第四轮步长衰减中，由于全集只剩不到 16 个线程在工作，它会全数合并落在唯一的 Warp 0 手中，其余 Warp 早已安全撤退退出轮询池。
+**要点**：Shared Memory 版本在每轮**先** `__syncthreads()` **再**读 shared_data，保证上一轮写完成后再做本轮归约，与 [01](/posts/7608f1b0/) 中 Tiled GEMM 的「加载完毕再计算」一致。
 
-### 线程粗化的 Register 化截留
+### 线程粗化：寄存器内累加再写 Shared
 
 ```cpp
-// 来源：02_Reduction/02_reduce_optimized/reduce_optimized.cu : coarsened_reduce_sum 核心片段
-__global__ void coarsened_reduce_sum(float* input, float* output, int length) {
+// 来源：02_Reduction/02_reduce_optimized/reduce_optimized.cu : L29-L54
+__global__ void coarsened_reduce_sum(PFloat input, PFloat output, CInt length) {
     __shared__ float shared_data[BLOCK_SIZE];
-    int tid = threadIdx.x;
-    int sid = 2 * COARSE_FACTOR * blockDim.x * blockIdx.x + tid;
+    CInt tid = threadIdx.x;
+    CInt sid = 2 * COARSE_FACTOR * blockDim.x * blockIdx.x + tid;
 
     float sum = 0.0f;
     if (sid < length) {
@@ -121,7 +192,7 @@ __global__ void coarsened_reduce_sum(float* input, float* output, int length) {
         }
     }
     shared_data[tid] = sum;
-    // 树状 Shared Memory 归约 + 最后 atomicAdd(output, shared_data[0])
+
     for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
         __syncthreads();
         if (tid < stride) shared_data[tid] += shared_data[tid + stride];
@@ -130,48 +201,85 @@ __global__ void coarsened_reduce_sum(float* input, float* output, int length) {
 }
 ```
 
-**要点解读**：
+**要点**：`sid` 为该线程负责的**首元素**全局下标；每线程连续读 $2 \times \textit{COARSE\_FACTOR}$ 个元素（步长 BLOCK_SIZE），在寄存器 `sum` 中累加后写入 `shared_data[tid]`，再经树状归约与一次 atomicAdd 得到全局和。
 
-- `COARSE_FACTOR * 2`（=8）将每线程负责的元素数拉大到 8 个，先在寄存器 `sum` 中串行累加，再写入 `shared_data[tid]`，Block 数降为约 1/8，`__syncthreads()` 与 `atomicAdd` 调用次数同步减少。收尾仍为 Shared Memory 树状归约 + 单次 `atomicAdd`，本实现未使用 `__shfl_*`。
+### Block / Grid 配置
+
+| 层级 | Segmented | Coarsened (COARSE_FACTOR=4) |
+|------|-----------|-----------------------------|
+| Block | dim3(BLOCK_SIZE)=1024 线程 | 同左 |
+| Grid | $\lceil N / (2 \times \textit{BLOCK\_SIZE}) \rceil$ | $\lceil N / (2 \times \textit{COARSE\_FACTOR} \times \textit{BLOCK\_SIZE}) \rceil$ |
+| 每线程元素数 | 2 | $2 \times 4 = 8$ |
+
+---
 
 ## 结果与边界
 
-### 性能对比
+### Reduce Sum 性能（N = 2048，100 次迭代取平均）
 
-> **测试条件**：RTX 4090 ($sm\_89$) , 参数 `100 迭代求均`
-> **数据来源**：`Results/02_Reduction.md` 原始实机日志
+> 数据来源：`Results/02_Reduction.md` 原始日志
 
-**1. 极小数据集 N=2048 的无力感**
+| 版本 | Kernel 耗时 | vs Simple | 说明 |
+|------|------------|-----------|------|
+| Simple Reduce | 0.0051 ms | 1.00x | stride 倍增，Warp 发散 |
+| Convergent Reduce | 0.0038 ms | 1.36x | 收敛索引，消除发散 |
+| Shared Memory Reduce | 0.0038 ms | 1.36x | 收敛 + 片上缓存 |
 
-| 并行实现手段 | 执行时间 | L1/L2 效应评价 | 数据性质 |
-|--------------|----------|----------------|----------|
-| Naive Simple Reduce | 0.0051 ms | 单纯依赖 Global 抖动 | [实测] |
-| Convergent Reduce | 0.0038 ms | 完美贴合 L1 局部热区 | [实测] |
-| Shared Memory Reduce | **0.0038 ms** | 未拉开与前者的实质差别 | [实测] |
+在 2048 元素（约 8 KB）规模下，Convergent 与 Shared 版本耗时相同。数据量小且访存连续时，L1 Cache 已能吸收大部分 Global Memory 访问，显式使用 Shared Memory 未拉开差距；但收敛索引带来的发散消除仍然有效（相对 Simple 约 1.36x）。
 
-在这个规模仅占据 $8\text{KB}$ 容量的数据上，把数据显性写进 Shared Memory 的动作与由于全连续访存被 128KB L1 Cache 全面隐性截获的 Convergent Global 版速度一模一样。底层硬件的 L1 代打抵消了人力干预。
+### Reduce Optimized 性能（N = 1,048,576，100 次迭代取平均）
 
-**2. 宏观数据集 N=1,048,576 (1M) 粗化降维战**
+> 数据来源：`Results/02_Reduction.md` 原始日志
 
-| 测试环境 | Total Kernel 耗时 | 对比基数 | 带宽折现 | 数据性质 |
-|----------|-------------------|----------|----------|----------|
-| CPU 参考 (14核) | 4.69 ms | 1.00x | - | [实测] |
-| GPU Segmented (多包细切) | 0.0084 ms | 558.33x | 476.19 GB/s | [实测] |
-| **GPU Coarsened (寄存器粗卷)**| **0.0047 ms** | **991.52x** | **887.48 GB/s** | [实测] |
+| 版本 | Kernel 耗时 | vs CPU (4.69 ms) | 有效带宽 | 数据性质 |
+|------|------------|------------------|----------|----------|
+| CPU 参考 | 4.69 ms | 1x | — | [实测] |
+| GPU Segmented | 0.0084 ms | 558x | 476.19 GB/s | [实测] |
+| **GPU Coarsened** | **0.0047 ms** | **992x** | **887.48 GB/s** | [实测] |
 
-当将 `COARSE_FACTOR=4` 外挂至核心体系内，通过在最内核强吃 8 倍元素的方法直接缩除掉了 87.5% 的跨 Block 落锁频次与 Kernel 线程启爆数量！**887.48 GB/s** 的实跑总线已经摸平到 4090 极值带宽的 88%。对于 `FLOP/Byte=0.125` 的无计算量操作，这已是该卡在此问题物理尺寸上的顶峰。
+Coarsened 将有效带宽推到 **887.48 GB/s**，约为 RTX 4090 HBM 理论峰值 1008 GB/s 的 **88%** [实测/理论]。对算术强度约 0.25 FLOP/Byte 的归约，已接近该问题在带宽上的物理极限。
 
-### 边界条件与局限
+```mermaid
+xychart-beta
+  title "归约 Kernel 耗时 (ms, N=1M)"
+  x-axis ["CPU", "Segmented GPU", "Coarsened GPU"]
+  y-axis "耗时 (ms)" 0 --> 5
+  bar [4.69, 0.0084, 0.0047]
+```
 
-- **L2 穿障极限 (The Fake 1506 GB/s)**：在进行 Dot Product 实验中测出的 `0.0056 ms` -> `1506.49 GB/s` 总量，远超 4090 总线极值。这种现象只会出没于测试体量（8 MB）完全坍缩于其标定超大的 72MB L2 范畴内。当 N 飙升至千万击穿 L2 Threshold 后，所有的魔法都会打回原形回落。
-- 系数不能无脑拉大：`COARSE_FACTOR` 若激增至 32 以上，将发生灾难性的 Register Spilling 溢出至 Local Memory 反噬耗时。
+### Dot Product 与「超带宽」现象（N = 1M，两向量 8 MB）
+
+> 数据来源：`Results/02_Reduction.md` 原始日志
+
+| 版本 | Kernel 耗时 | 有效带宽 | 说明 |
+|------|------------|----------|------|
+| Simple | 0.0092 ms | — | 基准 |
+| Coarsened | 0.0056 ms | ~1506 GB/s | 粗化 + 读两向量 |
+| FMA | 0.0056 ms | ~1506 GB/s | 与 Coarsened 同量级 |
+
+**边界说明**：8 MB 数据落在 RTX 4090 的 72 MB L2 Cache 内，热数据被 L2 反复命中，实测带宽可**超过** HBM 理论峰值 1008 GB/s（如 1506 GB/s）。这是 L2 参与读带宽的必然结果，并非违反物理极限；当问题规模超出 L2 容量后，带宽会回落至 HBM 量级。
+
+### COARSE_FACTOR 不宜过大
+
+将 COARSE_FACTOR 提到 32 以上时，每线程寄存器占用增加，可能触发 **Register Spilling**，溢出到 Local Memory（实为全局内存），反而增加延迟、降低带宽。通常 4～8 在带宽与占用之间较均衡。
+
+---
 
 ## 常见误区
 
-1. **误区**：在当前高架构（如 sm_89）下，纯 CPU 代码加上 `-O3 -mavx2` 就可以轻松与微小型 GPU Kernel 抗衡。
-   **实际**：在所有我们构建出的测试用例中，哪怕是只处理极细的一兆数组，只要你动用了粗化将吞地拉展，GPU 依然能爆出超越主流高核心桌搭级 CPU 千倍 (991+倍) 的绝对降维制裁表现 [实测]。
-2. **误区**：代码里强制用 `fmaf(a, b, c)` 一定比 `a*b + c` 跑得更带感。
-   **实际**：在最高优化的 NVCC 管道中毫无分别 [实测 0.0056ms对锁 0.0056ms]。当代现代编译器面对简单线性多项式，早就自行替程序员做出了 FMA 底层硬路由融合，它更多是规避特殊舍入的修饰语。
+1. **误区**：在小数据（如 N=2048）上，Shared Memory 版归约一定比 Convergent 版快很多。
+   **实际**：当数据能完全被 L1 缓存吸收时，Convergent 直接读 Global Memory 与 Shared 版读片上内存的延迟差异被抹平，二者耗时可能相同 [实测]。Shared Memory 的价值在大规模、多 Block 与复杂归约中更明显。
+
+2. **误区**：线程粗化会降低并行度，所以一定变慢。
+   **实际**：粗化减少的是 Block 数量和 atomicAdd/__syncthreads 次数，在归约这类 Memory Bound 且原子竞争明显的场景中，减少同步与原子冲突带来的收益通常大于「略少 Block」的损失，实测 Coarsened 相对 Segmented 约 1.77x [实测]。
+
+3. **误区**：点积测出 1506 GB/s 说明突破了 GPU 硬件极限。
+   **实际**：8 MB 数据远小于 72 MB L2，大量读来自 L2 而非 HBM。L2 带宽高于 HBM，因此「有效带宽」可超过 1008 GB/s；规模超出 L2 后，带宽会回落到 HBM 量级。
+
+4. **误区**：手写 `fmaf(a, b, sum)` 一定比 `a*b + sum` 更快。
+   **实际**：现代 NVCC 对简单乘加常自动生成 FMA，二者耗时多为同一量级 [实测 0.0056 ms 对 0.0056 ms]。FMA 的主要价值是舍入语义更可控，而非在当代编译器下再赚一轮加速。
+
+---
 
 ## 系列导航
 

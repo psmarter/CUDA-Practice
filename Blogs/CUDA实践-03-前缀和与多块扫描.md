@@ -1,5 +1,5 @@
 ---
-title: CUDA-Practice：03 并行前缀和算法路线选择与端到端扩展
+title: CUDA-Practice：03 从前缀和到多块扫描——Kogge-Stone 与三遍扫描
 tags:
   - CUDA
   - GPU编程
@@ -20,10 +20,10 @@ date: 2026-03-12 13:30:00
 
 读完本文，你将能够：
 
-- 厘清 Inclusive 与 Exclusive Scan 的数学区别与工程平移关系
-- 掌握以高工作量换取极低并发深度的 Kogge-Stone 算法模型（SIMT 最适配打法）
-- 分析 Brent-Kung 算法树形完美但在 GPU 发散性与长屏障中的水土不服
-- 通过三遍扫描（3-Pass Scan）构架完成百万级别元素的宏观跨 Block 制霸
+- 理解前缀和（Inclusive Scan）与归约的差异：前者需保留每一步中间结果，是 Radix Sort、流压缩等的基础
+- 用 Span（并行深度）与 Work（总操作量）解释为何 Kogge-Stone 在 GPU 上优于理论 Work 更少的 Brent-Kung
+- 理解 Block 内 Kogge-Stone 的「读-改-写」在同一块 Shared Memory 上时，为何需要双 `__syncthreads()` 防 RAW 冒险
+- 实现多 Block 下的三遍扫描（块内 KS → 对 block_sums 再 Scan → add_block_sums），完成百万级元素的全局前缀和
 
 ## 对应代码路径
 
@@ -32,137 +32,272 @@ date: 2026-03-12 13:30:00
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `03_Scan/01_prefix_sum/prefix_sum.cu` | `kogge_stone_scan`<br>`brent_kung_scan` | 单 Block KS（$\log N$ 步）/ BK（两阶段树），Shared Memory 双缓冲防 RAW | `N=1024` |
-| `03_Scan/02_segmented_scan/segmented_scan.cu` | `coarse_scan`<br>`segmented_scan`<br>`add_block_sums` | 单 Block 粗化 + 段末 KS（N≤4096）；多 Block 3-Pass（Pass1 块内 KS+block_sums，Pass2 对 block_sums Scan，Pass3 add_block_sums） | `N=4096`<br>`N=1048576` |
+| `03_Scan/01_prefix_sum/prefix_sum.cu` | `kogge_stone_scan`<br>`brent_kung_scan` | 单 Block KS（$\log N$ 步）/ BK（两阶段树），Shared Memory 双缓冲防 RAW | N = 1024 |
+| `03_Scan/02_segmented_scan/segmented_scan.cu` | `coarse_scan`<br>`segmented_scan`<br>`add_block_sums` | 单 Block 粗化 + 段末 KS（N≤4096）；多 Block 3-Pass（块内 KS + block_sums，再 Scan block_sums，再加回） | N = 4096<br>N = 1,048,576 (1M) |
 
-> Kernel 名称与源码中 `__global__` 函数签名完全一致。
+> 本篇多 Block 扩展按「块末写 block_sums → 对 block_sums 做一次 Scan → 每块加前一块基值」实现，未使用 Decoupled Look-back 等更复杂结构；Warp 内无 Shared Memory 的 Scan 见 [06 线程束原语与寄存器通信](/posts/fec051fc/)。
 
-> **本篇在系列中的位置**：承接 [02 归约与线程粗化](/posts/44fe4eb3/) 的树形折叠与 Shared Memory 同步，本篇在同一层级做**需保留每一步中间结果**的前缀和（Scan），并推广到多 Block（3-Pass）。后续 [06 线程束原语与寄存器通信](/posts/fec051fc/) 可用 `__shfl_up_sync` 等做 Warp 内无 Shared Memory 的 Scan；[12 标准库与工程实践](/posts/a1e20e80/) 的 Thrust 提供工业级 `inclusive_scan` 可对比本实现。
+> **本篇在系列中的位置**：承接 [02 归约与线程粗化](/posts/44fe4eb3/) 的树形折叠与 Shared Memory 同步，本篇在同一层级做**需保留每一步中间结果**的前缀和（Scan），并推广到多 Block（3-Pass）。后续 [06 线程束原语与寄存器通信](/posts/fec051fc/) 可用 `__shfl_up_sync` 等做 Warp 内 Scan；[12 标准库与工程实践](/posts/a1e20e80/) 的 Thrust 提供工业级 `inclusive_scan` 可对比本实现。
 
-## Baseline
+---
 
-**问题陈述**：前缀和要求每个第 $i$ 个结果必须强捆绑于第 $0 \dots i-1$ 个过程计算底量，无法通过随意顺序叠加。如果说归约由于无需记录过程轨迹相对自由，前缀和就是对整个张量内存位移图谱极其吃紧的重构操作。它作为后续 Radix Sort 的先行地基。
+## 三个实现分别做了什么
 
-| Baseline 类别 | 测试场景 | 指标 | 值 | 数据来源 |
-|---------------|----------|------|----|----------|
-| CPU 参考推演时长 (单核) | `N=1024` (4KB) | 极限速推时 | 0.00 ms | [实测] Results/03_Scan.md |
-| CPU 参考推演时长 (14核)| `N=1M` (4.00 MB) | 极化耗时 | 1.79 ms | [实测] Results/03_Scan.md |
-| GPU Brent-Kung 推演   | `N=1024` | 单核耗时 | 0.0037 ms | [实测] Results/03_Scan.md |
-| GPU Segmented         | `N=1M` | 极大跨块耗时 | 0.0221 ms | [实测] Results/03_Scan.md |
+### 1. 单 Block 前缀和：Kogge-Stone 与 Brent-Kung
 
-## 瓶颈分析
+**问题**：给定数组 $x[0 \dots n-1]$，计算 Inclusive 前缀和 $y[i] = \sum_{j=0}^{i} x[j]$。与归约不同，每个 $y[i]$ 都依赖前序结果，必须保留中间状态。
 
-试图将并行前缀和暴力化，会面临两个难以调和的工程与架构天堑：
+`kogge_stone_scan` 在 Shared Memory 上做**步长倍增**的扫描：`stride` 从 1 开始每次乘 2，每轮中满足 `tid >= stride` 的线程执行 `val = shared_data[tid] + shared_data[tid - stride]`，先写入局部变量 `val`，经 `__syncthreads()` 后再写回 `shared_data[tid]`。总轮数为 $\lceil \log_2 N \rceil$，**每轮内参与计算的线程连续**（tid ≥ stride），无 Warp 内分支断裂；代价是总加法次数为 $O(N \log N)$（Work 大），但 **Span 仅 $\log N$ 步**，同步次数少、流水饱满。
 
-1. **跨级深度等待税 (Span 瓶颈)**
-   - 并行计算必须兼顾两项标尺：总操作量 (Work) 与并行总深度 (Span)。部分算法像 Brent-Kung 虽然省下了 $\mathcal{O}(n \log n)$ 退致 $\mathcal{O}(n)$ 的工作总量计算器，但是因为要向上爬树归纳再向下遍历分发，Span（跨度）暴拉至接近 $2 \cdot \log N$ 步。这对每一次都要等待全员 `__syncthreads()` 卡死落地的 GPU 并发流水而言是极其拖沓的等待税收。
-2. **多 Block 全局同步断崖 (Scalability 瓶颈)**
-   - GPU 的 Shared Memory 不能超界同步邻接的 SM Block。在 $N=1,048,576$ 时，1024 个 Block 中，Block $n$ 不先拿到 Block $n-1$ 所有元素的累计极大值时，它是坚决无法正确给自家队伍所有下挂元素加上底层偏移量的，这引发了全域执行壁垒。
+`brent_kung_scan` 采用两阶段树：先「上 sweep」再「下 sweep」，总加法次数为 $O(N)$（Work 小），但每轮中只有部分下标参与（如 `index = (tid+1)*stride*2 - 1`），**Warp 内大量线程空闲**，且总步数约 $2 \log N$，`__syncthreads()` 次数约为 KS 的两倍。在 GPU 上实测 KS 更快 [实测]。
 
-## 优化思路
+```cpp
+// 来源：03_Scan/01_prefix_sum/prefix_sum.cu : L4-L36
+__global__ void kogge_stone_scan(PFloat input, PFloat output, CInt n) {
+    extern __shared__ float shared_data[];
+    CInt tid = threadIdx.x;
 
-### 优化 1：Kogge-Stone 算法拥抱 SIMT (力砖飞降维)
+    if (tid < n) shared_data[tid] = input[tid];
+    else         shared_data[tid] = 0.0f;
 
-**解决的瓶颈**：强求低操作总量但拖垮极长并发长度的等待延时。
-**核心思想**：彻底放弃算法学家崇尚的 $\mathcal{O}(N)$ “优美”体态，直接将工作量激化至 $\mathcal{O}(N \log N)$ 的 Kogge-Stone（KS）。它的直觉只聚焦于：**如何把 Span（深度）强行压到只有最扁平的 $\log_2 N$ 步**。在每一次循环，所有不越界的线程一律去把相对步长更远的元素抓过来加到自己身上。
-**预期收益**：保证每一步没有任何空闲线程发呆，以 24% 的压倒性速度打赢了理论更优但严重 Divergence 停摆的 Brent-Kung [实测]。
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        __syncthreads();
+        float val = 0.0f;
+        if (tid >= stride) {
+            val = shared_data[tid] + shared_data[tid - stride];
+        }
+        __syncthreads();
 
-### 优化 2：三遍扫描结构打破 Block 孤岛 (Multi-Block Scan)
+        if (tid >= stride) {
+            shared_data[tid] = val;
+        }
+    }
 
-**解决的瓶颈**：上百万序列跨网段阻拦的全局前置偏置传导。
-**核心思想**：建立解耦的三部曲 (3-Pass Scan)：
-1. 派发所有 Block 内自己做自己的闭合 KS Scan。在最后退出时，把末尾最大的一块（即本组累计权和）单独投射写死到一个外挂备用小数组 `block_sums` 中去；
-2. 拉起一个全新的挂载 Kernel，**只针对这个极小的外挂 `block_sums` 自己单独进行一次宏观扫卷**；
-3. **退回原始 Block 端**：第三次启动全域 Kernel，所有的局域 Block 直接拿对应小黑板上的第 `bid - 1` 号刻度基准，直接灌入自身的每一个元素底线中。
-**预期收益**：在 $N=1M$ 的大型突击战中稳定拿到 0.0221 毫秒的高阶耗时且保证了强一致性，比 CPU 狂增 **80.69x 加速比** [实测]。
+    if (tid < n) output[tid] = shared_data[tid];
+}
+```
+
+### 2. 单 Block 粗化扫描：coarse_scan（小规模）
+
+当 $N \le \textit{BLOCK\_SIZE} \times \textit{COARSE\_FACTOR}$（如 1024×4=4096）时，可用单 Block 完成。`coarse_scan` 让每线程负责 COARSE_FACTOR 个元素：先加载到 Shared Memory，在段内做**顺序**前缀和（每段独立），再收集每段末元素到 `section_sums`，对 `section_sums` 做一次 Kogge-Stone 得到「段前缀和」，最后把前一段的基值加回本段并写回 `output`。这样避免多 Block 与 3-Pass 的多次 Kernel 与全局访存，在 N=4096 时实测比同规模 3-Pass 略快（约 0.0047 ms vs 0.0059 ms [实测]）。
+
+### 3. 多 Block 三遍扫描：segmented_scan + add_block_sums
+
+当 $N$ 很大（如 1M）时，单 Block 无法覆盖。本实现采用**三遍扫描**：
+
+- **Pass 1**：`segmented_scan` 每个 Block 对自身 $[\textit{gid}, \textit{gid}+\textit{blockDim.x})$ 做 Kogge-Stone，结果写回 `output`，并将该 Block 最后一个元素（块和）写入 `block_sums[blockIdx.x]`。
+- **Pass 2**：对长度为「Block 数」的 `block_sums` 再执行一次前缀和（单 Block 或递归），得到 `scanned_block_sums`，即「前若干块的累加和」。
+- **Pass 3**：`add_block_sums` 每个 Block 将 `scanned_block_sums[blockIdx.x - 1]`（前一块的基值）加到自己负责的每个 `output[gid]` 上；Block 0 无前驱，不读 `block_sums[-1]`，需在代码中避免越界。
+
+这样 Block 间无需全局同步，仅通过中间数组在 HBM 上传递块和与扫描后的块和，即可得到全局前缀和。
+
+```cpp
+// 来源：03_Scan/02_segmented_scan/segmented_scan.cu : L66-L102
+__global__ void segmented_scan(CPFloat input, PFloat output, PFloat block_sums, CInt n) {
+    extern __shared__ float shared_data[];
+    CInt tid = threadIdx.x;
+    CInt gid = blockIdx.x * blockDim.x + tid;
+
+    if (gid < n) shared_data[tid] = input[gid];
+    else         shared_data[tid] = 0.0f;
+    __syncthreads();
+
+    for (int stride = 1; stride < blockDim.x; stride *= 2) {
+        float val = 0.0f;
+        if (tid >= stride) val = shared_data[tid] + shared_data[tid - stride];
+        __syncthreads();
+        if (tid >= stride) shared_data[tid] = val;
+        __syncthreads();
+    }
+
+    if (gid < n) output[gid] = shared_data[tid];
+    if (tid == blockDim.x - 1 && block_sums != nullptr)
+        block_sums[blockIdx.x] = shared_data[tid];
+}
+```
+
+```cpp
+// 来源：03_Scan/02_segmented_scan/segmented_scan.cu : L105-L111
+__global__ void add_block_sums(PFloat output, CPFloat scanned_block_sums, CInt n) {
+    CInt gid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (blockIdx.x > 0 && gid < n) {
+        output[gid] += scanned_block_sums[blockIdx.x - 1];
+    }
+}
+```
+
+---
+
+## Baseline 与瓶颈分析
+
+### 前缀和与归约的差异
+
+归约只需一个标量结果，树状折叠时中间节点可覆盖写；前缀和要求每个位置 $i$ 的输出依赖 $[0, i]$ 的完整历史，不能随意覆盖。因此前缀和既是 **Memory Bound**（读写出入与归约同量级），又对**数据依赖与写顺序**更敏感，多 Block 下必须显式传递「前块累加和」才能得到全局一致结果。
+
+### 单 Block：Span 与 Warp 利用率
+
+并行算法常用 **Work**（总操作数）和 **Span**（关键路径长度）衡量。Brent-Kung 的 Work 为 $O(N)$，优于 Kogge-Stone 的 $O(N \log N)$，但：
+
+- BK 每轮只有部分下标参与（如奇数位、再隔位等），同 Warp 内大量线程空闲，**Warp Divergence** 严重；
+- BK 需两阶段（上爬树、下分发），**Span 约 $2 \log N$**，`__syncthreads()` 次数约为 KS 的两倍。
+
+在 GPU 上，每轮同步后全体线程要齐步前进，Span 和每轮利用率比总 Work 更影响耗时。实测 N=1024 时 KS **0.0028 ms**、BK **0.0037 ms**，KS 约快 32%（或说 BK 慢约 24%）[实测]。
+
+### 多 Block：无全局同步下的信息传递
+
+GPU 的 Block 之间没有 `__syncthreads()` 级别的同步。若把 1M 元素分给 1024 个 Block，每个 Block 只能看到自己的数据；要得到全局前缀和，必须知道「前面所有块的累加和」作为本块基值。因此需要**中间数组**：各块先把块和写出，再对块和做一次前缀和，最后把「前块累加和」加回本块。这带来额外的 **HBM 读写**（block_sums 的写出与读入），是 Scan 难以像纯归约那样逼近 900+ GB/s 的重要原因之一。
+
+---
+
+## 优化思路：Kogge-Stone 与三遍扫描
+
+### 单 Block 选 Kogge-Stone 的原因
+
+- **Span 最小**：仅 $\log N$ 步，每步一次 `__syncthreads()`，总同步次数少。
+- **每步满负载**：`tid >= stride` 的线程连续，无 Warp 内断裂，利用率高。
+- **双屏障防 RAW**：读 `shared_data[tid]` 与 `shared_data[tid - stride]` 后先存到 `val`，同步后再写回 `shared_data[tid]`；若省去中间同步，快线程可能提前写回，慢线程尚未读完旧值，产生读后写（RAW）冒险。
+
+### 三遍扫描的结构
+
+| Pass | Kernel | 作用 |
+|------|--------|------|
+| 1 | `segmented_scan` | 每 Block 内 KS，写 `output` 与 `block_sums[blockIdx.x]` |
+| 2 | `segmented_scan`（对 block_sums） | 对块和数组做前缀和 → `scanned_block_sums` |
+| 3 | `add_block_sums` | `output[gid] += scanned_block_sums[blockIdx.x - 1]`（Block 0 不加） |
+
+Block 0 在 Pass 3 中不读取 `scanned_block_sums[-1]`，因此 `blockIdx.x > 0` 的判断与 `blockIdx.x - 1` 的下标必须正确，否则会越界或结果错位。
+
+---
 
 ## 关键代码解释
 
-### Kogge-Stone 必须双锁护体
+### Kogge-Stone 的双 `__syncthreads()` 防 RAW
 
 ```cpp
-// 来源：03_Scan/01_prefix_sum/prefix_sum.cu : L15-L26局部片选简写
-    for (int stride = 1; stride < blockDim.x; stride *= 2) {
-        
-        __syncthreads(); // 【护城河 1】确保刚刚大伙全写完了
-        
-        float val = 0.0f;
-        if (tid >= stride) {
-            // 所有人都去极具贪婪地抓取远方数据并缓存进局部变量
-            val = shared_data[tid] + shared_data[tid - stride];
-        }
-        
-        __syncthreads(); // 【护城河 2】确保大家全都【读取保存】完毕了再动手
-        
-        if (tid >= stride) {
-            shared_data[tid] = val; // 原地下死手覆盖
-        }
+// 来源：03_Scan/01_prefix_sum/prefix_sum.cu : L21-L32
+for (int stride = 1; stride < blockDim.x; stride *= 2) {
+    __syncthreads();   // 屏障 1：确保上一轮写回已全部完成
+    float val = 0.0f;
+    if (tid >= stride) {
+        val = shared_data[tid] + shared_data[tid - stride];
     }
+    __syncthreads();   // 屏障 2：确保本轮读已完成，再允许写回
+
+    if (tid >= stride) {
+        shared_data[tid] = val;
+    }
+}
 ```
 
-**要点解读**：
+- **屏障 1**：上一轮可能有线程刚把 `shared_data[tid]` 写回，必须等所有人写完，再开始本轮的「读」。
+- **屏障 2**：本轮的读都进了各自的 `val`，再允许写回 `shared_data[tid]`；否则先写完的线程会覆盖尚未被读的旧值，造成 RAW 冒险。
 
-- KS 的致命微操在于：整个读取与修改全部砸在同一片物理 Shared Memory 里。因为步数被砍得极低极暴力，各个线程交战区重叠面积极其庞大。假如拔掉中间的 `__syncthreads()`，右方速度爆表的线程会瞬间把刚刚的最新和写回覆盖在左边那帮还甚至没来得及作为基础读取的原本数上 ($RAW \ Hazard$)。双护城河锁与局部私自缓存变量 `val` 是隔离时空冲突的不二之法。
+与 [01](/posts/7608f1b0/) Tiled GEMM 的「加载完再算、算完再加载下一 tile」同理：读写在同一块 Shared Memory 上重叠时，必须用同步划分阶段。
 
-### 单 Block 粗化扫描 (coarse_scan) 与 3-Pass 分工
+### coarse_scan：段内顺序 + 段末 KS
 
 ```cpp
-// 来源：03_Scan/02_segmented_scan/segmented_scan.cu : coarse_scan 核心思路（N≤4096 单 Block）
-// shared_data[0..n-1] 存数据，section_sums 紧接其后存每段末尾值
-    for (int i = 0; i < COARSE_FACTOR; ++i) {
-        int index = tid * COARSE_FACTOR + i;
-        if (index < n) shared_data[index] = input[index];
-    }
-    __syncthreads();
-    // 段内顺序前缀和
-    for (int i = 1; i < COARSE_FACTOR; ++i) {
-        int index = tid * COARSE_FACTOR + i;
-        if (index < n) shared_data[index] += shared_data[index - 1];
-    }
-    __syncthreads();
-    // 收集每段末尾 → section_sums，再对 section_sums 做 KS，最后把 section_sums[section_id-1] 加回并写 output
+// 来源：03_Scan/02_segmented_scan/segmented_scan.cu : L10-L62（结构摘要）
+// 加载
+for (int i = 0; i < COARSE_FACTOR; ++i) {
+    CInt index = tid * COARSE_FACTOR + i;
+    if (index < n) shared_data[index] = input[index];
+}
+__syncthreads();
+// 段内顺序前缀和
+for (int i = 1; i < COARSE_FACTOR; ++i) {
+    CInt index = tid * COARSE_FACTOR + i;
+    if (index < n) shared_data[index] += shared_data[index - 1];
+}
+__syncthreads();
+// 收集段末 → section_sums，对 section_sums 做 KS，再分发 section_sums[section_id-1] 加回并写 output
 ```
 
-**要点解读**：
+每线程负责一段连续元素，段内串行做前缀和（无跨段依赖），再对「段末值」做一次 KS 得到段级前缀和，最后把前段基值加回并写回全局 `output`。
 
-- 当 N=4096 时，单 Block 用 `coarse_scan`：每线程负责 COARSE_FACTOR 个元素，先段内顺序前缀和，再对「段末值」做一次 KS 得到段前缀和，最后加回。避免 3-Pass 的多次 Kernel 与 HBM 往返，实测比同规模下 3-Pass 的 Segmented Scan 略快（约 0.0047 ms vs 0.0059 ms [实测]）。大规模 N=1M 必须用 3-Pass（`segmented_scan` + 对 block_sums 再 Scan + `add_block_sums`）。
+### Block / Grid 配置
+
+| 场景 | Block | Grid | 说明 |
+|------|-------|------|------|
+| prefix_sum (N=1024) | 1024 | 1 | 单 Block，KS/BK |
+| coarse_scan (N≤4096) | 1024 | 1 | 单 Block，粗化 + 段末 KS |
+| segmented_scan (N=1M) | 1024 | $\lceil N / 1024 \rceil$ = 1024 | 多 Block，3-Pass |
+
+---
 
 ## 结果与边界
 
-### 性能对比
+### 单 Block 算法对比（N = 1024，100 次迭代取平均）
 
-> **测试条件**：RTX 4090 ($sm\_89$) , 参数 `100 迭代求均`
-> **数据来源**：`Results/03_Scan.md` 原始实机日志
+> 数据来源：`Results/03_Scan.md` 原始日志
 
-**1. 单 Block 内算法硬派决选 (N=1024)**
+| 版本 | Kernel 耗时 | vs Kogge-Stone | 数据性质 |
+|------|------------|----------------|----------|
+| **Kogge-Stone** | **0.0028 ms** | 1.00x | [实测] |
+| Brent-Kung | 0.0037 ms | 0.76x（即慢约 32%） | [实测] |
 
-| 算法模型 | 步长 (Span)| 操作量 (Work) | 测算有效实机时 | 数据性质 |
-|----------|------------|---------------|----------------|----------|
-| Kogge-Stone | 10 步 | $\approx 10240$ 次加 | **0.0028 ms** | [实测] |
-| Brent-Kung  | $\approx 20$ 步 | $\approx 2048$ 次加 | 0.0037 ms (慢 24%) | [实测] |
+Kogge-Stone 以更少的同步步数与更饱满的 Warp 利用率，在单 Block 内领先 Brent-Kung约 32% [实测]。
 
-这反映了一条铁血定局：在拥有成百上千并行引擎的底层怪兽里，你为它少省了极其鸡肋的八千次计算，却为它惹来了接近**翻倍的执行管线同步时断屏障还有前中期极度残破不全的待命分支 (Warp Divergence)**。GPU 只在乎流水压没压满，Kogge-Stone 虽然工作量极其重口，但它能逼迫所有的管线以一往无前的连贯态一直突进致底。
+### 小规模 Coarse vs Segmented（N = 4096）
 
-**2. 宏观跨网段大规模攻城战 (N=1,048,576 元素)**
+> 数据来源：`Results/03_Scan.md` 原始日志
 
-| 测试环境 | Total Kernel 耗时 | 对比基数 | 带宽折现 | 数据性质 |
-|----------|-------------------|----------|----------|----------|
-| CPU 参考推演 (14核) | 1.79 ms | 1.00x | - | [实测] |
-| **GPU Segmented (3-Pass)**| **0.0221 ms** | **狂飙 80.69x 加速** | **378.77 GB/s** | [实测] |
+| 版本 | Kernel 耗时 | 说明 |
+|------|------------|------|
+| Coarse Scan | 0.0047 ms | 单 Block 粗化 + 段末 KS |
+| Segmented Scan (3-Pass) | 0.0059 ms | 多 Block 三遍扫描 |
 
-这个 `378 GB/s` 的成绩在 4090 身上的显现是耐人回味的：为何相较于 Reduce 操作可以轻松爆掉 900+ 带宽的事态，Scan 甚至碰触不到四成峰值力道？
-原因便是无可脱逃的 `3-Pass` 物理落地律！在这条底线上，算量翻到了 1M，底层强迫要求内核跨 Kernel 切出、必须将这部分流在 HBM 之中深埋硬写，随即再一次启动主进程将这些补偿池逐位提出相注入。**强制全局落盘与提取往复，是前缀和算法注定无法如黑洞般爆吸带宽的核心命门**。但也仅靠此举我们平摊消耗，相对于 $256 \times 4096$ 的规模扩大倍率，其实际时间成本只微涨了 **3.78x**。
+N=4096 时单 Block 可容纳，Coarse 无需写 block_sums 到全局再读回，因此略快于 3-Pass（约 1.23x）[实测]。
 
-### 边界条件与局限
+### 大规模三遍扫描（N = 1,048,576，100 次迭代取平均）
 
-- **强制写回惩罚**：在处理全局大任务时，只要牵扯到了三核扫描拆档打法，哪怕算法再极致，也必须要付那笔中间数据打底到 HBM 的巨额路费，并且还会严重消耗缓存。未来如果要规避掉，唯有通过类似于 `CUB` 这种采用的“解耦预读重写”(Decoupled Look-back) 架构强行去抹灭跨步掉那一次隔离内核层。
+> 数据来源：`Results/03_Scan.md` 原始日志
+
+| 版本 | Kernel 耗时 | vs CPU (1.79 ms) | 有效带宽 | 数据性质 |
+|------|------------|------------------|----------|----------|
+| CPU 参考 | 1.79 ms | 1x | — | [实测] |
+| **GPU Segmented (3-Pass)** | **0.0221 ms** | **80.69x** | **378.77 GB/s** | [实测] |
+
+数据量从 4096 增至 1M（256x），Kernel 时间从 0.0059 ms 增至 0.0221 ms（约 3.78x）[实测]，扩展性良好。378.77 GB/s 约为 RTX 4090 理论峰值 1008 GB/s 的 **37.6%** [实测/理论]。
+
+```mermaid
+xychart-beta
+  title "前缀和 Kernel 耗时 (ms)"
+  x-axis ["CPU N=1M", "GPU 3-Pass N=1M"]
+  y-axis "耗时 (ms)" 0 --> 2
+  bar [1.79, 0.0221]
+```
+
+### 为何 Scan 带宽低于归约
+
+归约（[02](/posts/44fe4eb3/)）在 1M 规模下可达约 887 GB/s；前缀和 3-Pass 约 378 GB/s。主要原因：
+
+- **多遍全局读写**：Pass 1 写出 block_sums，Pass 2 读 block_sums 再写 scanned_block_sums，Pass 3 再读 scanned_block_sums 并写 output。中间数据落盘 HBM，额外往返拉低有效带宽。
+- **依赖链**：前缀和每位置依赖前序，无法像归约那样在寄存器里粗化到「每线程多元素累加再一次性写 shared」就能大幅减少 Block 数；块间必须串行传递基值。
+
+若要进一步逼近带宽，需更复杂设计（如 CUB 的 Decoupled Look-back 等），或接受 3-Pass 的简洁性与可维护性换取略低带宽。
+
+### Inclusive 与 Exclusive 的转换
+
+本实现为 **Inclusive Scan**：$y[i] = \sum_{j=0}^{i} x[j]$。若需 **Exclusive Scan**（$y[0]=0$，$y[i] = \sum_{j=0}^{i-1} x[j]$），可在输入时整体右移（例如存 $x[i-1]$）或输出后做一次平移（$y[i] \leftarrow y[i-1]$，$y[0]=0$）。多数库只实现 Inclusive，再通过上述方式得到 Exclusive。
+
+---
 
 ## 常见误区
 
-1. **误区**：以为 Inclusive 和 Exclusive 是两套体系代码模型。
-   **实际**：绝大多数标准库和底层算法全都一门心思写 Inclusive 版本就够了。想转 Exclusive 怎么办？额外起一个极其轻薄的平移核 `y[i] = y[i-1]` 第一项推给个零就行了！
-2. **误区**：在写 `3-Pass` 的内核扫描第三步的时候只需要随便扔给所有的 Block 去提取全局底分。
-   **实际**：在第 3 步做加注时，`Block x` 要读取并吃下的永远是前一步里存进 `index: x - 1` 的外挂 `sum` 基线底面（前继包袱量）。并且在 `tid=0` 的老祖宗节点那层，由于自身前面没有任何包袱基站，**绝不能去抽取 -1 的死线越界数据**。这种边角边界处理如果崩掉一点就会牵连数百兆段数据错位。
+1. **误区**：Brent-Kung 的 Work 是 $O(N)$，在 GPU 上一定比 $O(N \log N)$ 的 Kogge-Stone 快。
+   **实际**：GPU 更受 Span 与每轮 Warp 利用率影响。BK 每轮参与线程稀疏、同步步数约两倍，实测 N=1024 时 KS 比 BK 快约 32% [实测]。在 SIMT 上「少做一点算术但多等几轮、且每轮很多人闲着」往往不如「多算一点、每轮满负载、同步少」。
+
+2. **误区**：3-Pass 的第三步可以随便用 blockIdx 去取「前一块」的基值。
+   **实际**：Block $b$ 必须加的是 **前一块的扫描结果**，即 `scanned_block_sums[b - 1]`（前 $b$ 块元素之和）。且 Block 0 没有前驱，必须判断 `blockIdx.x > 0` 再访问 `scanned_block_sums[blockIdx.x - 1]`，否则会越界或逻辑错误。
+
+3. **误区**：Inclusive 和 Exclusive 是两套完全不同的实现。
+   **实际**：通常只实现 Inclusive；Exclusive 可通过输入/输出平移或一次轻量 Kernel（如 $y[i]=y[i-1]$、$y[0]=0$）得到。
+
+4. **误区**：前缀和和归约一样，只要写好单 Block 就能自然扩展到任意大 N。
+   **实际**：多 Block 下各块之间无同步，必须通过「块和 → 对块和做 Scan → 加回」这类 3-Pass 或等价结构把前块累加和传下去；否则每块只能得到块内前缀和，不是全局前缀和。
+
+---
 
 ## 系列导航
 

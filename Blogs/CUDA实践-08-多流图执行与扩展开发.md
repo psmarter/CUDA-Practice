@@ -1,5 +1,5 @@
 ---
-title: CUDA-Practice：08 多流并发、CUDA Graphs 与 PyTorch 扩展解析
+title: CUDA-Practice：08 多流、图执行与扩展开发——掩盖传输与发射开销
 tags:
   - CUDA
   - GPU编程
@@ -20,10 +20,10 @@ date: 2026-03-12 14:30:00
 
 读完本文，你将能够：
 
-- 透彻解析 PCIe 与 Compute Engine 无法全开打满重叠的物理深洞
-- 使用 CUDA 多流并发 (Multi-Stream) 重建覆盖传输流
-- 理解并消除极小规模细微算子带来的数微秒级 CPU Launch Bound 单点制约（CUDA Graphs 护盾）
-- 完全移除高位层 Python/PyTorch 所附加的调度包袱，通过 C++ Extension 直连硬件显存
+- 理解单流下 H2D、Kernel、D2H 串行导致的 PCIe 与计算无法重叠的瓶颈
+- 用多流（Multi-Stream）将数据分块、异步拷贝与 Kernel 交错发射，实现传输与计算的重叠
+- 理解 CUDA Graphs 如何通过一次 Capture + 多次 Replay 降低极短 Kernel 序列的 CPU 发射开销（Launch Bound）
+- 理解 PyTorch C++/CUDA 扩展如何用 `torch::empty_like` 与 `data_ptr()` 直连 CUDA Kernel，绕过 Python 与框架调度开销
 
 ## 对应代码路径
 
@@ -32,169 +32,279 @@ date: 2026-03-12 14:30:00
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `08_Advanced/02_multi_stream/multi_stream.cu` | `compute_kernel` | 多流队列派发分离，A * sin(B) + B * cos(A) | `N=16.7M`<br>(192 MB) |
-| `08_Advanced/01_cuda_graphs/cuda_graphs.cu` | `add_kernel`<br>`mul_kernel` | `(A + B) * D + F` 三段向量流水，Graph Capture + Replay | `N=100_000`<br>(轻量级算子) |
-| `08_Advanced/03_pytorch_extension/pytorch_extension.cu` | `swish_forward_kernel`<br>`swish_backward_kernel` | Swish 前向/反向，自定义 C++/CUDA 扩展 | `N=10.4M`<br>(40 MB) |
+| `08_Advanced/02_multi_stream/multi_stream.cu` | `compute_kernel` | 多流、H2D/Kernel/D2H 分块异步、Pinned 内存 | N = 16,777,216 (192 MB) |
+| `08_Advanced/01_cuda_graphs/cuda_graphs.cu` | `add_kernel`<br>`mul_kernel` | $(A+B)\cdot D + F$ 三段流水、Graph Capture + Replay | N = 100,000 (约 2.67 MB) |
+| `08_Advanced/03_pytorch_extension/pytorch_extension.cu` | `swish_forward_kernel`<br>`swish_backward_kernel` | Swish 前向/反向、C++ Extension + `data_ptr()` | N = 10,485,760 (40 MB) |
 
-> Kernel 名称与源码中 `__global__` 函数签名完全一致。
->
-> **本篇在系列中的位置**：承接 [07 量化、半精度与整数推理](/posts/ef325d2f/) 与 [10 访存优化与共享内存冲突](/posts/5b6f891d/)，本篇从**系统与框架视角**回答「当算子本身已经很快，端到端还慢在哪里？」——分别用 **Multi-Stream** 掩盖 H2D/D2H、用 **CUDA Graphs** 降低极短 Kernel 的 Launch 开销、用 **PyTorch C++ Extension** 绕过 Python 调度。后续 [11 推理优化、融合与键值缓存](/posts/9729c03f/) 会在推理系统中把这些技术串成一条完整流水线，[15 多卡通信与全归约](/posts/b599e19f/) 则把问题扩展到多卡通信。
+> **本篇在系列中的位置**：承接 [07 量化、半精度与整数推理](/posts/ef325d2f/) 与单算子优化，本篇从**系统与调度视角**回答「当单算子已经很快时，端到端还慢在哪里？」——用 **Multi-Stream** 掩盖 H2D/D2H、用 **CUDA Graphs** 降低极短 Kernel 的 Launch 开销、用 **PyTorch C++ Extension** 绕过 Python 调度。后续 [11 推理优化、融合与键值缓存](/posts/9729c03f/) 会在推理系统中串联这些技术；[15 多卡通信与全归约](/posts/b599e19f/) 则扩展到多卡通信与流调度。
 
-## Baseline
+---
 
-**问题陈述**：把单独算子核的内部计算极致化仍不足以兑现成框架端到端的性能跳跃。对于整体工业应用，耗时通常溢落在了 CPU 向大总线指派工作的延迟、指令集排版的重度拥挤乃至 PCI-Express 控制线的强制等待与交接上。
+## 三个实现分别做了什么
 
-| Baseline 类别 | 测试场景 | 指标 | 值 | 数据来源 |
-|---------------|----------|------|----|----------|
-| Default Stream (强耦合) | `N=16.7M` (192 MB) | Pipeline 周期间隔 | 15.55 ms | [实测] Results/08_Advanced.md |
-| 传统多 Kernel Launch | `N=100K` (极轻代量) | 单圈发射+执行时间 | 4.9 µs | [实测] Results/08_Advanced.md |
-| 参考 CPU Swish 实现 | `N=10.4M` 单通求值 | 前向耗时（等价 Python 逐元素算子） | 30.30 ms | [实测] Results/08_Advanced.md |
+### 1. Multi-Stream：分块流水与传输—计算重叠
 
-## 瓶颈分析
+`multi_stream.cu` 的算子为 $C = A \cdot \sin(B) + B \cdot \cos(A)$，单流下每轮顺序执行：H2D（$A$、$B$）→ Kernel → D2H（$C$）。总周期时间等于三段之和，PCIe 传输与 SM 计算串行，无法重叠——与 [01 基础概念与分块](/posts/7608f1b0/) 中「含传输的端到端加速比仅 2.05x」同理，单流无法利用 Copy Engine 与 Compute Engine 的并行能力。
 
-如果不做系统级干涉，整个流传动将在各异系统断层处陷入致命滞空：
+多流版本将数据按 4 个流分块：每个流负责一段连续的 `[offset, offset+chunk)`。对每个流依次提交 `cudaMemcpyAsync(H2D)` → `compute_kernel<<<..., streams[i]>>>` → `cudaMemcpyAsync(D2H)`，然后 `cudaDeviceSynchronize()` 等待所有流完成。驱动可将不同流的 H2D、Kernel、D2H 在时间上交错执行，从而在 PCIe 与计算引擎之间形成重叠。**主机内存必须使用 Pinned Memory（`cudaMallocHost`）**，否则 `cudaMemcpyAsync` 会退化为同步拷贝，无法与计算重叠。
 
-1. **PCIe 硬件传输管线白白停摆 (H2D/D2H Blocking)**
-   - 在传统的单路调用中，显卡内部物理分开设立的 DMA Copy 控制器与 SM（架构内）计算单元完全以同步依赖排班。一旦进入计算环，传输电路断电挂起。如果计算不占极度优势，吞吐量将毫无尊严。
-2. **极小碎颗粒对 CPU Launch Bound 的极限施压**
-   - 现行的指令握手体系下，自底层态交切到发起封送至少要消耗数个 $\mu s$ 的纯主机端开销。若该细小激活算子在 4090 核心群中只费不足 $1\mu s$ 便宣告终局，硬件将被迫在空挡下常延挂起等候下一次主机发送信号。
-3. **高阶抽象语言与 Autograd 中盘开销 (Python Overhead)**
-   - 当构建一个由四五则数学法则构筑而成的自定义触发器并试图运行自动导流时，解释层不仅要跨越 `c10d` 调度器做低频寻找对应内核片段，且会被连同反复申请挂在显出释放池的多余隐变量撕裂开来，导致极其沉闷的胶水消耗（Glue Code Taxes）。
+### 2. CUDA Graphs：多 Kernel 流水的一次录制、多次回放
 
-## 优化思路
+`cuda_graphs.cu` 实现流水 $G = (A+B)\cdot D + F$：先 `add_kernel`($A$,$B$→$C$)，再 `mul_kernel`($C$,$D$→$E$)，再 `add_kernel`($E$,$F$→$G$)。传统方式每轮三次 `<<<>>>` 发射，每次都有数微秒级的 CPU→驱动提交开销；当 Kernel 本身极短（如 100K 元素）时，总耗时被 Launch 主导，即 **Launch Bound**。
 
-### 优化 1：Multi-Stream 实现隐秘流水重叠缝合
+CUDA Graphs 做法：在一条 `stream` 上 `cudaStreamBeginCapture`，依次执行上述三次 Kernel 启动，再 `cudaStreamEndCapture` 得到 `cudaGraph_t`；`cudaGraphInstantiate` 得到可执行图 `cudaGraphExec_t`。之后每轮只需一次 `cudaGraphLaunch(instance, stream)`，驱动一次性提交整条流水，大幅减少 CPU 发射次数，从而降低 Launch Bound 段的耗时。
 
-**解决的瓶颈**：解开完全同步的隐性死锁强制序顺。
-**核心思想**：切分大包任务并将之投放至数条异体流管道流队列（不同 `cudaStream_t`），从而欺骗驱动层将没有明确先后从属相连逻辑的 `cudaMemcpyAsync`（由主至卡）同另一个已经正在硅芯中爆拉的 `cudaLaunch` 计算行为重排对位叠置（Overlap）。
-**预期收益**：在极其微弱计算权重环境下拿到 1.13x 等比增幅（压缩掉近 2 毫秒传输时空）[实测]。
+### 3. PyTorch C++ Extension：自定义算子直连 CUDA
 
-### 优化 2：CUDA Graphs 先验成图直接复用
+`pytorch_extension.cu` 实现 Swish 前向 $y = x/(1+e^{-x})$ 与反向梯度，并分别提供：纯 CUDA 基准（Host 用 `vector`、`cudaMalloc`/`cudaMemcpy`）和 PyTorch 扩展接口（`torch::Tensor` + pybind11）。扩展侧用 `torch::empty_like(x)` 分配与 $x$ 同形的输出，用 `x.data_ptr<float>()` 取得显存指针，传入手写 `swish_forward_kernel`/`swish_backward_kernel`。这样 Python 端调用一次扩展即可完成整块计算，避免多次小算子与 Python 解释、Autograd 查找的开销；在「纯 Kernel 时间」对比下，相对「单线程 CPU 逐元素实现」可获得数百倍加速。
 
-**解决的瓶颈**：连续高频碎算子的驱动器压降损及唤醒时滞。
-**核心思想**：开立 `cudaStreamBeginCapture` 控制场，强行干练地打一次纯净前跑，将整个逻辑连带内存关系网固定截化为图形模板实例对像（Graph Instance）。到正规演练的千百次期间，主控制机只需掷出单一命令发射指令即可瞬间轰动该庞杂网链，杜绝与端级通讯。
-**预期收益**：消除发射机制阻抗，在一共极其脆弱的 4.9 微秒盘块中逆势摘除掉下 18% 周长耗减 [实测]。
+---
 
-### 优化 3：Native C++/CUDA Extension 防线推平
+## Baseline 与瓶颈分析
 
-**解决的瓶颈**：完全避免框架本身极其可笑的方法分配查址、零星开辟重塑操作与巨额内存边界翻墙行为。
-**核心思想**：彻底手算得出其反推微导函数解闭式，随后在深层硬质原生态 C++ 中靠一块干净透明无挂靠的底板 `torch::empty_like` 获取无开销驻区，并强行通过 `.data_ptr()` 扒下 `Tensor` 娇艳面孔外衣获取极真底层指针以灌溉原生 CUDA C 核弹投射器。
-**预期收益**：摧枯拉朽般打断原 Python 高层代码执行锁线时点，制造不可动及的 **360+ 倍跃进升腾比段** [实测]。
+### 单流下传输与计算串行
+
+默认流（或单流）下，每次 `cudaMemcpy` 与每次 `kernel<<<>>>` 按提交顺序串行执行。一轮「H2D → Kernel → D2H」的总时间 = H2D 时间 + Kernel 时间 + D2H 时间。GPU 上 Copy Engine 与 Compute Engine 可并行工作，但单流无法表达「流 1 在拷的同时流 2 在算」的并行性，因此无法利用这一重叠，端到端被三段之和限制。
+
+### 极短 Kernel 与 Launch Bound
+
+当数据规模很小（如 100K float，约 2.67 MB）时，Kernel 执行仅数微秒量级，而每次 `kernel<<<>>>` 的 CPU 侧提交也有数微秒开销。多轮多次发射时，总时间中 Launch 占比很高，称为 **Launch Bound**。此时优化方向是减少发射次数（例如用 CUDA Graphs 将多条操作录成一张图、一次提交）。
+
+### Python 与框架调度开销
+
+用 Python 写「逐元素 Swish」或组合多个小算子时，每次算子调用都会经过 Python 解释、Tensor 分配、调度器查找等。若用自定义 C++ Extension 将整块计算封装成一次 Kernel 调用，并直接使用 `data_ptr()` 与 CUDA Kernel，可去掉这些中间层开销，在相同数学下获得远高于「Python 多算子」的吞吐。
+
+---
+
+## 优化思路：多流、图与扩展如何掩盖延迟与发射
+
+### 核心思想
+
+- **Multi-Stream**：把一大块数据分成多块，每块绑定到独立 `cudaStream_t`；每流内用 `cudaMemcpyAsync` + `kernel<<<..., stream>>>` + `cudaMemcpyAsync` 描述「H2D → 计算 → D2H」。驱动在不同流之间可重叠执行，从而掩盖部分传输与计算延迟。**前提**：Host 侧参与 Async 拷贝的内存须为 Pinned（`cudaMallocHost`），否则 Async 会退化为同步。
+- **CUDA Graphs**：将「多条 CUDA 操作（含 Kernel、拷贝等）」在一次 Capture 中录成图，再 Instantiate 为可执行图；之后用一次 `cudaGraphLaunch` 提交整图，减少 CPU 到驱动的往返与 Launch 次数，适合高频、短小的 Kernel 序列。
+- **C++ Extension**：用 C++ 实现算子逻辑，用 `torch::empty_like` 分配输出、`data_ptr<T>()` 取显存指针并传入 CUDA Kernel，通过 pybind11 暴露给 Python；Python 端一次调用即完成整块计算，避免多算子拼接与 Python 层开销。
+
+### 为何 Pinned Memory 是多流重叠的前提
+
+`cudaMemcpyAsync` 在 Host 使用 **Pageable** 内存（如 `malloc`、`std::vector`）时，驱动会先分配临时 Pinned 缓冲区、把数据拷入再发起 DMA，或在内核中做同步拷贝，导致 Async 实际上阻塞，多流之间无法真正重叠。使用 `cudaMallocHost` 分配的 **Pinned** 内存后，DMA 可直接访问固定物理页，`cudaMemcpyAsync` 才能异步执行，多流的 H2D/Kernel/D2H 才有机会在时间上重叠。
+
+### 单流 vs 多流 vs Graph 对比（定性）
+
+| 场景 | 单流 | 多流 | CUDA Graph |
+|------|------|------|------------|
+| H2D/Kernel/D2H | 串行，周期 = 三段之和 | 分块后多流可重叠，周期缩短 | 不改变单次传输/计算时间，主要减 Launch |
+| Launch 开销 | 每 Kernel 一次 CPU 提交 | 同上 | 一次提交整图，适合极短 Kernel 序列 |
+| 前提/约束 | 无 | Host 须 Pinned | 图结构固定，Replay 时指针/规模不变 |
+
+---
 
 ## 关键代码解释
 
-### Pageable Memory 绞杀多流
+### compute_kernel 与多流分块发射
 
 ```cpp
-// 来源：08_Advanced/02_multi_stream/multi_stream.cu 
-    // 【灾难现场】：使用标准的系统托管分配（内存发生随时转移挂坠机制）
-    // float *h_a = (float*)malloc(size); 
-    
-    // 【神谕之举】：锁死物理段落页口。这是 DMA 控制机得以发动直传的最严苛前提
-    cudaMallocHost(&h_A, bytes);
-    
-    for (int i = 0; i < NUM_STREAMS; ++i) {
-        // [1] H2D 入栈列，各持己序
-        cudaMemcpyAsync(d_A + offset, h_A + offset, size, cudaMemcpyHostToDevice, streams[i]);
-        // [2] 等待上一个指令同流派系入站即触发点算
-        compute_kernel<<<blocks, threads, 0, streams[i]>>>(d_A + offset, d_B + offset);
-        // [3] 回退回收流
-        cudaMemcpyAsync(h_B + offset, d_B + offset, size, cudaMemcpyDeviceToHost, streams[i]);
+// 来源：08_Advanced/02_multi_stream/multi_stream.cu : L5-L14
+__global__ void compute_kernel(CPFloat A, CPFloat B, PFloat C, CInt n) {
+    CInt tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < n) {
+        float a = A[tid];
+        float b = B[tid];
+        C[tid] = a * sinf(b) + b * cosf(a);
     }
+}
 ```
 
-**要点解读**：
+```cpp
+// 来源：08_Advanced/02_multi_stream/multi_stream.cu : L131-L146
+for (int i = 0; i < num_streams; ++i) {
+    CInt offset = i * chunk_size;
+    CInt current_chunk = min(chunk_size, n - offset);
+    CSize current_bytes = current_chunk * FSIZE;
 
-- 为什么仅加了流分配仍未能重叠？如果你未使用 `cudaMallocHost`，任何一次对外部设备的传输都将迫使系统主驱动极其蛮横地将动作拦截打回强行阻断进程内环至自身复制。只有在页面不可搬移交换的情况下（Pinned），外部直接通路 DMA 才可能不带任何中央处理负担的跨位。
+    if (current_chunk > 0) {
+        CUDA_CHECK(cudaMemcpyAsync(d_A + offset, h_A + offset, current_bytes, cudaMemcpyHostToDevice, streams[i]));
+        CUDA_CHECK(cudaMemcpyAsync(d_B + offset, h_B + offset, current_bytes, cudaMemcpyHostToDevice, streams[i]));
 
-### 暴力扯除 Wrapper 保护壳的 Extension 直击
+        const dim3 block(BLOCK_SIZE_1D);
+        const dim3 grid(cdiv(current_chunk, BLOCK_SIZE_1D));
+        kernel<<<grid, block, 0, streams[i]>>>(d_A + offset, d_B + offset, d_C + offset, current_chunk);
+
+        CUDA_CHECK(cudaMemcpyAsync(h_C + offset, d_C + offset, current_bytes, cudaMemcpyDeviceToHost, streams[i]));
+    }
+}
+CUDA_CHECK(cudaDeviceSynchronize());
+```
+
+同一流内 H2D → Kernel → D2H 顺序依赖由流保证；不同流之间无显式依赖，驱动可重叠执行。
+
+### Pinned 内存分配（main 中）
 
 ```cpp
-// 来源：08_Advanced/03_pytorch_extension/pytorch_extension.cu : L20-L24
-torch::Tensor custom_swish_forward(torch::Tensor x) {
-    auto y = torch::empty_like(x); // 在本池里即刻打底不留外沿
-    
-    // 直接暴破对象提取核心原始地址交予内核！
+// 来源：08_Advanced/02_multi_stream/multi_stream.cu : L194-L200
+// 为了使 cudaMemcpyAsync 能真正异步工作，Host 内存必须分配为 Pinned 锁页内存
+PFloat h_A = nullptr, h_B = nullptr, h_C_single = nullptr, h_C_multi = nullptr, h_C_cpu = nullptr;
+CUDA_CHECK(cudaMallocHost((void**)&h_A, size_io));
+CUDA_CHECK(cudaMallocHost((void**)&h_B, size_io));
+CUDA_CHECK(cudaMallocHost((void**)&h_C_single, size_io));
+CUDA_CHECK(cudaMallocHost((void**)&h_C_multi, size_io));
+h_C_cpu = new float[n]; // CPU 参照结果不需要锁页
+```
+
+### CUDA Graphs：Capture → Instantiate → Replay
+
+```cpp
+// 来源：08_Advanced/01_cuda_graphs/cuda_graphs.cu : L170-L184
+CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+add_func<<<grid, block, 0, stream>>>(d_A, d_B, d_C, n);
+mul_func<<<grid, block, 0, stream>>>(d_C, d_D, d_E, n);
+add_func<<<grid, block, 0, stream>>>(d_E, d_F, d_G, n);
+CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+
+CUDA_CHECK(cudaGraphInstantiate(&instance, graph, nullptr, nullptr, 0));
+
+CUDA_CHECK(cudaGraphLaunch(instance, stream));
+CUDA_CHECK(cudaStreamSynchronize(stream));
+```
+
+Capture 阶段在 `stream` 上按顺序执行三次 Kernel，录成图；Instantiate 得到可执行实例；之后每轮一次 `cudaGraphLaunch` 即提交整条流水。
+
+### PyTorch Extension：empty_like + data_ptr
+
+```cpp
+// 来源：08_Advanced/03_pytorch_extension/pytorch_extension.cu : L287-L308
+torch::Tensor swish_forward_cuda(torch::Tensor x) {
+    TORCH_CHECK(x.device().is_cuda(), "x must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "x must be contiguous");
+
+    CInt n = x.numel();
+    auto y = torch::empty_like(x);
+
+    const dim3 block(BLOCK_SIZE_1D);
+    const dim3 grid(cdiv(n, BLOCK_SIZE_1D));
+
     swish_forward_kernel<<<grid, block>>>(
-        x.data_ptr<float>(), 
-        y.data_ptr<float>(), 
-        x.numel()
+        x.data_ptr<float>(),
+        y.data_ptr<float>(),
+        n
     );
     return y;
 }
 ```
 
-**要点解读**：
+`torch::empty_like(x)` 在 PyTorch 管理下分配与 $x$ 同形、同设备同 dtype 的 Tensor；`data_ptr<float>()` 取得底层指针传给 Kernel，无需额外拷贝或包装。
 
-- 这里将算术从前线隔离，完全靠 pybind11 打通了 Python 与本机底座 C 汇集接口。你交出的是带有完整生命期监管与极高抽象化 `Tensor` 实体，而在这里它只是一块指向纯浮点数陈列的扁平内存带而已！
+### Block / Thread 映射（Multi-Stream，单流内）
+
+| 层级 | 配置 | 职责 |
+|------|------|------|
+| 单流内 chunk | `current_chunk = min(chunk_size, n - offset)` | 该流负责的元素数 |
+| Grid | `cdiv(current_chunk, 256)` | 覆盖当前 chunk |
+| Block | 256 线程 | 每线程一元素，`compute_kernel` 内做 $C[i]=A[i]\sin(B[i])+B[i]\cos(A[i])$ |
+
+### 数据流概览（多流 Pipeline）
+
+```mermaid
+sequenceDiagram
+    participant S1 as Stream 1
+    participant S2 as Stream 2
+    participant S3 as Stream 3
+    participant S4 as Stream 4
+    participant PCIe as PCIe / Compute
+
+    Note over S1,S4: 同一时刻不同流可处于不同阶段
+    S1->>PCIe: H2D chunk1
+    S2->>PCIe: H2D chunk2
+    S1->>PCIe: Kernel chunk1
+    S3->>PCIe: H2D chunk3
+    S2->>PCIe: Kernel chunk2
+    S1->>PCIe: D2H chunk1
+    Note over S1,S4: 驱动调度下 H2D / Kernel / D2H 重叠
+```
+
+---
 
 ## 结果与边界
 
-### 性能对比
+### Multi-Stream（N = 16,777,216，192 MB，10 次迭代）
 
-> **测试条件**：双 RTX 4090 ($sm\_89$), nvcc -O3
-> **数据来源**：`Results/08_Advanced.md` 原始实机日志，均以 10-100次 打脸求均值
+> 数据来源：`Results/08_Advanced.md` 原始日志
 
-**1. 物理重叠隔离战 (Multi-Stream)**
+| 版本 | Pipeline 周期时间 | vs 单流 | 数据性质 |
+|------|------------------|--------|----------|
+| 单流（H2D→Kernel→D2H 串行） | 15.55 ms | 1.00x | [实测] |
+| **4 流并发** | **13.73 ms** | **1.13x** | [实测] |
 
-体量：192 MB (轻运算三角阵设)
+本测试中 Kernel 为 $A\sin(B)+B\cos(A)$，计算量适中，单周期内传输与计算时间量级接近，多流后约 13% 周期缩短，说明部分 H2D/Kernel/D2H 已重叠。若 Kernel 更重、计算时间更长，重叠收益会更大；若 Kernel 极短，则周期主要被传输占满，多流收益仍受限于 PCIe 带宽。
 
-| 运作方式模型 | Pipeline 时限均极度 | 对战单流对比基带率 | 数据性质 |
-|--------------|---------------------|--------------------|----------|
-| 强串行挂单机 | 15.55 ms            | 1.00x              | [实测] |
-| 四流切盘并进 | **13.73 ms**        | **1.13x 提纯**     | [实测] |
+### CUDA Graphs（N = 100,000，约 2.67 MB，1000 次迭代）
 
-这 13% 看似不多，但在由于该算式纯属极底强度的三角代数导致它其实被外部极其遥远的 PCIe $H2D \longleftrightarrow D2H$ 传输界限严密封顶封口。倘若这个主方程置换为庞大的重度加卷积核心算，由于重算期的延长直接掩护并倒扣吃没了所有通讯时口，整体极限逼接可以提冲至近三倍以上（极限 $4-\alpha$）。
+| 版本 | Kernel 段耗时（1000 次平均） | vs 传统发射 | 数据性质 |
+|------|-----------------------------|-------------|----------|
+| 传统多 Kernel 发射 | 0.0049 ms | 1.00x | [实测] |
+| **CUDA Graph Launch** | **0.0042 ms** | **1.18x** | [实测] |
 
-**2. 极限碎星发射制裁战 (CUDA Graphs)**
+规模很小，Kernel 执行极短，传统方式下 CPU 发射占比高；Graph 一次提交整条流水，发射开销降低约 18%。本例总时间仍受 H2D/D2H 主导，因此 GPU 总时间与 CPU 对比未必占优，适合作为 **Launch Bound** 与 Graph 收益的教学示例。
 
-碎算序列：仅发生不过不足 3 MB 区阵，千次累击。
+### PyTorch Extension（Swish，N = 10,485,760，40 MB，100 次迭代）
 
-| 发射调包引擎层 | 核战极短击发反应时 | 实测拔升制压比值 | 数据性质 |
-|----------------|--------------------|------------------|----------|
-| 原理多遍挂靠触发 | 4.90 µs          | 1.00x            | [实测] |
-| 拓扑快装截影回放 | **4.20 µs**      | **1.18x**        | [实测] |
+| 版本 | Forward | Backward | vs CPU (Kernel) | 数据性质 |
+|------|---------|----------|----------------|----------|
+| CPU 参考 | 30.30 ms | 46.01 ms | 1x | [实测] |
+| **GPU Custom Swish (Kernel)** | **0.08 ms** | **0.13 ms** | **369x / 342x** | [实测] |
 
-一旦在总共仅够四五微秒的时间区段里成功榨出 0.70 个微秒的减除，便是在底层发射链口去斩断了整整最硬底核心近两成耗支！这也是主流如 TensorRT 在对 Transformer 大语言短解码序列狂射之中打满 4090 限域的关键秘钥锁匙。
+Forward 有效带宽约 1022 GB/s，高于 HBM 理论 1008 GB/s，是因为 40 MB 数据落在 72 MB L2 内，测得的是缓存带宽。加速比体现的是「单次 CUDA Kernel」相对「单线程 CPU 逐元素」的差异。
 
-**3. 天堑崩塌战 (Native Custom Extension 爆裂)**
+```mermaid
+xychart-beta
+  title "多流 / Graph / Extension 相对基准对比"
+  x-axis ["单流 Pipeline", "4 流 Pipeline", "传统 Launch", "Graph Launch"]
+  y-axis "相对耗时" 0 --> 1.2
+  bar [1.0, 0.88, 1.0, 0.85]
+```
 
-体量：对 10+ M 单通道前馈逆流操作探测。
+### 为什么多流只快 1.13x 而非接近 2x
 
-| 环境调度地带域 | 前向连结演算期段 (Forward) | GPU 后向推断期段 (Backward) | 倍率反制打击下压率 | 数据性质 |
-|----------------|----------------------------|----------------------------|--------------------|----------|
-| Python Native  | 30.30 ms                   | 46.01 ms                   | 基线 | [实测] |
-| **C++ 裸切接直打**| **0.08 ms**             | **0.13 ms**                | **369x 打击** / **342x 打击** | [实测] |
+理论上若 H2D、Kernel、D2H 三段完全重叠，周期可接近 $\max(\text{H2D},\text{Kernel},\text{D2H})$。实测 1.13x 说明本测试中三段长度接近、且仅有 4 个流，重叠程度有限；流数或 chunk 划分方式会影响重叠率。此外 PCIe 带宽与计算带宽的比值、Kernel 密度都会影响多流收益上限。
 
-这种极具毁灭性的倍差不仅是因为绕开了极高频次分配（`torch.exp(-x)` 以及中间变量承接）；我们在算例中高达 `1022.08 GB/s` 假象带的爆点亦全拜 L2 缓存所赐。本例仅用 40 MB 的体量正好绝绝完整被 4090 那多达 72 MB 的海量二极管极速缓冲区通盘拦截吞没未被写入外界，一举造就这超出 1008 G 的极顶巅峰局。
+### 边界与局限
 
-### 边界条件与局限
+- **Graph 的固定结构**：Capture 时录制的 Kernel 配置、指针与数据量在 Replay 时不应改变；若每次迭代的 shape 或分支不同，需重新 Capture 或使用 Graph 的更新/条件执行机制。
+- **Pinned 内存用量**：`cudaMallocHost` 占用锁页物理内存，过量使用会减少系统可用内存并影响换页。应仅对参与 Async 传输的缓冲区使用 Pinned，且控制规模。
 
-- **图模型的形态锁喉**：一切运用 Graphs 截存的操作大前提，是所有的张量长度与步型架构在录像刻画当时就已经焊死固定成了绝对结构标的！如果推断引擎每当走完一步长度便长存缩短甚至有 `if/else` 的不同变轨分水流（如条件触发核），那么所有预存图模型都将全部失效乃至报错挂起。此时必须辅佐依靠动态重图和参数修正表来维持战线。
+---
 
 ## 常见误区
 
-1. **误区**：一旦上了 Python，无论算出来什么结果都不可能有底层写出来的核块那么狂野。
-   **实际**：Python 语言本因无罪！若你使用内置早由官方大神依靠最原始核堆满写的 `torch.nn.functional` ，跑的其实全都是纯粹的无锁 C 逻辑。你拖延出来的巨大惩罚仅产生出现在大量散手小算式用底层根本不曾组装拼装过的粗浅拼接调出方法上。而此举的完美工业应对利刃是直挂 `torch.compile` 引出原生底层的 Triton 解析器，甚至都不需要你书写一行 Custom 代码！
-2. **误区**：在做大作业时，所有的资源必须一股脑儿直接全都分配挂 `pinned Memory`。
-   **实际**：锁页内存极其重额恐怖！一旦由于过量硬生生锁死占尽主机，你的系统连交换回退操作页面缓冲的基本盘口也将丧失殆尽全盘乃至致使整个外界崩溃罢工。它理应被克制且严格且小限幅限定仅存在给核心高速穿梭信道（如 Ring Buffer 队列阵）这唯一直切点中。
+1. **误区**：只要用了多个 `cudaStream_t`，传输和计算就会自动重叠。
+   **实际**：若 Host 端用的是 Pageable 内存（如 `malloc`、`vector`），`cudaMemcpyAsync` 会退化为同步行为，多流无法真正重叠。必须对参与 Async 拷贝的 Host 缓冲区使用 **Pinned Memory**（`cudaMallocHost`）。
+
+2. **误区**：CUDA Graphs 能加速所有多 Kernel 场景。
+   **实际**：Graph 主要减少的是 **CPU 发射次数**，对 Launch Bound（Kernel 极短、发射开销占比大）场景效果明显。若单次 Kernel 已很长或传输占主导，Graph 带来的周期缩短有限；且 Graph 结构在录制后固定，动态 shape 或分支需额外处理。
+
+3. **误区**：PyTorch 下写 Python 就注定比 C++ Extension 慢。
+   **实际**：PyTorch 内置算子（如 `torch.nn.functional`）底层已是 C++/CUDA，性能与手写 Extension 同量级。慢往往来自「用大量小 Python 算子拼接」或未使用 `torch.compile` 等优化。Extension 的价值在于：把「一大块自定义计算」做成一次 Kernel 调用，避免 Python 与调度开销；若逻辑本身可被现有算子表达，可优先考虑 `torch.compile` 或融合 API。
+
+4. **误区**：多流流数越多，Pipeline 周期越短。
+   **实际**：流数增加有利于更多重叠，但受限于 PCIe 带宽、Copy/Compute 引擎并发度与 chunk 划分。流数过多可能带来调度与同步开销，且若单 chunk 过小，Launch 与拷贝的固定成本占比上升。通常 4–8 流是常见选择，需结合问题规模实测。
+
+---
 
 ## 系列导航
 
 ### 前置阅读
 
-| 文章 | 关系 |
-|------|------|
-| [05 大模型算子与注意力归一化](/posts/cb29461c/) | 先理解大模型算子（Softmax、Norm、FlashAttention）在单卡上的算力/带宽瓶颈位置，再考虑系统级如何通过多流与 Graphs 改善端到端性能 |
-| [07 量化、半精度与整数推理](/posts/ef325d2f/) | 本篇默认你已经知道哪些算子可以安全量化到 FP16/INT8，因此可以放心用 Multi-Stream/Graphs 批量调度这些低精度核函数 |
-| [10 访存优化与共享内存冲突](/posts/5b6f891d/) | 在做流水线遮盖传输缝隙之前，先确保单个 Kernel 内部已经做到合并访存、避免 Bank Conflict，不然多流只会放大底层访存问题 |
+| 文章 | 与本篇的衔接 |
+|------|----------------|
+| [01 基础概念与分块](/posts/7608f1b0/) | 建立带宽墙与「含传输端到端加速比」的直觉，理解单流下 H2D/D2H 与 Kernel 串行的瓶颈 |
+| [05 大模型算子与注意力归一化](/posts/cb29461c/) | 理解单卡上 Softmax、Norm 等算子的瓶颈，再考虑用多流与 Graphs 改善端到端 |
+| [07 量化、半精度与整数推理](/posts/ef325d2f/) | 掌握 FP16/INT8 算子后，可用 Multi-Stream/Graphs 批量调度这些低精度 Kernel |
 
-### 推荐后续
+### 推荐后续（承上启下）
 
-| 文章 | 关系 |
-|------|------|
-| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 把本篇的 Multi-Stream、Graphs、C++ Extension 放进真实推理系统，结合 KV Cache 与算子融合，形成端到端的 LLM 推理优化方案 |
-| [13 性能分析、屋顶线与占用率](/posts/803b94d6/) | 从 Roofline 与 Occupancy 视角重新审视本篇场景是 Memory Bound 还是 Launch Bound，帮助你判断何时该用 Multi-Stream，何时该用 Graphs |
+| 文章 | 与本篇的衔接 |
+|------|----------------|
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 将 Multi-Stream、Graphs、C++ Extension 放入推理系统，与 KV Cache、算子融合一起形成端到端方案 |
+| [13 性能分析、屋顶线与占用率](/posts/803b94d6/) | 用 Roofline 与占用率判断场景是 Memory Bound 还是 Launch Bound，从而决定是否用 Graphs、多流 |
 
 ---
 

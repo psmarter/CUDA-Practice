@@ -1,5 +1,5 @@
 ---
-title: CUDA-Practice：13 Roofline 定天界，Occupancy 辨虚实——量化的 GPU 诊断流
+title: CUDA-Practice：13 从 Roofline 到 Nsight——性能天花板与占用率辨虚实
 tags:
   - CUDA
   - GPU编程
@@ -23,9 +23,10 @@ date: 2026-03-11 12:30:00
 
 读完本文，你将能够：
 
-- 运用 Roofline 模型定量判断算子是受限于内存带宽（Memory Bound）还是计算能力（Compute Bound）
-- 破除对 100% 占用率（Occupancy）的盲目追求，理解指令级并行（ILP）在隐藏高迟延访存时的物理依据
-- 使用 Nsight Compute 的关键指标（如 `l1tex_t_sectors_per_request`）直接定位全局合并访存失效的根源
+- 用 Roofline 模型定量判断一个 Kernel 是 Memory Bound 还是 Compute Bound，并算出「理论上限」与「当前效率」
+- 理解 Occupancy 的真实含义：它是隐藏延迟的手段之一，而不是要无条件追求 100%；掌握 ILP 在带宽型算子中如何补足甚至超越高占用率
+- 用 Nsight Compute / Nsight Systems 的关键指标，把「非合并 / 在等内存 / 在等指令」变成可复现的证据链
+- 在「还可以快多少」与「到底卡在算力还是带宽」之间建立统一的诊断流程
 
 ## 对应代码路径
 
@@ -34,77 +35,64 @@ date: 2026-03-11 12:30:00
 
 | 源文件 | Kernel 名称 | 核心技术 | 测试规模 |
 |--------|-------------|----------|----------|
-| `13_Performance_Analysis/02_roofline/roofline.cu` | `memory_bound_kernel` | Vector Add (Memory Bound 典型) | N=10,000,000 |
-| `13_Performance_Analysis/02_roofline/roofline.cu` | `compute_bound_kernel` | Naive GEMM (Compute Bound 典型) | M=N=K=1024 |
-| `13_Performance_Analysis/01_occupancy/occupancy.cu` | `configurable_kernel`<br>`shared_memory_kernel`<br>`register_limited_kernel`| 动态配置 Block Size 与 ILP，观察 Occupancy 和带宽影响 | N=10,000,000 |
-| `13_Performance_Analysis/03_nsight_profiling/nsight_profiling.cu` | `profile_example_kernel_bad`<br>`profile_example_kernel_good` | 非合并访存 (Stride=32) 对比标准合并访存的性能探针 | N=10,000,000 |
+| `13_Performance_Analysis/02_roofline/roofline.cu` | `memory_bound_kernel` / `compute_bound_kernel` | Roofline 双基准：Vector Add（Memory Bound）、Naive GEMM（Compute Bound） | N = 10,000,000 / N = 1024 |
+| `13_Performance_Analysis/01_occupancy/occupancy.cu` | `configurable_kernel` / `shared_memory_kernel` / `register_limited_kernel` | Occupancy、ILP、SMEM/寄存器资源约束 | N = 10,000,000 |
+| `13_Performance_Analysis/03_nsight_profiling/nsight_profiling.cu` | `profile_example_kernel_bad` / `profile_example_kernel_good` | 非合并访存 vs 合并访存探针 | N = 10,000,000 |
 
-> Kernel 名称与源码中 `__global__` 函数签名完全一致。
->
-> **本篇在系列中的位置**：承接 [01 基础概念与分块](/posts/7608f1b0/)、[04 矩阵乘优化与寄存器分块](/posts/1a09f6f/)、[10 访存优化与共享内存冲突](/posts/5b6f891d/) 中对「算子实现与访存形态」的具体优化，本篇抽象出统一的 **性能建模与诊断视角**——通过 Roofline/Occupancy/Nsight 工具，回答「我的算子还可以快多少？」和「到底是算力不够还是带宽/实现出问题」。后续 [11 推理优化、融合与键值缓存](/posts/9729c03f/)、[12 标准库与工程实践](/posts/a1e20e80/) 会在推理系统与标准库层面复用这些分析方法。
+> 本篇在系列中的位置：承接 [01 基础概念与分块](/posts/7608f1b0/) 的带宽墙与 Roofline 直觉、[04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) 与 [10 访存优化与共享内存冲突](/posts/5b6f891d/) 的具体优化，本篇抽象出统一的 **性能建模与诊断视角**——通过 Roofline / Occupancy / Nsight 回答「理论上限在哪」「当前卡在带宽还是算力」「占用率是否值得继续堆」。后续 [11 推理优化、融合与键值缓存](/posts/9729c03f/) 与 [12 标准库与工程实践](/posts/a1e20e80/) 会在推理系统与标准库层面复用这些方法。
 
-## Baseline
+---
 
-**问题陈述**：在遇到性能未达预期的 Kernel 时，开发者常常通过猜测来添加 `__shared__` 或调整 `blockDim`。本篇博客不讨论具体业务，而是建立一套基于数据的诊断 Baseline：先通过 Roofline 计算天花板，再用代码实际跑分验证。
+## 三个实现分别做了什么
 
-**Baseline 实现**：我们以 `roofline.cu` 中的 `memory_bound_kernel` (Vector Add) 和 `compute_bound_kernel` (Naive GEMM) 共同作为基准，对比它们的物理指标。
+### 1. Roofline 双基准：用两个极端算子「定天花板」
 
-| 算子 | 指标 | 值 | 数据来源 |
-|------|------|----|----------|
-| Vector Add | Kernel 耗时 | 0.13 ms | [实测] Results/13_Performance_Analysis.md |
-| Vector Add | 实际运行速度 | 78.72 GFLOPS | [实测] Results/13_Performance_Analysis.md |
-| Naive GEMM | Kernel 耗时 | 0.41 ms | [实测] Results/13_Performance_Analysis.md |
-| Naive GEMM | 实际运行速度 | 5.23 TFLOPS | [实测] Results/13_Performance_Analysis.md |
+`roofline.cu` 用两个刻意选取的 baseline 建立诊断坐标系：
 
-## 瓶颈分析
+- **memory_bound_kernel**：Vector Add，每元素读 $A$、读 $B$、写 $C$（12 字节），只做 1 次加法，最典型的 Memory Bound。
+- **compute_bound_kernel**：Naive GEMM，算术强度高（理想化口径下 $I \gg$ 拐点），用于对照 Compute Bound 理论上限与实际效率。
 
-性能诊断的第一步，是计算算术强度（Arithmetic Intensity，$I$），即每搬运 1 字节数据能执行多少次浮点运算（FLOPs）。
-我们将计算结果与 RTX 4090 的 **Roofline 拐点 81.9 FLOP/Byte [理论]** 结合对比。
+它的价值在于：**跑一次就能从设备查询峰值算力与带宽，打印 Ridge Point（拐点算术强度），并给出每个 Kernel 的算术强度、理论上限、实测吞吐与效率**——把 [01](/posts/7608f1b0/) 里的 Roofline 直觉变成可执行的诊断脚本。
 
-### 案例 A：极限 Memory Bound 的 Vector Add
+```cpp
+// 来源：13_Performance_Analysis/02_roofline/roofline.cu : L12-L34
+__global__ void memory_bound_kernel(CPFloat a, CPFloat b, PFloat c, CInt n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        c[idx] = a[idx] + b[idx];
+    }
+}
 
-- 算术强度估算：每次计算读取 2 个 float（8 字节），写回 1 个 float（4 字节），总共 12 字节访存。计算为 1 次加法（1 FLOP）。
-- 此算子的理论算术强度 $I = 1 / 12 \approx 0.083 \text{ FLOP/Byte}$ [理论]。
-- 0.083 远小于拐点阈值 81.9，因此处于 **Memory Bound** 区域。
-- 理论性能上限 $P = 0.083 \times 1008 \text{ GB/s} \approx 83.7 \text{ GFLOPS}$ [理论]。
-- 我们的实测性能 78.72 GFLOPS 达到了理论峰值的 94%！这意味着显存带宽的物理潜力已经被全额透支。如果不减少算子的读写需求，无论如何修改 CUDA Core 指令均无法提速。
+__global__ void compute_bound_kernel(CPFloat A, CPFloat B, PFloat C, CInt N) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row < N && col < N) {
+        float sum = 0.0f;
+        for (int i = 0; i < N; ++i) {
+            sum += A[row * N + i] * B[i * N + col];
+        }
+        C[row * N + col] = sum;
+    }
+}
+```
 
-### 案例 B：虚假的 Compute Bound 的 Naive GEMM
+运行时会从设备查询峰值算力与带宽，打印 Ridge Point，并对每个 Kernel 做 Roofline 分析（算术强度、瓶颈判定、理论峰值、实测 GFLOPS、效率百分比）。
 
-- 算术强度估算：Naive GEMM 内层没有使用 Tiling 缓存复用。每次迭代计算都从全局显存重取数据。如果假定所有数据均完美通过缓存命中（仅最理想的情况），其算术强度 $I = 2N^3 / (3N^2 \times 4) = N / 6$。对于 N=1024，$I \approx 170.67 \text{ FLOP/Byte}$ [理论]。
-- 这看似远大于 81.9，属于 Compute Bound。
-- 理论天花板原本应为 $82.6 \text{ TFLOPS}$ [理论]。然而实测只有可怜的 5.23 TFLOPS。
-- 瓶颈在于 $170.67$ 只是基于完美缓存的假象。由于 Naive 算法的显存重访率极高，实际传输的物理流量暴增，它实际跌回了 Memory Bound 斜坡底端。突破口必须是引入 Shared Memory 提高缓存命中（请参考 [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/)）。
+### 2. Occupancy 与 ILP：用「同样总工作量」挑战占用率迷信
 
-## 优化思路
+`occupancy.cu` 构造带宽型 kernel `configurable_kernel<BLOCK_SIZE, ITEMS_PER_THREAD>`：每线程处理 `ITEMS_PER_THREAD` 个元素，用 `#pragma unroll` 让加载指令形成 ILP。目标是回答：**当每线程干更多事（ILP 更高）时，即便 Block 更小、并发形态变化，性能会怎样？**
 
-通过上述 Roofline 的宏观判定，针对 Memory Bound 和由于不当执行引发性能跌落的情况，我们分别设计相关的实验来破除“常识”并提供纠错思路。
+同时提供 `shared_memory_kernel`（每 Block 32 KB Shared Memory 挤占 SM 资源）与 `register_limited_kernel`（`__launch_bounds__` 限制寄存器）作为「资源约束」的对照，说明 Occupancy 受 SMEM/寄存器限制时的表现。
 
-### 优化 1：利用 ILP（指令级并行）隐藏延迟
-
-**解决的瓶颈**：破除对 100% Occupancy（高占用率才能掩盖延迟）的盲目追求。
-**核心思想**：与其压缩单个线程资源来换取大量的并发 Warp 数，不如在同一个线程内放开手脚，通过展开循环引发多条无数据依赖的显存读取指令 (Instruction-Level Parallelism，ILP)，利用硬件内部加载单元的长流水线实现单核自我掩蔽。
-**预期收益**：即便是在极低 Occupancy 下，也能跑满甚至超额榨取系统等效带宽 [理论]。
-
-### 优化 2：彻底消灭非合并访存（Uncoalesced Memory Access）
-
-**解决的瓶颈**：显存读取时的严重效率折损。
-**核心思想**：避免同一 Warp 中不同线程的跳步跨越寻址，将跨步寻址重构为连续索引。以此适配底层缓存列强制 $32$ 字节包（Sector）硬性读取规则。
-**预期收益**：极大提高 `l1tex__average_t_sectors_per_request_pipe_lsu_mem_global_op_ld` 指标健康度并成倍抬升带宽表现 [实测]。
-
-## 关键代码解释
-
-### ILP 极简并行发射
+它的价值在于建立**延迟隐藏的多元视角**：Occupancy 不是唯一杠杆，在带宽型算子中 ILP 常能更充分地压榨带宽，甚至出现「低 Occupancy + 高 ILP」优于「满 Occupancy + 低 ILP」的情况。
 
 ```cpp
 // 来源：13_Performance_Analysis/01_occupancy/occupancy.cu : L8-L24
 template<int BLOCK_SIZE, int ITEMS_PER_THREAD>
 __global__ void configurable_kernel(CPFloat input, PFloat output, CInt n) {
     float items[ITEMS_PER_THREAD];
-    
     int base_idx = blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD;
-    
-    // [1] 利用 unroll 和寄存器数组形成密集独立的读取指令串，压发底层流水线
+
     #pragma unroll
     for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
         int idx = base_idx + i * BLOCK_SIZE + threadIdx.x;
@@ -114,92 +102,257 @@ __global__ void configurable_kernel(CPFloat input, PFloat output, CInt n) {
             items[i] = 0.0f;
         }
     }
-    // ...
+    // ... 处理与写回
 }
 ```
 
-**要点解读**：
+`idx` 的构造保证同一 Warp 内相邻线程访问连续地址（合并访存）；每线程多元素 + `#pragma unroll` 形成 ILP，让加载流水线更饱和。
 
-- `[1]`：编译器会将这里的 `#pragma unroll` 连同 `ITEMS_PER_THREAD` 展开成十几条连续且无上下游依赖的 `LDG.E` 加载汇编指令。这促使硬件不必等待上一跳加载返回即立刻下发后续读取请求，达成指令级别的深度并发响应（ILP）。这种方式下即便总活跃线程数很少，也能拉满甚至跑爆总线。
+### 3. Nsight 探针：把「非合并」变成可量化证据
 
-### 合并访存与跳跃寻址刺客
+`nsight_profiling.cu` 给出一对几乎同构的 kernel：
+
+- **profile_example_kernel_bad**：将线性 `idx` 映射成跨步地址（同一 Warp 内线程访问相距很远的元素），制造非合并访存。
+- **profile_example_kernel_good**：标准线性访问，合并访存。
+
+两者做同样的计算 `val = val * val + val`，差别只在访存模式。用 Nsight Compute 可看到 bad 版本的 Global Load Efficiency 等指标明显劣于 good，把「在等内存」具象为事务有效字节比。
+
+它的价值在于：**仅改索引、不改算法，就能用 Nsight 把「非合并」量化为有效带宽与加速比**，为后续 [10 访存优化与共享内存冲突](/posts/5b6f891d/) 的修复提供可复现的对照。
 
 ```cpp
-// 来源：13_Performance_Analysis/03_nsight_profiling/nsight_profiling.cu : L68-L76
-__global__ void profile_example_kernel_bad(CPFloat input, PFloat output, CInt n, CInt stride) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n) return;
-    
-    int chunk = n / stride; 
-    // [1] 极其恶劣跳跃转换，强行错开同一 Warp 里的线性寻址
-    int mapped_idx = (idx % stride) * chunk + (idx / stride);
-    if (mapped_idx >= n) return;
-    
-    float val = input[mapped_idx];
+// 来源：13_Performance_Analysis/03_nsight_profiling/nsight_profiling.cu : L72-L90
+// Bad：跨步映射，同一 Warp 访问相距 chunk 的地址
+int chunk = n / stride;
+int mapped_idx = (idx % stride) * chunk + (idx / stride);
+float val = input[mapped_idx];
+val = val * val + val;
+output[mapped_idx] = val;
+
+// Good：线性索引，合并访存
+float val = input[idx];
+val = val * val + val;
+output[idx] = val;
 ```
 
-**要点解读**：
+修复方式就是把 Bad 的 `mapped_idx` 改回 Good 的线性 `idx`。
 
-- `[1]`：引入了一个基于输入 `stride=32` 的严重离散化重定向索引。这意味着 `thread0` 请求 `addr[0]` 时，`thread1` 会强行请求 `addr[chunk]`。Warp 的访存请求在物理板上支离破碎，最终导致有效数据利用率直线崩塌到不到百分之几（32 分之 1）。
+---
+
+## Baseline 与瓶颈分析
+
+### Roofline：用 $P = \min(P_{\text{peak}}, I \cdot B_{\text{peak}})$ 把「快多少」算出来
+
+算术强度（Arithmetic Intensity）定义为每字节搬运对应的浮点运算数：
+
+$$I = \frac{\text{FLOPs}}{\text{Bytes}} \quad [\text{理论}]$$
+
+Roofline 给出性能上限：
+
+$$P_{\max} = \min(P_{\text{peak}},\ I \cdot B_{\text{peak}}) \quad [\text{理论}]$$
+
+当 $I < P_{\text{peak}} / B_{\text{peak}}$ 时，性能由带宽决定（Memory Bound 斜坡）；反之由算力决定（Compute Bound 平台）。本项目在 `roofline.cu` 运行时会读取设备参数并打印 Ridge Point；实测平台（RTX 4090）画像约为：单精度峰值 86.02 TFLOPS、带宽 1008.10 GB/s、Ridge 约 85.33 FLOP/Byte [实测]。
+
+### 案例 A：Vector Add 的带宽墙
+
+Vector Add 每元素读 $A$（4 B）、读 $B$（4 B）、写 $C$（4 B），总搬运 12 B，只做 1 次加法：
+
+$$I = \frac{1}{12} \approx 0.083\ \text{FLOP/Byte} \quad [\text{理论}]$$
+
+远小于 Ridge（约 85.33），因此必然 Memory Bound。理论上限约 84.01 GFLOPS，实测约 78.72 GFLOPS，效率约 93.70% [实测]。含义是：**若不减少字节搬运或提高复用，改 Block 配置或指令调度很难再带来实质提升**。
+
+### 案例 B：Naive GEMM 为什么「判为 Compute Bound，却只有约 6% 效率」
+
+Naive GEMM（N=1024）在「理想化字节数」口径下（例如只计 $3 N^2$ 次 float 读写），算术强度 $I \approx 170.67$ FLOP/Byte [实测打印]，大于 Ridge，Roofline 判为 Compute Bound，理论上限约 86,016 GFLOPS（86.016 TFLOPS）[实测打印]。
+
+但实测只有约 5234 GFLOPS（约 5.23 TFLOPS），效率仅约 6.08% [实测]。
+
+关键点：**Compute Bound 的判定依赖你对 bytes 的估算口径**。Naive GEMM 的真实瓶颈往往是总访存量与复用不足，导致实际物理流量远大于「理想化」字节数，从而把性能拉回带宽斜坡附近。要突破它，必须引入 Tiling（Shared/寄存器复用），对应 [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) 的主线。
+
+---
+
+## 优化思路：Occupancy、ILP 与合并访存该怎么选
+
+### 核心思想
+
+- **Occupancy** 的本质是「用更多活跃 Warp 做切换来隐藏延迟」，是手段之一，不是唯一目标。若同一线程内能发射多条互不依赖的加载指令（ILP），硬件可以把这些请求挂到长流水线上并行等待；在带宽型算子中，ILP 常能更充分地压榨带宽，甚至出现「低 Occupancy + 高 ILP」优于「满 Occupancy + 低 ILP」的情况。
+- **合并访存** 是前提。很多「看似在等内存」的 kernel 其实是「每次事务只用到带回字节的一小部分」，有效带宽会直接崩塌。应先修好合并访存，再谈 ILP / Occupancy。
+
+### 诊断顺序建议
+
+| 步骤 | 动作 | 工具/指标 |
+|------|------|-----------|
+| 1 | 用 Roofline 判断 Memory Bound 还是 Compute Bound，算理论上限与效率 | 算术强度 $I$、Ridge、实测 GFLOPS |
+| 2 | 若 Memory Bound，检查是否合并访存、是否有无效搬运 | Nsight Compute：Global Load/Store Efficiency、`l1tex__*` 等 |
+| 3 | 在合并健康的前提下，看 Occupancy 与 ILP 谁在限制延迟隐藏 | `cudaOccupancyMaxActiveBlocksPerMultiprocessor`、实测带宽对比 |
+
+### 存储与延迟隐藏
+
+| 手段 | 作用 | 适用场景 |
+|------|------|----------|
+| 高 Occupancy | 更多 Warp 轮转，隐藏访存/指令延迟 | 寄存器与 SMEM 不成为瓶颈时 |
+| 高 ILP | 同一线程内多组独立加载/计算，让流水线饱和 | 带宽型、每线程工作量可扩时 |
+| 合并访存 | 提高单次事务有效字节，逼近硬件带宽上限 | 所有访问 Global Memory 的 Kernel |
+
+---
+
+## 关键代码解释
+
+### ILP：用 `ITEMS_PER_THREAD` 让加载指令「成串」
+
+```cpp
+// 来源：13_Performance_Analysis/01_occupancy/occupancy.cu : L8-L24
+template<int BLOCK_SIZE, int ITEMS_PER_THREAD>
+__global__ void configurable_kernel(CPFloat input, PFloat output, CInt n) {
+    float items[ITEMS_PER_THREAD];
+    int base_idx = blockIdx.x * BLOCK_SIZE * ITEMS_PER_THREAD;
+
+    #pragma unroll
+    for (int i = 0; i < ITEMS_PER_THREAD; ++i) {
+        int idx = base_idx + i * BLOCK_SIZE + threadIdx.x;
+        if (idx < n) {
+            items[i] = input[idx];
+        } else {
+            items[i] = 0.0f;
+        }
+    }
+    // ... 处理与写回
+}
+```
+
+`#pragma unroll` 将循环展开为一串相互独立的加载与寄存器操作，形成 ILP，使加载流水线更饱和。`idx` 的构造保证同一 Warp 内相邻线程访问连续地址（合并访存），同时每线程承担多元素，提高单线程指令并行度。
+
+### 非合并访存：只改索引，带宽就能差数倍
+
+```cpp
+// 来源：13_Performance_Analysis/03_nsight_profiling/nsight_profiling.cu : L72-L79
+int chunk = n / stride;
+int mapped_idx = (idx % stride) * chunk + (idx / stride);
+float val = input[mapped_idx];
+val = val * val + val;
+output[mapped_idx] = val;
+```
+
+`mapped_idx` 把同一 Warp 的相邻线程打散到远距离地址，导致一次 128B 事务只命中少量有效 float，有效带宽崩塌。修复方式就是改回线性索引 `input[idx]` / `output[idx]`。
+
+### Block / Grid 与调用层级
+
+| 实现 | Kernel | Block 配置 | Grid 配置 | 说明 |
+|------|--------|------------|-----------|------|
+| roofline.cu | `memory_bound_kernel` | 256 | `(cdiv(n, 256))` | 一维，与 01 的 Vector Add 一致 |
+| roofline.cu | `compute_bound_kernel` | 16×16 | `(cdiv(N,16), cdiv(N,16))` | 2D，每线程一个 $C$ 元素 |
+| occupancy.cu | `configurable_kernel` | `BLOCK_SIZE`（如 256 或 64） | 线程需求 = `cdiv(n, ITEMS_PER_THREAD)` | 每线程处理多元素，总工作量固定 |
+| nsight_profiling.cu | bad / good | 256 | `(cdiv(n, 256))` | 相同配置，仅访存索引不同 |
+
+### Roofline 与诊断数据流概览
+
+```mermaid
+graph LR
+    classDef hw fill:#f9d0c4,stroke:#333,stroke-width:2px;
+    classDef kernel fill:#fcf1c8,stroke:#333,stroke-width:2px;
+    classDef tool fill:#bbf,stroke:#333,stroke-width:2px;
+
+    subgraph 输入
+        I[算术强度 I]:::kernel
+        B[带宽 B_peak]:::hw
+        P[算力 P_peak]:::hw
+    end
+
+    subgraph Roofline
+        R["P_max = min(P_peak, I·B_peak)"]:::tool
+    end
+
+    I --> R
+    B --> R
+    P --> R
+    R --> 判定[Memory / Compute Bound]
+```
+
+---
 
 ## 结果与边界
 
-### 性能对比
+### Roofline 双基准（Vector Add vs Naive GEMM）
 
-> **测试条件**：RTX 4090, CUDA 12.x, 迭代 100 次取平均值
-> **数据来源**：`Results/13_Performance_Analysis.md` 原始日志
+> 数据来源：`Results/13_Performance_Analysis.md` 原始日志
 
-**1. Occupancy vs ILP 对抗 (配置均处理 10M 元素总量)**
+| 算子 | Kernel 耗时 | 实际吞吐 | Roofline 判定 | 理论上限 | 效率 | 数据性质 |
+|------|-------------|----------|---------------|----------|------|----------|
+| Vector Add (N=10M) | 0.13 ms | 78.72 GFLOPS | Memory Bound | 84.01 GFLOPS | 93.70% | [实测] |
+| Naive GEMM (N=1024) | 0.41 ms | 5234.05 GFLOPS | Compute Bound | 86016 GFLOPS | 6.08% | [实测] |
 
-| 版本 (每块线程人数, 每人承担包袱) | Kernel 耗时 | 理论计算 Occupancy | 等效带宽读写 | 数据性质 |
-|-----------------------------------|-------------|------------------|--------------|----------|
-| Config 1 `<256, 1>` (高满载无 ILP)  | 0.07 ms     | 100%             | 1230.12 GB/s | [实测]   |
-| Config 2 `<256, 4>` (中等兼顾)      | 0.06 ms     | 100%             | 1324.67 GB/s | [实测]   |
-| **Config 3 `<64, 16>` (极限 ILP)**  | **0.06 ms** | **100% (由于未超限)** | **1365.92 GB/s** | [实测]   |
-| Config 4 `<256, 1>`伴随 32KB SMEM | 0.08 ms     | 50%              | 1020.48 GB/s | [实测]   |
+Vector Add 已接近其带宽上限；Naive GEMM 虽被判为 Compute Bound，但因访存与复用不足，实测离算力天花板很远，需通过 Tiling 提升有效算术强度。
 
-在 Config 3 的高 ILP 推算中出现了超峰值带宽的 1365.92 GB/s [实测]。因为在连续的 100 轮循环测算中，这约 76 MB 的数据集碰巧命中了 RTX 4090 高达 72 MB 的 L2 Cache。内部 Cache 的瞬发吞吐远超 HBM，因此造就了表现爆表的有效读写。
+### Occupancy vs ILP（同样处理 10M 元素）
 
-**2. 探针下访存模式实验**
+> 数据来源：`Results/13_Performance_Analysis.md` 原始日志
 
-| 版本 | Kernel 耗时 | 有效测绘总线带宽 | 核心异常特征 | 数据性质 |
-|------|-------------|----------------|--------------|----------|
-| `profile_example_kernel_bad` | 0.29 ms | 273.54 GB/s | Stride=32 离散化 | [实测] |
-| `profile_example_kernel_good`| 0.07 ms | 1227.03 GB/s | 极板标准合并访存 | [实测] |
+| 版本（每块线程数, 每线程元素数） | Kernel 耗时 | 理论 Occupancy | 有效带宽（读+写） | 数据性质 |
+|----------------------------------|-------------|----------------|-------------------|----------|
+| Config 1 `<256, 1>`（低 ILP） | 0.07 ms | 100% | 1230.12 GB/s | [实测] |
+| Config 2 `<256, 4>`（更高 ILP） | 0.06 ms | 100% | 1324.67 GB/s | [实测] |
+| **Config 3 `<64, 16>`（极高 ILP）** | **0.06 ms** | **100%** | **1365.92 GB/s** | [实测] |
+| Config 4 `<256, 1>` + 32KB SMEM | 0.08 ms | 50% | 1020.48 GB/s | [实测] |
 
-完全相同执行结构中，仅仅只是因为将跳跃寻址变更回直接的线性对齐读取，整体吞吐量足足激增并产生碾压性级别的 **4.49 倍提升** [实测]。
+Config 3 出现超过 HBM 理论峰值（1008 GB/s）的有效带宽，是因为该规模数据大量命中 72 MB L2，L2→SM 的瞬时吞吐高于 HBM，导致「有效带宽」统计高于标称 HBM 峰值 [实测解释]。
+
+### Nsight 探针：合并 vs 非合并（Stride=32）
+
+> 数据来源：`Results/13_Performance_Analysis.md` 原始日志
+
+| 版本 | Kernel 耗时 | 有效带宽 | 数据性质 |
+|------|-------------|----------|----------|
+| `profile_example_kernel_bad` | 0.29 ms | 273.54 GB/s | [实测] |
+| `profile_example_kernel_good` | 0.07 ms | 1227.03 GB/s | [实测] |
+
+仅通过把索引恢复为线性访问，吞吐获得 **约 4.49x** 提升 [实测]。
+
+```mermaid
+xychart-beta
+  title "合并 vs 非合并 有效带宽 (GB/s)"
+  x-axis ["Bad (非合并)", "Good (合并)"]
+  y-axis "GB/s" 0 --> 1400
+  bar [273.54, 1227.03]
+```
 
 ### 边界条件与局限
 
-- 当代码极其复杂包含巨量寄存器声明且不得不做高频切换时，若因为盲目去追求极度的高 ILP 将导致 `Spill to local memory` 现象发生（寄存器溢出回显存）。这将带来一次数百微秒的深重恶性迟延，反而不如利用一定的 Occupancy 实行多兵团切换妥当。
+- **ILP** 并非越高越好：寄存器压力过大导致 spill（溢出到 local memory）会引入额外 Global 访存，反而变慢。
+- **Roofline** 给出的是上限与方向，落地需结合 Nsight 指标找「为什么没接近上限」（例如非合并、Stall 原因、Occupancy 与 ILP 的权衡）。
+
+---
 
 ## 常见误区
 
-1. **误区**：ncu 给我的算子定性为 Memory Bound（内存受限），所以我只能去买更好的显卡以获得更高的 HBM 带宽。
-   **实际**：在基础算术中绝大部分初级计算皆呈现出 Memory Bound。但很多时候，内存总线上实际上运输的都是中间态的过程变量。我们可以通过算子融合机制（Kernel Fusion）去把这些原本落在外存上的变量合并留存在 SM 内部生命周期（例如 Shared Memory）里抵消掉，人为拔高算法的内生算术强度逼近拐点。
+1. **误区**：ncu 定性为 Memory Bound，就只能靠换更高带宽的卡。
+   **实际**：很多 Memory Bound 来自无效搬运（中间结果落盘、布局不合并、重复读写）。通过融合、提高复用、修复合并访存，可以在同一带宽上获得大幅提升。
 
-2. **误区**：为了获取高吞吐速度，我们编写所有核函数参数配置都应无脑调高使其 Occupancy 达成 100%。
-   **实际**：Occupancy 本质只是掩盖迟延的一个选项之一。如果你的人均寄存器宽容度很大或者内存读取链存在很明显的 `#pragma unroll` 并发机会空间，就算降级牺牲一部分 Occupancy 取代之也依然能够跑爆系统的物理上限总线。
+2. **误区**：所有 Kernel 都应该把 Occupancy 调到 100%。
+   **实际**：Occupancy 是隐藏延迟的选项之一。若 ILP 足够、访存模式健康，较低 Occupancy 仍可能接近带宽上限；反之盲目堆 Occupancy 也救不了非合并与 spill。
 
-3. **误区**：不管我是 4 字节跳跃提取还是几十连号合并取，只要提取的数据总量是一样的带宽应该相差无几的。
-   **实际**：这忽略了最致命的 GPU 显存底层通信最小包裹结构（Sector），硬件规定 L1 每发一次车硬规定打包 32 个字节（或多或少随构架演进略有区分）。你跳几步，这些包裹周边没利用到的数据都会同归于尽变成无用的垃圾吞吐流阻断大动脉循环，令真正承载带宽急剧跳水衰退。
+3. **误区**：访问总字节数一样，带宽就差不多。
+   **实际**：事务粒度是硬件规定的。非合并访问会让「每次事务只有少量有效字节」，导致有效带宽崩塌，本篇 bad/good 探针直接体现为约 4.49x 差距。
+
+4. **误区**：Roofline 判成 Compute Bound 就说明 Kernel 已经「算力拉满」。
+   **实际**：判定依赖你对 bytes 的估算。Naive GEMM 用理想化字节数会判为 Compute Bound，但实际访存与复用不足时，物理上仍可能卡在带宽或 L2/SMEM 路径，效率只有个位数百分比；需用 Tiling 提高有效算术强度，再用 Roofline 看新上限。
+
+---
 
 ## 系列导航
 
 ### 前置阅读
 
 | 文章 | 与本篇的衔接 |
-|------|--------------|
-| [01 基础概念与分块](/posts/7608f1b0/) | 提供初步的 Memory Bound/Compute Bound 直觉，为本篇的 Roofline 数学化诊断做铺垫 |
-| [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) | Naive GEMM vs Tiled GEMM 的性能差异，可以用本篇 Roofline/Occupancy 框架重新审视 |
-| [10 访存优化与共享内存冲突](/posts/5b6f891d/) | 本篇指出问题（非合并访存、Bank/带宽瓶颈），10 章从 Global/Shared/Async Copy 三层给出具体解法 |
+|------|----------------|
+| [01 基础概念与分块](/posts/7608f1b0/) | 建立 Memory Bound / Compute Bound 与 Roofline 直觉，为本篇定量诊断做铺垫 |
+| [04 矩阵乘优化与寄存器分块](/posts/1a09f6f/) | 用本篇框架重新审视 Naive / Tiled / 寄存器分块的上限与瓶颈 |
+| [10 访存优化与共享内存冲突](/posts/5b6f891d/) | 本篇指出「合并 / Bank / 流水」问题后，10 给出具体修复手段 |
 
-### 推荐后续
+### 推荐后续（承上启下）
 
 | 文章 | 与本篇的衔接 |
-|------|--------------|
-| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 在推理系统中用本篇的 Roofline/Occupancy 思路评估 Kernel Fusion、PagedAttention、Continuous Batching 的收益上界 |
-| [12 标准库与工程实践](/posts/a1e20e80/) | 对比手写内核与标准库的性能时，直接用本篇提供的建模方法判断是否已接近硬件或库的Roofline |
+|------|----------------|
+| [11 推理优化、融合与键值缓存](/posts/9729c03f/) | 在推理链路里用 Roofline / Occupancy 思路评估融合、KV Cache 与 batching 的收益上界 |
+| [12 标准库与工程实践](/posts/a1e20e80/) | 对比手写内核与标准库性能时，用本篇方法判断是否接近库/硬件 Roofline |
 
 ---
 
