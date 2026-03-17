@@ -1,6 +1,9 @@
 # CUDA-Practice
 
+[![CUDA](https://img.shields.io/badge/CUDA-11.0+-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-zone)
+[![C++](https://img.shields.io/badge/C++-17-blue?style=flat-square&logo=cplusplus)](https://isocpp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Blog](https://img.shields.io/badge/Blog-smarter.xin-orange?style=flat-square)](https://smarter.xin)
 
 从零开始的 CUDA 编程学习与实践仓库：从基础算子实现到工业级优化（GEMM、Flash Attention、KV Cache 等），提供可运行代码与实机性能记录。配套技术博客见 **[Smarter's Blog — https://smarter.xin/](https://smarter.xin/)**，系列文章与仓库章节一一对应，便于系统学习。
 
