@@ -1,7 +1,7 @@
 # CUDA-Practice
 
-[![CUDA](https://img.shields.io/badge/CUDA-11.0+-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-zone)
-[![C++](https://img.shields.io/badge/C++-17-blue?style=flat-square&logo=cplusplus)](https://isocpp.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-11.0%2B-green?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-zone)
+[![C++](https://img.shields.io/badge/C%2B%2B-17-blue?style=flat-square&logo=cplusplus)](https://isocpp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Blog](https://img.shields.io/badge/Blog-smarter.xin-orange?style=flat-square)](https://smarter.xin)
 
